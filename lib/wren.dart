@@ -6,6 +6,7 @@ import 'package:args/command_runner.dart';
 import 'package:pub_semver/pub_semver.dart';
 import 'package:wren/src/installer.dart';
 import 'package:yaml/yaml.dart';
+import 'package:yaml_edit/yaml_edit.dart';
 
 export 'src/installer.dart'
     show InstallEnvironment, InstallException, InstallResult, InstalledRelease;
@@ -722,7 +723,8 @@ void _replaceFileAtomically(
   Set<String> existingKeys,
 })
 _rewriteProjectConstraints(String content, InstalledRelease release) {
-  final root = loadYamlNode(content);
+  final editor = YamlEditor(content);
+  final root = editor.parseAt(const []);
   if (root is! YamlMap) {
     throw const FormatException('the document root must be a mapping');
   }
@@ -735,7 +737,6 @@ _rewriteProjectConstraints(String content, InstalledRelease release) {
     'flutter': release.version,
     'sdk': release.dartVersion!,
   };
-  final replacements = <(int, int, String)>[];
   final edits = <String, (String, String)>{};
   final existingKeys = <String>{};
   for (final entry in versions.entries) {
@@ -745,20 +746,10 @@ _rewriteProjectConstraints(String content, InstalledRelease release) {
     final oldValue = node.value.toString();
     final newValue = '^${entry.value}';
     if (oldValue == newValue) continue;
-    final start = node.span.start.offset;
-    final end = node.span.end.offset;
-    if (start < 0 || end < start || end > content.length) {
-      throw const FormatException('constraint source location is unavailable');
-    }
-    replacements.add((start, end, jsonEncode(newValue)));
+    editor.update(['environment', entry.key], newValue);
     edits[entry.key] = (oldValue, newValue);
   }
-  replacements.sort((left, right) => right.$1.compareTo(left.$1));
-  var rewritten = content;
-  for (final (start, end, replacement) in replacements) {
-    rewritten = rewritten.replaceRange(start, end, replacement);
-  }
-  return (content: rewritten, edits: edits, existingKeys: existingKeys);
+  return (content: editor.toString(), edits: edits, existingKeys: existingKeys);
 }
 
 bool _changesDartLanguageVersion(String oldConstraint, String newVersion) {

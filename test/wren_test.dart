@@ -230,8 +230,8 @@ dependencies:
 
         expect(status, 0);
         final updated = await pubspec.readAsString();
-        expect(updated, contains('flutter: "^3.47.8" # old Flutter range'));
-        expect(updated, contains('sdk: "^3.13.7"'));
+        expect(updated, contains('flutter: ^3.47.8 # old Flutter range'));
+        expect(updated, contains('sdk: ^3.13.7'));
         expect(updated, contains('dependencies:\n  path: ^1.9.0'));
         expect(output.toString(), contains('>=3.0.0 <4.0.0 → ^3.47.8'));
         expect(
@@ -267,7 +267,7 @@ environment:
         expect(status, 0);
         final updated = await pubspec.readAsString();
         expect(updated, isNot(contains('flutter:')));
-        expect(updated, contains('sdk: "^3.14.0-315.3.beta"'));
+        expect(updated, contains('sdk: ^3.14.0-315.3.beta'));
         expect(output.toString(), contains('Updated environment.sdk'));
       },
     );
@@ -328,7 +328,7 @@ environment:
       ], confirmation: (_) async => true);
 
       expect(status, 0);
-      expect(pubspec.readAsStringSync(), contains('sdk: "^3.13.7"'));
+      expect(pubspec.readAsStringSync(), contains('sdk: ^3.13.7'));
       expect(
         jsonDecode(
           File('${dataDirectory.path}/config.json').readAsStringSync(),
