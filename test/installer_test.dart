@@ -982,6 +982,7 @@ printf '\376\000\n' >&2
           'sources/$_engineRevision-linux-x64/.wren-source.json',
         ),
       );
+      final expectedFlutterLauncher = await privateFlutter.readAsString();
       await privateDart.writeAsString('corrupted private Dart');
       await privateFlutter.writeAsString('corrupted Flutter launcher');
       await privateSnapshot.delete();
@@ -991,7 +992,11 @@ printf '\376\000\n' >&2
         await releaseMarker.readAsString(),
       ) as Map<String, Object?>;
       await releaseMarker.writeAsString(
-        jsonEncode({...manifest, 'externalUse': true}),
+        jsonEncode(
+          Map<String, Object?>.from(manifest)
+            ..remove('checkoutFiles')
+            ..['externalUse'] = true,
+        ),
       );
 
       final leaseDirectory = Directory(
@@ -1051,16 +1056,7 @@ printf '\376\000\n' >&2
         reason: error.toString(),
       );
       expect(await privateDart.readAsString(), await sourceDart.readAsString());
-      final checkoutFiles = manifest['checkoutFiles']! as List<Object?>;
-      expect(
-        await privateFlutter.readAsString(),
-        utf8.decode(
-          base64.decode(
-            (checkoutFiles.single! as Map<String, Object?>)['content']!
-                as String,
-          ),
-        ),
-      );
+      expect(await privateFlutter.readAsString(), expectedFlutterLauncher);
       expect(
         await privateSnapshot.readAsString(),
         await sourceSnapshot.readAsString(),
@@ -1163,6 +1159,77 @@ printf '\376\000\n' >&2
             stderrSink: StringBuffer(),
           ),
           3,
+        );
+      },
+    );
+
+    test(
+      'keeps a damaged shared source when private repair is cancelled',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+
+        final sourceDart = File(
+          p.join(
+            dataDirectory.path,
+            'sources/$_engineRevision-linux-x64/bin/cache/dart-sdk/bin/dart',
+          ),
+        );
+        expect(
+          (await Process.run('chmod', ['-x', sourceDart.path])).exitCode,
+          0,
+        );
+        final privateDart = File(
+          p.join(
+            dataDirectory.path,
+            'releases/stable-$_version-linux-x64/bin/cache/dart-sdk/bin/dart',
+          ),
+        );
+        await privateDart.writeAsString('damaged private Dart');
+        final releaseMarker = File(
+          p.join(
+            dataDirectory.path,
+            'releases/stable-$_version-linux-x64/.wren-release.json',
+          ),
+        );
+        final manifest = jsonDecode(
+          await releaseMarker.readAsString(),
+        ) as Map<String, Object?>;
+        await releaseMarker.writeAsString(
+          jsonEncode({...manifest, 'externalUse': true}),
+        );
+
+        final error = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            confirmation: (_) async => false,
+            stdoutSink: StringBuffer(),
+            stderrSink: error,
+          ),
+          6,
+          reason: error.toString(),
+        );
+        expect(sourceDart.statSync().mode & 0x49, 0);
+        expect(await privateDart.readAsString(), 'damaged private Dart');
+        expect(
+          Directory(p.join(dataDirectory.path, 'staging')).listSync(),
+          isEmpty,
         );
       },
     );

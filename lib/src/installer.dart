@@ -426,6 +426,11 @@ class FlutterInstaller {
         );
       }
       releaseManifest = Map<String, Object?>.from(lifecycleManifest);
+      releaseManifest = await _ensureReleaseCheckoutFileRecords(
+        releaseDirectory,
+        root,
+        releaseManifest,
+      );
       final frameworkRevision = releaseManifest['frameworkRevision'];
       final engineRevision = releaseManifest['engineRevision'];
       final sourceKey = releaseManifest['sourceKey'];
@@ -639,9 +644,30 @@ class FlutterInstaller {
             engineRevision: engineRevision,
             host: host,
           );
+          final privateFilesRepaired = await _repairPrivateReleaseFiles(
+            releaseDirectory,
+            source,
+            releaseManifest: releaseManifest,
+            releaseKey: releaseKey,
+            releaseVersion: releaseVersion,
+            externalUse: releaseManifest['externalUse'] == true,
+            confirmExternalUse: confirmExternalUse,
+          );
+          final readiness = await _readiness(releaseDirectory, root);
+          if (readiness?.needsRepair ?? true) {
+            throw InstallException(
+              'Flutter $releaseVersion still needs repair: '
+              '${readiness?.repairReason ?? 'release validation failed'}.',
+            );
+          }
           if (sourceBackup.existsSync()) {
             await sourceBackup.delete(recursive: true);
           }
+          return RepairResult(
+            sourceKey: sourceKey,
+            replaced: true,
+            privateFilesRepaired: privateFilesRepaired,
+          );
         } catch (error) {
           if (newSourcePublished && source.existsSync()) {
             await source.delete(recursive: true);
@@ -649,7 +675,9 @@ class FlutterInstaller {
           if (oldSourceMoved && sourceBackup.existsSync()) {
             await sourceBackup.rename(source.path);
           }
-          if (error is InstallException) rethrow;
+          if (error is InstallException || error is InstallCancelledException) {
+            rethrow;
+          }
           throw InstallException(
             'Flutter $releaseVersion source repair failed: $error',
           );
@@ -659,28 +687,6 @@ class FlutterInstaller {
             await stagingRoot.delete(recursive: true);
           }
         }
-
-        final privateFilesRepaired = await _repairPrivateReleaseFiles(
-          releaseDirectory,
-          source,
-          releaseManifest: releaseManifest,
-          releaseKey: releaseKey,
-          releaseVersion: releaseVersion,
-          externalUse: releaseManifest['externalUse'] == true,
-          confirmExternalUse: confirmExternalUse,
-        );
-        final readiness = await _readiness(releaseDirectory, root);
-        if (readiness?.needsRepair ?? true) {
-          throw InstallException(
-            'Flutter $releaseVersion still needs repair: '
-            '${readiness?.repairReason ?? 'release validation failed'}.',
-          );
-        }
-        return RepairResult(
-          sourceKey: sourceKey,
-          replaced: true,
-          privateFilesRepaired: privateFilesRepaired,
-        );
       } finally {
         await _releaseLock(sourceLock);
       }
@@ -2436,6 +2442,62 @@ class FlutterInstaller {
     if (records == null) return const [];
     _validateCheckoutFileRecords(records);
     return (records as List<Object?>).cast<Map<String, Object?>>();
+  }
+
+  Future<Map<String, Object?>> _ensureReleaseCheckoutFileRecords(
+    Directory release,
+    Directory root,
+    Map<String, Object?> releaseManifest,
+  ) async {
+    if (releaseManifest['checkoutFiles'] != null) return releaseManifest;
+    final revision = releaseManifest['frameworkRevision'];
+    if (revision is! String ||
+        !RegExp(r'^[a-fA-F0-9]{40}$').hasMatch(revision)) {
+      throw const InstallException(
+        'the installed Flutter framework identity is invalid.',
+      );
+    }
+    final gitDirectory = p.join(root.path, 'flutter.git');
+    final blob = await Process.run('git', [
+      '--git-dir',
+      gitDirectory,
+      'show',
+      '$revision:bin/flutter',
+    ], workingDirectory: release.path);
+    if (blob.exitCode != 0 || blob.stdout is! String) {
+      throw InstallException(
+        'could not load the trusted Flutter launcher from revision $revision.',
+      );
+    }
+    final treeEntry = await Process.run('git', [
+      '--git-dir',
+      gitDirectory,
+      'ls-tree',
+      revision,
+      '--',
+      'bin/flutter',
+    ], workingDirectory: release.path);
+    final fields = '${treeEntry.stdout}'.trim().split(RegExp(r'\s+'));
+    if (treeEntry.exitCode != 0 ||
+        fields.length < 2 ||
+        !{'100644', '100755'}.contains(fields.first)) {
+      throw InstallException(
+        'could not read the trusted Flutter launcher mode at revision '
+        '$revision.',
+      );
+    }
+    final bytes = utf8.encode(blob.stdout! as String);
+    final updated = Map<String, Object?>.from(releaseManifest)
+      ..['checkoutFiles'] = [
+        {
+          'path': 'bin/flutter',
+          'sha256': sha256.convert(bytes).toString(),
+          'mode': fields.first == '100755' ? 0x1ed : 0x1a4,
+          'content': base64.encode(bytes),
+        },
+      ];
+    await _publishManifest(release.path, updated);
+    return updated;
   }
 
   Future<List<Map<String, Object?>>> _checkoutFileRecords(
