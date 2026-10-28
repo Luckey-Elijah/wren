@@ -4,6 +4,11 @@ import 'dart:io' as io;
 
 import 'package:pub_semver/pub_semver.dart';
 
+import 'src/installer.dart';
+
+export 'src/installer.dart'
+    show InstallEnvironment, InstallException, InstallResult;
+
 const _minimumDartVersion = '2.19.0';
 const _linuxCatalog =
     'https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json';
@@ -20,6 +25,7 @@ Future<int> runWren(
   StringSink? stderrSink,
   String? catalogJson,
   HostPlatform? host,
+  InstallEnvironment? installEnvironment,
 }) async {
   final out = stdoutSink ?? io.stdout;
   final err = stderrSink ?? io.stderr;
@@ -35,8 +41,13 @@ Future<int> runWren(
     return 0;
   }
 
-  if (parsed.command != 'releases') {
+  if (parsed.command != 'releases' && parsed.command != 'install') {
     err.writeln('wren: unknown command "${parsed.command}".');
+    err.writeln(_usage);
+    return 2;
+  }
+  if (parsed.command == 'install' && parsed.releaseVersion == null) {
+    err.writeln('wren: `install` requires a Flutter release version.');
     err.writeln(_usage);
     return 2;
   }
@@ -53,6 +64,24 @@ Future<int> runWren(
     final catalog = catalogJson == null
         ? await ReleaseCatalog.fetch(targetHost.catalogUri, host: targetHost)
         : ReleaseCatalog.parse(catalogJson, host: targetHost);
+    if (parsed.command == 'install') {
+      final version = parsed.releaseVersion!;
+      final eligibility = catalog.eligibilityForVersion(version);
+      final release = eligibility.release;
+      if (release == null) {
+        err.writeln(
+          'wren: Flutter $version cannot be installed: ${eligibility.reason}',
+        );
+        return 4;
+      }
+      final installer = FlutterInstaller(
+        installEnvironment ?? InstallEnvironment(),
+        onProgress: err.writeln,
+      );
+      final result = await installer.install(release, host: targetHost);
+      out.writeln(result.message);
+      return 0;
+    }
     if (parsed.releaseVersion case final version?) {
       final eligibility = catalog.eligibilityForVersion(version);
       if (eligibility.release case final release?) {
@@ -82,14 +111,21 @@ Future<int> runWren(
   } on ReleaseCatalogException catch (error) {
     err.writeln('wren: ${error.message}');
     return 4;
+  } on InstallException catch (error) {
+    err.writeln('wren: ${error.message}');
+    return 4;
+  } on Object catch (error) {
+    err.writeln('wren: ${parsed.command} failed: $error');
+    return 4;
   }
 }
 
 const _usage =
-    'Usage: wren [--verbose] releases [<release>]\n'
+    'Usage: wren [--verbose] <command> [<release>]\n'
     'Commands:\n'
     '  releases   List eligible stable and beta Flutter releases\n'
-    '             Check one release with: wren releases <release>';
+    '             Check one release with: wren releases <release>\n'
+    '  install    Install a stable Flutter release: wren install <release>';
 
 class _ParsedArguments {
   const _ParsedArguments({

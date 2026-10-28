@@ -1,0 +1,1042 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:crypto/crypto.dart';
+import 'package:path/path.dart' as p;
+import 'package:pub_semver/pub_semver.dart';
+
+import '../wren.dart' show FlutterRelease, HostPlatform;
+
+const _flutterGitUrl = 'https://github.com/flutter/flutter.git';
+const _engineRevisionPattern = r'^[a-fA-F0-9]{40}$';
+const _dartExecutable = 'bin/cache/dart-sdk/bin/dart';
+const _requiredDirectories = <String>[
+  'bin/cache/artifacts/engine/common/flutter_patched_sdk',
+  'bin/cache/artifacts/engine/common/flutter_patched_sdk_product',
+  'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux',
+  'bin/cache/artifacts/engine/linux-x64-release/flutter_linux',
+  'bin/cache/flutter_web_sdk',
+  'bin/cache/pkg/sky_engine',
+  'bin/cache/pkg/flutter_gpu',
+];
+const _sourceStampFiles = <String>[
+  'engine-dart-sdk.stamp',
+  'engine.stamp',
+  'flutter_sdk.stamp',
+  'linux-sdk.stamp',
+  'flutter_web_sdk.stamp',
+  'engine.realm',
+];
+const _requiredFiles = <String>[
+  _dartExecutable,
+  'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
+  'bin/cache/artifacts/engine/linux-x64/flutter_tester',
+  'bin/cache/artifacts/engine/linux-x64/libflutter_linux_gtk.so',
+  'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux/libflutter_linux_gtk.so',
+  'bin/cache/artifacts/engine/linux-x64-release/flutter_linux/libflutter_linux_gtk.so',
+];
+
+/// Local storage and source locations for one Wren installation.
+///
+/// The optional values are also useful for exercising installs against a
+/// temporary Git repository without contacting GitHub.
+class InstallEnvironment {
+  InstallEnvironment({Directory? dataDirectory, Uri? flutterRepository})
+    : dataDirectory = dataDirectory ?? _defaultDataDirectory(),
+      flutterRepository = flutterRepository ?? Uri.parse(_flutterGitUrl);
+
+  final Directory dataDirectory;
+  final Uri flutterRepository;
+}
+
+class InstallResult {
+  const InstallResult({required this.message, required this.alreadyInstalled});
+
+  final String message;
+  final bool alreadyInstalled;
+}
+
+class InstallException implements Exception {
+  const InstallException(this.message);
+
+  final String message;
+}
+
+class FlutterInstaller {
+  FlutterInstaller(this.environment, {this.onProgress});
+
+  final InstallEnvironment environment;
+  final void Function(String message)? onProgress;
+
+  Future<InstallResult> install(
+    FlutterRelease release, {
+    required HostPlatform host,
+  }) async {
+    if (!RegExp(r'^[a-fA-F0-9]{40}$').hasMatch(release.frameworkRevision)) {
+      throw const InstallException(
+        'the Flutter catalog has a missing or invalid framework revision.',
+      );
+    }
+    if (release.channel != 'stable') {
+      throw const InstallException(
+        'this Wren version can install stable Flutter releases only.',
+      );
+    }
+    if (host != HostPlatform.linuxX64) {
+      throw InstallException(
+        'stable installation is not implemented for ${host.label} yet.',
+      );
+    }
+
+    final root = environment.dataDirectory.absolute;
+    final releaseKey = '${release.channel}-${release.version}-linux-x64';
+    final releasePath = p.join(root.path, 'releases', releaseKey);
+    final lockPath = p.join(root.path, 'locks', 'install-$releaseKey');
+    final releaseLock = await _acquireLock(
+      Directory(lockPath),
+      onWait: () => _progress(
+        'Waiting for another install of Flutter ${release.version}',
+      ),
+    );
+    try {
+      final existing = await _existingInstall(releasePath, release, host);
+      if (existing == _ExistingInstall.healthy) {
+        return InstallResult(
+          message: 'Flutter ${release.version} is already installed and ready.',
+          alreadyInstalled: true,
+        );
+      }
+      if (existing == _ExistingInstall.damaged) {
+        throw InstallException(
+          'Flutter ${release.version} is installed but needs repair; run '
+          '`wren repair ${release.version}`.',
+        );
+      }
+
+      if (await Directory(releasePath).exists()) {
+        await _removeIncompleteWorktree(releasePath, root);
+      }
+      await Directory(releasePath).parent.create(recursive: true);
+      final stagingRoot = Directory(
+        p.join(root.path, 'staging', 'install-$releaseKey'),
+      );
+      final checkoutStage = Directory(p.join(stagingRoot.path, 'checkout'));
+      String? sourcePath;
+      var sourceCreated = false;
+      var checkoutPublished = false;
+      var worktreeCreated = false;
+      if (await stagingRoot.exists()) {
+        if (await Directory(p.join(root.path, 'flutter.git')).exists()) {
+          await _discardWorktree(root, checkoutStage.path);
+        }
+        await stagingRoot.delete(recursive: true);
+      }
+      await stagingRoot.create(recursive: true);
+      try {
+        _progress('Preparing Flutter ${release.version} for ${host.label}');
+        await _requireGit();
+        final repoLock = await _acquireLock(
+          Directory(p.join(root.path, 'locks', 'flutter-git')),
+          onWait: () => _progress('Waiting for the shared Flutter Git lock'),
+        );
+        try {
+          await _ensureSharedRepository(root);
+          await _fetchFrameworkCommit(
+            root,
+            release.frameworkRevision,
+            release.version,
+          );
+          await _runGit(root, [
+            '--git-dir',
+            p.join(root.path, 'flutter.git'),
+            'worktree',
+            'add',
+            '--detach',
+            checkoutStage.path,
+            release.frameworkRevision,
+          ], userMessage: 'could not create a detached Flutter worktree');
+          worktreeCreated = true;
+        } finally {
+          await _releaseLock(repoLock);
+        }
+
+        final checkoutRevision = await _gitText(checkoutStage.path, [
+          'rev-parse',
+          'HEAD',
+        ], userMessage: 'could not verify the Flutter checkout revision');
+        if (checkoutRevision.toLowerCase() !=
+            release.frameworkRevision.toLowerCase()) {
+          throw const InstallException(
+            'Flutter checkout revision does not match the release catalog.',
+          );
+        }
+        final releaseTag = await _gitText(checkoutStage.path, [
+          'describe',
+          '--tags',
+          '--exact-match',
+          'HEAD',
+        ], userMessage: 'could not verify the Flutter release tag');
+        if (releaseTag != release.version) {
+          throw InstallException(
+            'Flutter revision $checkoutRevision is not tagged as ${release.version}.',
+          );
+        }
+        final engineRevision = (await File(
+          p.join(checkoutStage.path, 'bin/internal/engine.version'),
+        ).readAsString()).trim();
+        if (!RegExp(_engineRevisionPattern).hasMatch(engineRevision)) {
+          throw const InstallException(
+            'the selected Flutter checkout has a missing or invalid engine revision.',
+          );
+        }
+        final resolvedSourceKey = _sourceKey(engineRevision, host);
+        final resolvedSourcePath = p.join(
+          root.path,
+          'sources',
+          resolvedSourceKey,
+        );
+        sourcePath = resolvedSourcePath;
+
+        final sourceLock = await _acquireLock(
+          Directory(p.join(root.path, 'locks', 'source-$resolvedSourceKey')),
+          onWait: () => _progress('Waiting for the shared engine source lock'),
+        );
+        try {
+          var artifactsPrepared = false;
+          final sourceDirectory = Directory(resolvedSourcePath);
+          if (await sourceDirectory.exists()) {
+            await _validateSource(
+              sourceDirectory,
+              engineRevision: engineRevision,
+              host: host,
+            );
+            await _materializeSource(sourceDirectory, checkoutStage);
+          } else {
+            _progress('Downloading Linux host and web artifacts');
+            // Flutter's artifact updater validates storage-provider transfer
+            // checksums and rejects archives it cannot extract. Wren checks
+            // the runtime identity and resulting host artifact layout.
+            await _runFlutter(
+              checkoutStage,
+              ['precache', '--linux', '--web'],
+              userMessage:
+                  'Flutter failed to download or extract required artifacts',
+            );
+            await _validateCheckout(
+              checkoutStage,
+              release: release,
+              frameworkRevision: checkoutRevision,
+              engineRevision: engineRevision,
+            );
+            artifactsPrepared = true;
+            final sourceStage = Directory(p.join(stagingRoot.path, 'source'));
+            await _createSource(
+              checkoutStage,
+              sourceStage,
+              engineRevision: engineRevision,
+              host: host,
+            );
+            await sourceDirectory.parent.create(recursive: true);
+            await sourceStage.rename(sourceDirectory.path);
+            sourceCreated = true;
+          }
+          if (!artifactsPrepared) {
+            _progress('Validating Linux host and web artifacts');
+            await _runFlutter(
+              checkoutStage,
+              ['precache', '--linux', '--web'],
+              userMessage:
+                  'Flutter failed to validate or prepare required artifacts',
+            );
+            await _validateCheckout(
+              checkoutStage,
+              release: release,
+              frameworkRevision: checkoutRevision,
+              engineRevision: engineRevision,
+            );
+          }
+        } finally {
+          await _releaseLock(sourceLock);
+        }
+        _validatePrivateCacheBoundary(checkoutStage, root);
+
+        await checkoutStage.rename(releasePath);
+        checkoutPublished = true;
+        final worktreeRepairLock = await _acquireLock(
+          Directory(p.join(root.path, 'locks', 'flutter-git')),
+        );
+        try {
+          await _runGit(root, [
+            '--git-dir',
+            p.join(root.path, 'flutter.git'),
+            'worktree',
+            'repair',
+            releasePath,
+          ], userMessage: 'could not update Flutter worktree metadata');
+        } finally {
+          await _releaseLock(worktreeRepairLock);
+        }
+
+        final manifest = <String, Object?>{
+          'format': 1,
+          'channel': release.channel,
+          'version': release.version,
+          'frameworkRevision': checkoutRevision,
+          'engineRevision': engineRevision,
+          'host': host.catalogOs,
+          'architecture': host.catalogArchitecture,
+          'canonicalDartVersion': release.dartVersion,
+          'archive': release.archive,
+          'archiveSha256': release.archiveSha256,
+          'sourceKey': resolvedSourceKey,
+          'state': 'ready',
+        };
+        await _publishManifest(releasePath, manifest);
+        return InstallResult(
+          message: 'Installed Flutter ${release.version} for ${host.label}.',
+          alreadyInstalled: false,
+        );
+      } on InstallException {
+        rethrow;
+      } on Object catch (error) {
+        throw InstallException(
+          'Flutter ${release.version} installation failed: $error',
+        );
+      } finally {
+        final ready = File(p.join(releasePath, '.wren-release.json'))
+            .existsSync();
+        if (!ready) {
+          if (checkoutPublished) {
+            await _discardWorktree(root, releasePath);
+            if (await Directory(releasePath).exists()) {
+              await Directory(releasePath).delete(recursive: true);
+            }
+          } else if (worktreeCreated) {
+            await _discardWorktree(root, checkoutStage.path);
+          }
+          if (sourceCreated &&
+              sourcePath != null &&
+              await Directory(sourcePath).exists()) {
+            await Directory(sourcePath).delete(recursive: true);
+          }
+        }
+        if (await stagingRoot.exists()) {
+          await stagingRoot.delete(recursive: true);
+        }
+      }
+    } finally {
+      await _releaseLock(releaseLock);
+    }
+  }
+
+  void _progress(String message) => onProgress?.call(message);
+
+  Future<void> _requireGit() async {
+    try {
+      final result = await Process.run('git', ['--version']);
+      if (result.exitCode != 0) {
+        throw StateError('git --version exited ${result.exitCode}');
+      }
+    } on Object catch (error) {
+      throw InstallException(
+        'Git is required to install Flutter. Install Git and retry. ($error)',
+      );
+    }
+  }
+
+  Future<void> _ensureSharedRepository(Directory root) async {
+    final repository = Directory(p.join(root.path, 'flutter.git'));
+    if (await repository.exists()) return;
+    await repository.parent.create(recursive: true);
+    final stagingRepository = Directory(
+      p.join(root.path, 'staging', 'flutter-repo'),
+    );
+    await stagingRepository.parent.create(recursive: true);
+    if (await stagingRepository.exists()) {
+      await stagingRepository.delete(recursive: true);
+    }
+    await _runGit(root, [
+      'init',
+      '--bare',
+      stagingRepository.path,
+    ], userMessage: 'could not initialize Wren’s shared Flutter repository');
+    await _runGit(root, [
+      '--git-dir',
+      stagingRepository.path,
+      'remote',
+      'add',
+      'origin',
+      environment.flutterRepository.toString(),
+    ], userMessage: 'could not configure the Flutter Git remote');
+    try {
+      await stagingRepository.rename(repository.path);
+    } catch (_) {
+      if (await repository.exists()) {
+        await stagingRepository.delete(recursive: true);
+      } else {
+        rethrow;
+      }
+    }
+  }
+
+  Future<void> _fetchFrameworkCommit(
+    Directory root,
+    String revision,
+    String version,
+  ) async {
+    await _runGit(root, [
+      '--git-dir',
+      p.join(root.path, 'flutter.git'),
+      'fetch',
+      '--filter=blob:none',
+      '--no-tags',
+      'origin',
+      revision,
+      'refs/tags/$version:refs/tags/$version',
+    ], userMessage: 'could not fetch Flutter framework revision $revision');
+  }
+
+  Future<void> _validateCheckout(
+    Directory checkout, {
+    required FlutterRelease release,
+    required String frameworkRevision,
+    required String engineRevision,
+  }) async {
+    final missingArtifact = _missingRequiredArtifact(checkout.path);
+    if (missingArtifact != null) {
+      throw InstallException(
+        'required Flutter artifact is missing: $missingArtifact.',
+      );
+    }
+
+    final flutterExecutable = File(p.join(checkout.path, 'bin/flutter'));
+    final dartExecutable = File(p.join(checkout.path, _dartExecutable));
+    _requireExecutable(flutterExecutable, 'Flutter');
+    _requireExecutable(dartExecutable, 'Dart');
+    for (final artifact in [
+      'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
+      'bin/cache/artifacts/engine/linux-x64/flutter_tester',
+    ]) {
+      _requireExecutable(File(p.join(checkout.path, artifact)), artifact);
+    }
+
+    final flutter = await _run(
+      flutterExecutable.path,
+      ['--version', '--machine'],
+      workingDirectory: checkout.path,
+      userMessage: 'the installed Flutter tool did not run',
+    );
+    final versionData = _decodeVersionOutput(flutter.stdout);
+    // Flutter reports [user-branch] for a detached worktree. Its framework
+    // revision and release tag are still checked against the catalog below.
+    final reportedChannel = versionData['channel'];
+    if ((reportedChannel != release.channel &&
+            reportedChannel != '[user-branch]') ||
+        versionData['flutterVersion'] != release.version ||
+        versionData['frameworkRevision'] != frameworkRevision ||
+        versionData['engineRevision'] != engineRevision) {
+      throw InstallException(
+        'Flutter runtime identity does not match the selected catalog release '
+        '(channel ${versionData['channel']}, version '
+        '${versionData['flutterVersion']}, framework '
+        '${versionData['frameworkRevision']}, engine '
+        '${versionData['engineRevision']}).',
+      );
+    }
+    final runtimeDartVersion = versionData['dartSdkVersion'];
+    if (runtimeDartVersion is! String ||
+        !_sameVersion(runtimeDartVersion, release.dartVersion)) {
+      throw InstallException(
+        'Flutter reports bundled Dart ${runtimeDartVersion ?? 'unknown'}; '
+        'the release catalog specifies ${release.dartVersion}.',
+      );
+    }
+
+    final dart = await _run(
+      dartExecutable.path,
+      ['--version'],
+      workingDirectory: checkout.path,
+      userMessage: 'the bundled Dart executable did not run',
+    );
+    final dartOutput = '${dart.stdout}\n${dart.stderr}';
+    final match = RegExp(r'Dart SDK version:\s+([^\s]+)')
+        .firstMatch(dartOutput);
+    final reportedDartVersion = match?.group(1);
+    if (reportedDartVersion == null ||
+        !_sameVersion(reportedDartVersion, release.dartVersion)) {
+      throw InstallException(
+        'bundled Dart reports ${reportedDartVersion ?? 'an unknown version'}; '
+        'the release catalog specifies ${release.dartVersion}.',
+      );
+    }
+  }
+
+  Future<_ExistingInstall> _existingInstall(
+    String releasePath,
+    FlutterRelease release,
+    HostPlatform host,
+  ) async {
+    final marker = File(p.join(releasePath, '.wren-release.json'));
+    if (!await marker.exists()) return _ExistingInstall.incomplete;
+    try {
+      final data =
+          jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+      if (data['state'] != 'ready' ||
+          data['channel'] != release.channel ||
+          data['version'] != release.version ||
+          data['frameworkRevision'] != release.frameworkRevision ||
+          data['host'] != host.catalogOs ||
+          data['architecture'] != host.catalogArchitecture) {
+        return _ExistingInstall.damaged;
+      }
+      if (_missingRequiredArtifact(releasePath) != null) {
+        return _ExistingInstall.damaged;
+      }
+      return _ExistingInstall.healthy;
+    } on Object {
+      return _ExistingInstall.damaged;
+    }
+  }
+
+  Future<void> _createSource(
+    Directory checkout,
+    Directory sourceStage, {
+    required String engineRevision,
+    required HostPlatform host,
+  }) async {
+    await sourceStage.create(recursive: true);
+    // Keep immutable artifact payloads in the source; stamps, tool snapshots,
+    // downloads, and other mutable cache state stay in the release checkout.
+    for (final relativePath in _sourceArtifactPaths) {
+      final source = Directory(p.join(checkout.path, relativePath));
+      if (!await source.exists()) {
+        throw InstallException(
+          'cannot retain missing shared artifact $relativePath.',
+        );
+      }
+      await _copyTree(
+        source,
+        Directory(p.join(sourceStage.path, relativePath)),
+      );
+    }
+    for (final relativePath in _sourceArtifactPaths) {
+      if (!await Directory(p.join(sourceStage.path, relativePath)).exists()) {
+        throw InstallException(
+          'shared artifact source is incomplete at $relativePath.',
+        );
+      }
+    }
+    final stamps = <String, String>{};
+    for (final relativePath in _sourceStampFiles) {
+      final stamp = File(p.join(checkout.path, 'bin/cache', relativePath));
+      if (await stamp.exists()) {
+        stamps[relativePath] = await stamp.readAsString();
+      }
+    }
+    for (final relativePath in _sourceStampFiles.where(
+      (path) => path != 'engine.realm',
+    )) {
+      if (stamps[relativePath]?.trim() != engineRevision) {
+        throw InstallException(
+          'Flutter cache stamp $relativePath does not match engine revision '
+          '$engineRevision.',
+        );
+      }
+    }
+    if (stamps['engine.realm'] == null) {
+      throw const InstallException('Flutter cache is missing engine.realm.');
+    }
+    await _publishManifest(sourceStage.path, {
+      'format': 1,
+      'engineRevision': engineRevision,
+      'host': host.catalogOs,
+      'architecture': host.catalogArchitecture,
+      'archiveVariant': 'linux-x64',
+      'artifacts': _sourceArtifactPaths,
+      'stamps': stamps,
+      'inventory': await _sourceInventory(sourceStage),
+      'state': 'ready',
+    }, filename: '.wren-source.json');
+  }
+
+  Future<void> _validateSource(
+    Directory source, {
+    required String engineRevision,
+    required HostPlatform host,
+  }) async {
+    final marker = File(p.join(source.path, '.wren-source.json'));
+    if (!await marker.exists()) {
+      throw const InstallException(
+        'the retained host artifact source is damaged.',
+      );
+    }
+    try {
+      final data =
+          jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+      if (data['state'] != 'ready' ||
+          data['engineRevision'] != engineRevision ||
+          data['host'] != host.catalogOs ||
+          data['architecture'] != host.catalogArchitecture ||
+          data['archiveVariant'] != 'linux-x64' ||
+          jsonEncode(data['artifacts']) != jsonEncode(_sourceArtifactPaths)) {
+        throw const InstallException(
+          'the retained host artifact source is damaged.',
+        );
+      }
+      for (final relativePath in _sourceArtifactPaths) {
+        if (!await Directory(p.join(source.path, relativePath)).exists()) {
+          throw const InstallException(
+            'the retained host artifact source is damaged.',
+          );
+        }
+      }
+      if (jsonEncode(data['inventory']) !=
+          jsonEncode(await _sourceInventory(source))) {
+        throw const InstallException(
+          'the retained host artifact source is damaged.',
+        );
+      }
+      final stamps = data['stamps'];
+      if (stamps is! Map<String, Object?> ||
+          stamps.keys
+              .toSet()
+              .difference(_sourceStampFiles.toSet())
+              .isNotEmpty ||
+          stamps.keys.toSet().containsAll(
+                _sourceStampFiles.where((path) => path != 'engine.realm'),
+              ) ==
+              false ||
+          _sourceStampFiles
+              .where((path) => path != 'engine.realm')
+              .any((path) => '${stamps[path]}'.trim() != engineRevision) ||
+          stamps['engine.realm'] == null) {
+        throw const InstallException(
+          'the retained host artifact source is damaged.',
+        );
+      }
+    } on InstallException {
+      rethrow;
+    } on Object {
+      throw const InstallException(
+        'the retained host artifact source is damaged.',
+      );
+    }
+  }
+
+  Future<void> _materializeSource(Directory source, Directory checkout) async {
+    final data = jsonDecode(
+      await File(p.join(source.path, '.wren-source.json')).readAsString(),
+    ) as Map<String, Object?>;
+    for (final relativePath in _sourceArtifactPaths) {
+      final destination = Directory(p.join(checkout.path, relativePath));
+      if (await destination.exists()) await destination.delete(recursive: true);
+      await _copyTree(
+        Directory(p.join(source.path, relativePath)),
+        destination,
+      );
+    }
+    final stamps = data['stamps'] as Map<String, Object?>;
+    for (final entry in stamps.entries) {
+      await File(p.join(checkout.path, 'bin/cache', entry.key))
+          .writeAsString(entry.value as String, flush: true);
+    }
+  }
+
+  Future<void> _publishManifest(
+    String directory,
+    Map<String, Object?> manifest, {
+    String filename = '.wren-release.json',
+  }) async {
+    final target = File(p.join(directory, filename));
+    final temporary = File('${target.path}.tmp-${_randomId()}');
+    await temporary.writeAsString(jsonEncode(manifest), flush: true);
+    await temporary.rename(target.path);
+  }
+
+  Future<void> _removeIncompleteWorktree(String path, Directory root) async {
+    if (await Directory(p.join(root.path, 'flutter.git')).exists()) {
+      await _discardWorktree(root, path);
+    }
+    if (await Directory(path).exists()) {
+      await Directory(path).delete(recursive: true);
+    }
+  }
+
+  Future<void> _discardWorktree(Directory root, String path) async {
+    final lock = await _acquireLock(
+      Directory(p.join(root.path, 'locks', 'flutter-git')),
+    );
+    try {
+      final result = await Process.run('git', [
+        '--git-dir',
+        p.join(root.path, 'flutter.git'),
+        'worktree',
+        'remove',
+        '--force',
+        path,
+      ]);
+      if (result.exitCode != 0 && await Directory(path).exists()) {
+        await Directory(path).delete(recursive: true);
+      }
+      await Process.run('git', [
+        '--git-dir',
+        p.join(root.path, 'flutter.git'),
+        'worktree',
+        'prune',
+      ]);
+    } finally {
+      await _releaseLock(lock);
+    }
+  }
+
+  Future<String> _gitText(
+    String workingDirectory,
+    List<String> arguments, {
+    required String userMessage,
+  }) async {
+    final result = await Process.run(
+      'git',
+      arguments,
+      workingDirectory: workingDirectory,
+    );
+    if (result.exitCode != 0) {
+      throw InstallException('$userMessage: ${_processDetails(result)}');
+    }
+    return '${result.stdout}'.trim();
+  }
+
+  Future<void> _runGit(
+    Directory root,
+    List<String> arguments, {
+    required String userMessage,
+  }) async {
+    final result = await Process.run(
+      'git',
+      arguments,
+      workingDirectory: root.path,
+    );
+    if (result.exitCode != 0) {
+      throw InstallException('$userMessage: ${_processDetails(result)}');
+    }
+  }
+
+  Future<ProcessResult> _runFlutter(
+    Directory checkout,
+    List<String> arguments, {
+    required String userMessage,
+  }) => _run(
+    p.join(checkout.path, 'bin/flutter'),
+    arguments,
+    workingDirectory: checkout.path,
+    userMessage: userMessage,
+  );
+
+  Future<ProcessResult> _run(
+    String executable,
+    List<String> arguments, {
+    required String workingDirectory,
+    required String userMessage,
+  }) async {
+    try {
+      final result = await Process.run(
+        executable,
+        arguments,
+        workingDirectory: workingDirectory,
+      );
+      if (result.exitCode != 0) {
+        throw InstallException('$userMessage: ${_processDetails(result)}');
+      }
+      return result;
+    } on InstallException {
+      rethrow;
+    } on Object catch (error) {
+      throw InstallException('$userMessage: $error');
+    }
+  }
+
+  void _requireExecutable(File file, String name) {
+    if (!file.existsSync()) {
+      throw InstallException(
+        'required $name executable is missing: ${file.path}.',
+      );
+    }
+    final mode = file.statSync().mode;
+    if (mode & 0x49 == 0) {
+      throw InstallException(
+        'required $name file is not executable: ${file.path}.',
+      );
+    }
+  }
+}
+
+enum _ExistingInstall { incomplete, healthy, damaged }
+
+const _sourceArtifactPaths = <String>[
+  'bin/cache/dart-sdk',
+  'bin/cache/artifacts/engine/common',
+  'bin/cache/artifacts/engine/linux-x64',
+  'bin/cache/artifacts/engine/linux-x64-profile',
+  'bin/cache/artifacts/engine/linux-x64-release',
+  'bin/cache/flutter_web_sdk',
+  'bin/cache/pkg/sky_engine',
+  'bin/cache/pkg/flutter_gpu',
+];
+
+String? _missingRequiredArtifact(String rootPath) {
+  for (final relativePath in _requiredDirectories) {
+    if (FileSystemEntity.typeSync(
+          p.join(rootPath, relativePath),
+          followLinks: true,
+        ) !=
+        FileSystemEntityType.directory) {
+      return relativePath;
+    }
+  }
+  for (final relativePath in _requiredFiles) {
+    if (FileSystemEntity.typeSync(
+          p.join(rootPath, relativePath),
+          followLinks: true,
+        ) !=
+        FileSystemEntityType.file) {
+      return relativePath;
+    }
+  }
+  return null;
+}
+
+Future<List<Map<String, String>>> _sourceInventory(Directory source) async {
+  final entries = <Map<String, String>>[];
+  for (final relativePath in _sourceArtifactPaths) {
+    final root = Directory(p.join(source.path, relativePath));
+    await for (final entity in root.list(recursive: true, followLinks: false)) {
+      if (FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        if (FileSystemEntity.typeSync(entity.path, followLinks: false) ==
+            FileSystemEntityType.link) {
+          throw const InstallException(
+            'the retained host artifact source contains a symbolic link.',
+          );
+        }
+        continue;
+      }
+      final digest = await sha256.bind(File(entity.path).openRead()).first;
+      entries.add({
+        'path': p.relative(entity.path, from: source.path),
+        'sha256': digest.toString(),
+      });
+    }
+  }
+  entries.sort((left, right) => left['path']!.compareTo(right['path']!));
+  return entries;
+}
+
+Directory _defaultDataDirectory() {
+  final env = Platform.environment;
+  final override = env['WREN_DATA_DIR'];
+  if (override != null && override.trim().isNotEmpty) {
+    return Directory(override);
+  }
+  final xdg = env['XDG_DATA_HOME'];
+  if (xdg != null && xdg.trim().isNotEmpty) {
+    return Directory(p.join(xdg, 'wren'));
+  }
+  final home = env['HOME'];
+  final base = home == null || home.isEmpty ? Directory.current.path : home;
+  return Directory(p.join(base, '.local', 'share', 'wren'));
+}
+
+Future<Directory> _acquireLock(
+  Directory lock, {
+  void Function()? onWait,
+}) async {
+  await lock.parent.create(recursive: true);
+  var reportedWait = false;
+  for (var attempt = 0; attempt < 36000; attempt++) {
+    try {
+      await lock.create();
+      await File(p.join(lock.path, 'owner')).writeAsString('$pid\n');
+      return lock;
+    } on FileSystemException {
+      if (!await lock.exists()) rethrow;
+      if (await _isStaleLock(lock)) {
+        try {
+          await lock.delete(recursive: true);
+        } on FileSystemException {
+          // Another waiter may have removed it first.
+        }
+        continue;
+      }
+      if (!reportedWait) {
+        reportedWait = true;
+        onWait?.call();
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+  }
+  throw InstallException(
+    'timed out waiting for Wren install lock ${lock.path}.',
+  );
+}
+
+Future<bool> _isStaleLock(Directory lock) async {
+  final ownerFile = File(p.join(lock.path, 'owner'));
+  final modified = (await lock.stat()).modified;
+  final age = DateTime.now().difference(modified);
+  if (!await ownerFile.exists()) return age > const Duration(seconds: 3);
+  final ownerPid = int.tryParse((await ownerFile.readAsString()).trim());
+  if (ownerPid == null) return age > const Duration(seconds: 3);
+  final probe = await Process.run('kill', ['-0', '$ownerPid']);
+  return probe.exitCode != 0 && age > const Duration(seconds: 3);
+}
+
+Future<void> _releaseLock(Directory lock) async {
+  if (await lock.exists()) await lock.delete(recursive: true);
+}
+
+Future<void> _copyTree(
+  Directory source,
+  Directory destination, {
+  Set<String>? activeDirectories,
+}) async {
+  final active = activeDirectories ?? <String>{};
+  final canonicalSource = p.normalize(await source.resolveSymbolicLinks());
+  if (!active.add(canonicalSource)) {
+    throw FileSystemException(
+      'artifact directory links contain a cycle',
+      source.path,
+    );
+  }
+  if (await _copyWithReflink(source, destination)) {
+    active.remove(canonicalSource);
+    return;
+  }
+  await destination.create(recursive: true);
+  try {
+    await for (final entity in source.list(followLinks: false)) {
+      final targetPath = p.join(destination.path, p.basename(entity.path));
+      switch (FileSystemEntity.typeSync(entity.path, followLinks: false)) {
+        case FileSystemEntityType.directory:
+          await _copyTree(
+            Directory(entity.path),
+            Directory(targetPath),
+            activeDirectories: active,
+          );
+        case FileSystemEntityType.file:
+          await File(entity.path).copy(targetPath);
+        case FileSystemEntityType.link:
+          final link = Link(entity.path);
+          final resolvedTarget = await link.resolveSymbolicLinks();
+          switch (FileSystemEntity.typeSync(
+            resolvedTarget,
+            followLinks: true,
+          )) {
+            case FileSystemEntityType.directory:
+              await _copyTree(
+                Directory(resolvedTarget),
+                Directory(targetPath),
+                activeDirectories: active,
+              );
+            case FileSystemEntityType.file:
+              await File(resolvedTarget).copy(targetPath);
+            default:
+              throw FileSystemException(
+                'artifact link target is not a file or directory',
+                entity.path,
+              );
+          }
+        case FileSystemEntityType.notFound:
+          throw FileSystemException(
+            'artifact disappeared while copying',
+            entity.path,
+          );
+        default:
+          throw FileSystemException(
+            'unsupported artifact file type',
+            entity.path,
+          );
+      }
+    }
+  } finally {
+    active.remove(canonicalSource);
+  }
+}
+
+Future<bool> _copyWithReflink(Directory source, Directory destination) async {
+  await for (final entity in source.list(recursive: true, followLinks: false)) {
+    if (FileSystemEntity.typeSync(entity.path, followLinks: false) ==
+        FileSystemEntityType.link) {
+      return false;
+    }
+  }
+  await destination.parent.create(recursive: true);
+  ProcessResult result;
+  try {
+    result = await Process.run('cp', [
+      '-a',
+      '--reflink=auto',
+      source.path,
+      destination.path,
+    ]);
+  } on Object {
+    return false;
+  }
+  if (result.exitCode == 0) return true;
+  if (await destination.exists()) await destination.delete(recursive: true);
+  return false;
+}
+
+void _validatePrivateCacheBoundary(Directory checkout, Directory root) {
+  final cache = Directory(p.join(checkout.path, 'bin/cache'));
+  final sharedSources = p.join(root.path, 'sources');
+  for (final entity in cache.listSync(recursive: true, followLinks: false)) {
+    if (FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+        FileSystemEntityType.link) {
+      continue;
+    }
+    final resolved = p.normalize(
+      p.absolute(Link(entity.path).resolveSymbolicLinksSync()),
+    );
+    if (p.isWithin(sharedSources, resolved)) {
+      throw InstallException(
+        'private Flutter cache path ${entity.path} links into the shared artifact source.',
+      );
+    }
+  }
+}
+
+Map<String, Object?> _decodeVersionOutput(Object output) {
+  try {
+    final decoded = jsonDecode('$output');
+    if (decoded is Map<String, Object?>) return decoded;
+  } on FormatException {
+    // The failure below adds an actionable Flutter-specific message.
+  }
+  throw const InstallException(
+    'Flutter returned invalid --version --machine JSON.',
+  );
+}
+
+bool _sameVersion(String left, String right) {
+  try {
+    return Version.parse(left) == Version.parse(right);
+  } on FormatException {
+    return false;
+  }
+}
+
+String _sourceKey(String engineRevision, HostPlatform host) =>
+    '$engineRevision-${host.catalogOs}-${host.catalogArchitecture}';
+
+String _randomId() {
+  final random = Random.secure();
+  return List<int>.generate(
+    16,
+    (_) => random.nextInt(256),
+  ).map((value) => value.toRadixString(16).padLeft(2, '0')).join();
+}
+
+String _processDetails(ProcessResult result) {
+  final output = '${result.stderr}\n${result.stdout}'.trim();
+  return output.isEmpty ? 'exit code ${result.exitCode}' : output;
+}
