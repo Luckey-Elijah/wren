@@ -1,0 +1,39 @@
+Type: grilling
+Status: resolved
+Blocked by: 05
+
+## Question
+
+What are the user-visible rules for interrupted installs, corrupted caches, concurrent Wren processes, failed SDK launches, removal of active versions, and cleanup of unreferenced shared assets?
+
+## Answer
+
+An interrupted or failed install never becomes ready or appears in `list`. Retrying `wren install <release>` discards that release's incomplete stage and starts fresh; it does not resume downloads. Other abandoned stages remain until explicit cleanup. If two processes install the same release, the second waits for the first: it accepts the completed install if the first succeeds, or starts a fresh attempt if the first fails. A healthy already installed release makes `install` a no-op.
+
+Wren shows a wait message when another Wren process holds a required lock or a Wren-launched SDK holds a use lease needed by `remove` or `repair`. Ctrl-C cancels only the waiting command with status `6`; the command holding the lock or lease continues. Different releases may still install concurrently under the lock model in [Install and cache model](05-install-and-cache-model.md).
+
+A release whose required checkout or release-private artifacts are found missing or invalid remains registered but appears as “needs repair” in `list`. The same applies to every release referencing a retained shared artifact source found damaged, even when its private files are healthy, as decided in [Shared artifact reuse policy](13-shared-artifact-reuse-policy.md). `list` reports known damage and checks cheap readiness signals; SDK launch checks required files and source readiness metadata before starting. Neither command fully rehashes every artifact. If the selected release needs repair, Wren does not silently choose another release: it fails before launch with status `3` and tells the user to run `wren repair <release>`. `wren install <release>` on a release needing repair also directs the user to `repair` rather than reporting success.
+
+`wren repair <release>` fully validates the retained shared source and the release's private host artifacts and already-present optional device/build-target artifacts; it does not fetch never-used platforms. It reports success without downloading when they are healthy and otherwise stages and validates replacements before publication. Rebuilding a shared source alone changes no live SDK path and does not wait for SDK users or request editor-close confirmation. A private-file repair waits visibly for Wren-launched users of that release and follows the external-use confirmation rule. A failed or interrupted repair does not publish partial replacements; affected releases remain marked as needing repair. After rebuilding a shared source once, Wren validates each dependent release and automatically restores availability to those whose private files are healthy; releases with damaged private files still need their own repair.
+
+If prelaunch checks find damage, the command returns status `3`. If the SDK executable cannot start, Wren returns status `5`; it marks the release as needing repair only when missing or invalid files caused the failure. Other OS start errors leave install state unchanged. Once the SDK starts, its exit status passes through as specified in [CLI and execution contract](06-cli-and-execution-contract.md), even if it fails.
+
+`wren remove <release>` may remove the release selected by the current project or named by the global fallback. It waits for Wren-launched users of that release, then makes the release unavailable before deleting its files. Reclaiming the retained shared source also waits for active installs or repairs using it. When that release is the global fallback, Wren clears the fallback as it becomes unavailable; it never changes the project's pubspec. It reports the resulting active release or lack of one. If removal fails after deletion begins, the release stays unavailable, the command reports status `4`, and rerunning `remove` finishes cleanup. Successful removal reclaims shared sources with no remaining installed-release or active install/repair references; the existing last-release prompt for the shared Git repository still applies.
+
+Crash-orphaned stages and unreferenced shared sources are otherwise retained until explicit `wren cleanup`. `wren cleanup --dry-run` previews candidates. The ordinary command needs no second confirmation, deletes only entries it can prove have no installed-release or active install/repair reference, and reports what it reclaimed. It preserves the optional shared Git repository and Wren's retained rollback binary. Failed `install`, `repair`, `remove`, or `cleanup` operations return status `4`; cancelling a lock or lease wait returns status `6`.
+
+The additional confirmation for SDK paths supplied to editors is specified in [External SDK integration](09-external-sdk-integration.md).
+
+## Comments
+
+First decision round pending (2026-10-27): retry of interrupted staged installs, repair of damaged ready releases or shared artifacts, removal of a selected release, lock contention, and crash-orphan cleanup.
+
+First-round decisions (2026-10-27): A retry discards the interrupted release's staged work and starts fresh. Damaged ready releases or shared artifacts require an explicit repair action before launch. Explicit `remove` proceeds after Wren-launched users exit; if it removes the global fallback, Wren clears that setting and reports the resulting selection. Commands wait visibly for contended locks and let Ctrl-C cancel their own wait. Crash-orphaned stages and unreferenced shared assets remain until an explicit cleanup action; normal `remove` still reclaims newly unreferenced assets as decided in [Install and cache model](05-install-and-cache-model.md).
+
+Second-round decisions (2026-10-27): Add `wren repair <release>` for explicit repair; `install` is a no-op for an already healthy installed release. Add `wren cleanup` with `--dry-run`; it deletes only provable crash orphans and does not delete the optional shared Git repository. `list` displays a damaged installed release as needing repair, and SDK selection fails with a repair instruction instead of silently choosing another release. A second install of the same release waits, accepts the first successful result, or starts fresh if the first failed. A failed SDK start marks the release as needing repair only when files are missing or fail validation; unrelated OS launch errors return status 5 without changing install state, and a started SDK's exit status passes through. If removal fails after deletion begins, the release remains unavailable and a later `remove` finishes cleanup; the global fallback is cleared when the release becomes unavailable.
+
+Third-round decisions (2026-10-27): `list` reports known damage and checks cheap readiness signals; SDK launch checks required files; `repair` performs full validation. Repair of a shared artifact waits visibly for Wren-launched users of it and stages and validates replacement before publication; failed repair leaves affected releases needing repair. Repair of a healthy release reports health without downloading, while `install` on a damaged release directs the user to `repair`. Explicit `cleanup` needs no second prompt, reports reclaimed space, and offers `--dry-run`; it preserves the shared Git repository and Wren rollback binary. Damage found before SDK start returns status 3, an actual process-start failure returns 5, failed Wren operations return 4, and cancelling a wait returns 6.
+
+The human confirmed the consolidated answer on 2026-10-27. The answer above is the resolution.
+
+Shared-source and release-private repair details were updated after [Shared artifact reuse policy](13-shared-artifact-reuse-policy.md) was confirmed on 2026-10-28. Earlier comments retain the decision history.

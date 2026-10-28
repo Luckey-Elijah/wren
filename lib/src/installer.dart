@@ -11,30 +11,84 @@ import '../wren.dart' show FlutterRelease, HostPlatform;
 const _flutterGitUrl = 'https://github.com/flutter/flutter.git';
 const _engineRevisionPattern = r'^[a-fA-F0-9]{40}$';
 const _dartExecutable = 'bin/cache/dart-sdk/bin/dart';
-const _requiredDirectories = <String>[
+const _commonRequiredDirectories = <String>[
   'bin/cache/artifacts/engine/common/flutter_patched_sdk',
   'bin/cache/artifacts/engine/common/flutter_patched_sdk_product',
-  'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux',
-  'bin/cache/artifacts/engine/linux-x64-release/flutter_linux',
   'bin/cache/flutter_web_sdk',
   'bin/cache/pkg/sky_engine',
   'bin/cache/pkg/flutter_gpu',
 ];
-const _sourceStampFiles = <String>[
+const _commonSourceStampFiles = <String>[
   'engine-dart-sdk.stamp',
   'engine.stamp',
   'flutter_sdk.stamp',
-  'linux-sdk.stamp',
   'flutter_web_sdk.stamp',
   'engine.realm',
 ];
-const _requiredFiles = <String>[
-  _dartExecutable,
+const _dartRequiredFiles = <String>[_dartExecutable];
+const _linuxRequiredFiles = <String>[
   'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
   'bin/cache/artifacts/engine/linux-x64/flutter_tester',
   'bin/cache/artifacts/engine/linux-x64/libflutter_linux_gtk.so',
   'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux/libflutter_linux_gtk.so',
   'bin/cache/artifacts/engine/linux-x64-release/flutter_linux/libflutter_linux_gtk.so',
+];
+
+List<String> _requiredDirectories(HostPlatform host) => [
+  ..._commonRequiredDirectories,
+  if (host == HostPlatform.linuxX64)
+    'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux',
+  if (host == HostPlatform.linuxX64)
+    'bin/cache/artifacts/engine/linux-x64-release/flutter_linux',
+  if (host == HostPlatform.macosArm64)
+    'bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework',
+  if (host == HostPlatform.macosArm64)
+    'bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework',
+  if (host == HostPlatform.macosArm64)
+    'bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework',
+];
+
+List<String> _requiredFiles(HostPlatform host) => [
+  ..._dartRequiredFiles,
+  if (host == HostPlatform.linuxX64) ..._linuxRequiredFiles,
+  if (host == HostPlatform.macosArm64) ...[
+    'bin/cache/artifacts/engine/darwin-arm64/gen_snapshot',
+    'bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework/Info.plist',
+    'bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework/Info.plist',
+    'bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework/Info.plist',
+  ],
+];
+
+List<String> _sourceStampFiles(HostPlatform host) => [
+  ..._commonSourceStampFiles,
+  host == HostPlatform.linuxX64 ? 'linux-sdk.stamp' : 'macos-sdk.stamp',
+];
+
+List<String> _sourceArtifactPaths(HostPlatform host) => [
+  'bin/cache/dart-sdk',
+  'bin/cache/artifacts/engine/common',
+  if (host == HostPlatform.linuxX64) ...[
+    'bin/cache/artifacts/engine/linux-x64',
+    'bin/cache/artifacts/engine/linux-x64-profile',
+    'bin/cache/artifacts/engine/linux-x64-release',
+  ],
+  if (host == HostPlatform.macosArm64) ...[
+    'bin/cache/artifacts/engine/darwin-arm64',
+    'bin/cache/artifacts/engine/darwin-arm64-profile',
+    'bin/cache/artifacts/engine/darwin-arm64-release',
+  ],
+  'bin/cache/flutter_web_sdk',
+  'bin/cache/pkg/sky_engine',
+  'bin/cache/pkg/flutter_gpu',
+];
+
+String _archiveVariant(HostPlatform host) =>
+    host == HostPlatform.linuxX64 ? 'linux-x64' : 'darwin-arm64';
+
+List<String> _precacheArguments(HostPlatform host) => [
+  'precache',
+  host == HostPlatform.linuxX64 ? '--linux' : '--macos',
+  '--web',
 ];
 
 /// Local storage and source locations for one Wren installation.
@@ -491,14 +545,9 @@ class FlutterInstaller {
         'this Wren version can install stable Flutter releases only.',
       );
     }
-    if (host != HostPlatform.linuxX64) {
-      throw InstallException(
-        'stable installation is not implemented for ${host.label} yet.',
-      );
-    }
-
     final root = environment.dataDirectory.absolute;
-    final releaseKey = '${release.channel}-${release.version}-linux-x64';
+    final releaseKey =
+        '${release.channel}-${release.version}-${_archiveVariant(host)}';
     final releasePath = p.join(root.path, 'releases', releaseKey);
     final lockPath = p.join(root.path, 'locks', 'install-$releaseKey');
     final releaseLock = await _acquireLock(
@@ -619,15 +668,15 @@ class FlutterInstaller {
               engineRevision: engineRevision,
               host: host,
             );
-            await _materializeSource(sourceDirectory, checkoutStage);
+            await _materializeSource(sourceDirectory, checkoutStage, host);
           } else {
-            _progress('Downloading Linux host and web artifacts');
+            _progress('Downloading ${host.label} and web artifacts');
             // Flutter's artifact updater validates storage-provider transfer
             // checksums and rejects archives it cannot extract. Wren checks
             // the runtime identity and resulting host artifact layout.
             await _runFlutter(
               checkoutStage,
-              ['precache', '--linux', '--web'],
+              _precacheArguments(host),
               userMessage:
                   'Flutter failed to download or extract required artifacts',
             );
@@ -636,6 +685,7 @@ class FlutterInstaller {
               release: release,
               frameworkRevision: checkoutRevision,
               engineRevision: engineRevision,
+              host: host,
             );
             artifactsPrepared = true;
             final sourceStage = Directory(p.join(stagingRoot.path, 'source'));
@@ -650,10 +700,10 @@ class FlutterInstaller {
             sourceCreated = true;
           }
           if (!artifactsPrepared) {
-            _progress('Validating Linux host and web artifacts');
+            _progress('Validating ${host.label} and web artifacts');
             await _runFlutter(
               checkoutStage,
-              ['precache', '--linux', '--web'],
+              _precacheArguments(host),
               userMessage:
                   'Flutter failed to validate or prepare required artifacts',
             );
@@ -662,6 +712,7 @@ class FlutterInstaller {
               release: release,
               frameworkRevision: checkoutRevision,
               engineRevision: engineRevision,
+              host: host,
             );
           }
         } finally {
@@ -810,8 +861,9 @@ class FlutterInstaller {
     required FlutterRelease release,
     required String frameworkRevision,
     required String engineRevision,
+    required HostPlatform host,
   }) async {
-    final missingArtifact = _missingRequiredArtifact(checkout.path);
+    final missingArtifact = _missingRequiredArtifact(checkout.path, host);
     if (missingArtifact != null) {
       throw InstallException(
         'required Flutter artifact is missing: $missingArtifact.',
@@ -822,10 +874,7 @@ class FlutterInstaller {
     final dartExecutable = File(p.join(checkout.path, _dartExecutable));
     _requireExecutable(flutterExecutable, 'Flutter');
     _requireExecutable(dartExecutable, 'Dart');
-    for (final artifact in [
-      'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
-      'bin/cache/artifacts/engine/linux-x64/flutter_tester',
-    ]) {
+    for (final artifact in _hostExecutables(host)) {
       _requireExecutable(File(p.join(checkout.path, artifact)), artifact);
     }
 
@@ -878,6 +927,18 @@ class FlutterInstaller {
         'the release catalog specifies ${release.dartVersion}.',
       );
     }
+    final reportedDartHost = RegExp(r'on "([^"]+)"')
+        .firstMatch(dartOutput)
+        ?.group(1);
+    final expectedDartHost = host == HostPlatform.linuxX64
+        ? 'linux_x64'
+        : 'macos_arm64';
+    if (reportedDartHost != expectedDartHost) {
+      throw InstallException(
+        'bundled Dart runs as ${reportedDartHost ?? 'an unknown host'}; '
+        'Wren requires native $expectedDartHost.',
+      );
+    }
   }
 
   Future<_ExistingInstall> _existingInstall(
@@ -898,7 +959,7 @@ class FlutterInstaller {
           data['architecture'] != host.catalogArchitecture) {
         return _ExistingInstall.damaged;
       }
-      if (_missingRequiredArtifact(releasePath) != null) {
+      if (_missingRequiredArtifact(releasePath, host) != null) {
         return _ExistingInstall.damaged;
       }
       return _ExistingInstall.healthy;
@@ -916,7 +977,9 @@ class FlutterInstaller {
     await sourceStage.create(recursive: true);
     // Keep immutable artifact payloads in the source; stamps, tool snapshots,
     // downloads, and other mutable cache state stay in the release checkout.
-    for (final relativePath in _sourceArtifactPaths) {
+    final artifactPaths = _sourceArtifactPaths(host);
+    final stampFiles = _sourceStampFiles(host);
+    for (final relativePath in artifactPaths) {
       final source = Directory(p.join(checkout.path, relativePath));
       if (!await source.exists()) {
         throw InstallException(
@@ -928,7 +991,7 @@ class FlutterInstaller {
         Directory(p.join(sourceStage.path, relativePath)),
       );
     }
-    for (final relativePath in _sourceArtifactPaths) {
+    for (final relativePath in artifactPaths) {
       if (!await Directory(p.join(sourceStage.path, relativePath)).exists()) {
         throw InstallException(
           'shared artifact source is incomplete at $relativePath.',
@@ -936,13 +999,13 @@ class FlutterInstaller {
       }
     }
     final stamps = <String, String>{};
-    for (final relativePath in _sourceStampFiles) {
+    for (final relativePath in stampFiles) {
       final stamp = File(p.join(checkout.path, 'bin/cache', relativePath));
       if (await stamp.exists()) {
         stamps[relativePath] = await stamp.readAsString();
       }
     }
-    for (final relativePath in _sourceStampFiles.where(
+    for (final relativePath in stampFiles.where(
       (path) => path != 'engine.realm',
     )) {
       if (stamps[relativePath]?.trim() != engineRevision) {
@@ -960,10 +1023,10 @@ class FlutterInstaller {
       'engineRevision': engineRevision,
       'host': host.catalogOs,
       'architecture': host.catalogArchitecture,
-      'archiveVariant': 'linux-x64',
-      'artifacts': _sourceArtifactPaths,
+      'archiveVariant': _archiveVariant(host),
+      'artifacts': artifactPaths,
       'stamps': stamps,
-      'inventory': await _sourceInventory(sourceStage),
+      'inventory': await _sourceInventory(sourceStage, host),
       'state': 'ready',
     }, filename: '.wren-source.json');
   }
@@ -979,6 +1042,8 @@ class FlutterInstaller {
         'the retained host artifact source is damaged.',
       );
     }
+    final artifactPaths = _sourceArtifactPaths(host);
+    final stampFiles = _sourceStampFiles(host);
     try {
       final data =
           jsonDecode(await marker.readAsString()) as Map<String, Object?>;
@@ -986,13 +1051,13 @@ class FlutterInstaller {
           data['engineRevision'] != engineRevision ||
           data['host'] != host.catalogOs ||
           data['architecture'] != host.catalogArchitecture ||
-          data['archiveVariant'] != 'linux-x64' ||
-          jsonEncode(data['artifacts']) != jsonEncode(_sourceArtifactPaths)) {
+          data['archiveVariant'] != _archiveVariant(host) ||
+          jsonEncode(data['artifacts']) != jsonEncode(artifactPaths)) {
         throw const InstallException(
           'the retained host artifact source is damaged.',
         );
       }
-      for (final relativePath in _sourceArtifactPaths) {
+      for (final relativePath in artifactPaths) {
         if (!await Directory(p.join(source.path, relativePath)).exists()) {
           throw const InstallException(
             'the retained host artifact source is damaged.',
@@ -1000,22 +1065,19 @@ class FlutterInstaller {
         }
       }
       if (jsonEncode(data['inventory']) !=
-          jsonEncode(await _sourceInventory(source))) {
+          jsonEncode(await _sourceInventory(source, host))) {
         throw const InstallException(
           'the retained host artifact source is damaged.',
         );
       }
       final stamps = data['stamps'];
       if (stamps is! Map<String, Object?> ||
-          stamps.keys
-              .toSet()
-              .difference(_sourceStampFiles.toSet())
-              .isNotEmpty ||
+          stamps.keys.toSet().difference(stampFiles.toSet()).isNotEmpty ||
           stamps.keys.toSet().containsAll(
-                _sourceStampFiles.where((path) => path != 'engine.realm'),
+                stampFiles.where((path) => path != 'engine.realm'),
               ) ==
               false ||
-          _sourceStampFiles
+          stampFiles
               .where((path) => path != 'engine.realm')
               .any((path) => '${stamps[path]}'.trim() != engineRevision) ||
           stamps['engine.realm'] == null) {
@@ -1032,11 +1094,15 @@ class FlutterInstaller {
     }
   }
 
-  Future<void> _materializeSource(Directory source, Directory checkout) async {
+  Future<void> _materializeSource(
+    Directory source,
+    Directory checkout,
+    HostPlatform host,
+  ) async {
     final data = jsonDecode(
       await File(p.join(source.path, '.wren-source.json')).readAsString(),
     ) as Map<String, Object?>;
-    for (final relativePath in _sourceArtifactPaths) {
+    for (final relativePath in _sourceArtifactPaths(host)) {
       final destination = Directory(p.join(checkout.path, relativePath));
       if (await destination.exists()) await destination.delete(recursive: true);
       await _copyTree(
@@ -1180,19 +1246,16 @@ class FlutterInstaller {
 
 enum _ExistingInstall { incomplete, healthy, damaged }
 
-const _sourceArtifactPaths = <String>[
-  'bin/cache/dart-sdk',
-  'bin/cache/artifacts/engine/common',
-  'bin/cache/artifacts/engine/linux-x64',
-  'bin/cache/artifacts/engine/linux-x64-profile',
-  'bin/cache/artifacts/engine/linux-x64-release',
-  'bin/cache/flutter_web_sdk',
-  'bin/cache/pkg/sky_engine',
-  'bin/cache/pkg/flutter_gpu',
-];
+List<String> _hostExecutables(HostPlatform host) =>
+    host == HostPlatform.linuxX64
+    ? const [
+        'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
+        'bin/cache/artifacts/engine/linux-x64/flutter_tester',
+      ]
+    : const ['bin/cache/artifacts/engine/darwin-arm64/gen_snapshot'];
 
-String? _missingRequiredArtifact(String rootPath) {
-  for (final relativePath in _requiredDirectories) {
+String? _missingRequiredArtifact(String rootPath, HostPlatform host) {
+  for (final relativePath in _requiredDirectories(host)) {
     if (FileSystemEntity.typeSync(
           p.join(rootPath, relativePath),
           followLinks: true,
@@ -1201,7 +1264,7 @@ String? _missingRequiredArtifact(String rootPath) {
       return relativePath;
     }
   }
-  for (final relativePath in _requiredFiles) {
+  for (final relativePath in _requiredFiles(host)) {
     if (FileSystemEntity.typeSync(
           p.join(rootPath, relativePath),
           followLinks: true,
@@ -1213,9 +1276,12 @@ String? _missingRequiredArtifact(String rootPath) {
   return null;
 }
 
-Future<List<Map<String, String>>> _sourceInventory(Directory source) async {
+Future<List<Map<String, String>>> _sourceInventory(
+  Directory source,
+  HostPlatform host,
+) async {
   final entries = <Map<String, String>>[];
-  for (final relativePath in _sourceArtifactPaths) {
+  for (final relativePath in _sourceArtifactPaths(host)) {
     final root = Directory(p.join(source.path, relativePath));
     await for (final entity in root.list(recursive: true, followLinks: false)) {
       if (FileSystemEntity.typeSync(entity.path, followLinks: false) !=

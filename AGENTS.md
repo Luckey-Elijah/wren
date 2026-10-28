@@ -2,6 +2,8 @@
 
 ## Implementation specs
 
+Resolve Wren implementation ticket references from `.scratch/wren-build/issues/` and state the local ticket title. Those files are the issue tracker for Wren implementation work.
+
 For implementation work, first check `.scratch/` for the initiative's `spec.md`. The Wren version-manager specification is `.scratch/wren-version-manager/spec.md`; its source decisions and research remain alongside it in that directory. Treat the spec as the implementation contract, and consult the source tickets when a rationale or unresolved condition needs detail.
 
 When a user invokes `to-spec`, synthesize the supplied decisions into `.scratch/<initiative>/spec.md` and keep it local unless the user explicitly requests publication. When a user invokes `implement`, locate and follow the relevant local `spec.md` before changing product code. Update the spec only when the user changes a decision or asks for specification maintenance.
