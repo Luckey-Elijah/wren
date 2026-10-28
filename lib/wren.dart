@@ -282,53 +282,9 @@ class WrenContext {
     HostPlatform host,
     List<InstalledRelease> installed,
   ) async {
-    final project = projectDirectory ?? io.Directory.current;
-    final pubspec = io.File('${project.path}/pubspec.yaml');
-    if (pubspec.existsSync()) {
-      try {
-        final yaml = loadYaml(pubspec.readAsStringSync());
-        final environment = yaml is YamlMap ? yaml['environment'] : null;
-        final flutterText = environment is YamlMap
-            ? environment['flutter']
-            : null;
-        final dartText = environment is YamlMap ? environment['sdk'] : null;
-        if (flutterText is String && dartText is String) {
-          final flutterConstraint = VersionConstraint.parse(flutterText);
-          final dartConstraint = VersionConstraint.parse(dartText);
-          final matching =
-              installed.where((release) {
-                if (release.host != host.catalogOs ||
-                    release.dartVersion == null) {
-                  return false;
-                }
-                try {
-                  final flutterVersion = Version.parse(release.version);
-                  final dartVersion = Version.parse(release.dartVersion!);
-                  final constraintsMatch =
-                      flutterConstraint.allows(flutterVersion) &&
-                      dartConstraint.allows(dartVersion);
-                  final betaExplicitlyAllowed =
-                      release.channel != 'beta' ||
-                      (_explicitlyAllowsPrerelease(
-                            flutterText,
-                            flutterVersion,
-                          ) &&
-                          _explicitlyAllowsPrerelease(dartText, dartVersion));
-                  return constraintsMatch && betaExplicitlyAllowed;
-                } on FormatException {
-                  return false;
-                }
-              }).toList()..sort(
-                (left, right) =>
-                    Version.parse(right.version)
-                        .compareTo(Version.parse(left.version)),
-              );
-          if (matching.isNotEmpty) return matching.first.version;
-        }
-      } on Object {
-        // Missing, malformed, or invalid constraints leave fallback eligible.
-      }
-    }
+    final project = _projectReleaseConstraints();
+    final selected = project.selectRelease(host, installed);
+    if (selected != null) return selected;
     final fallback = await globalFallback;
     return fallback == null || fallback.isEmpty ? null : fallback;
   }
@@ -351,6 +307,9 @@ class WrenContext {
       releaseApiUri: upgradeReleaseApiUri,
     ).run();
   }
+
+  _ProjectReleaseConstraints _projectReleaseConstraints() =>
+      _ProjectReleaseConstraints.read(projectDirectory ?? io.Directory.current);
 
   /// Starts the selected SDK command.
   Future<int> launchSdk(
@@ -394,6 +353,104 @@ bool _explicitlyAllowsPrerelease(String constraint, Version version) {
       return false;
     }
   });
+}
+
+class _ProjectReleaseConstraints {
+  const new({
+    required this.pubspecExists,
+    this.flutterText,
+    this.dartText,
+    this.flutterConstraint,
+    this.dartConstraint,
+    this.problem,
+  });
+
+  factory read(io.Directory project) {
+    final pubspec = io.File('${project.path}/pubspec.yaml');
+    if (!pubspec.existsSync()) {
+      return const _ProjectReleaseConstraints(pubspecExists: false);
+    }
+    try {
+      final yaml = loadYaml(pubspec.readAsStringSync());
+      final environment = yaml is YamlMap ? yaml['environment'] : null;
+      final flutterText = environment is YamlMap
+          ? environment['flutter']
+          : null;
+      final dartText = environment is YamlMap ? environment['sdk'] : null;
+      if (flutterText is! String || dartText is! String) {
+        return const _ProjectReleaseConstraints(
+          pubspecExists: true,
+          problem:
+              'pubspec.yaml must define environment.flutter and '
+              'environment.sdk to compare releases',
+        );
+      }
+      return _ProjectReleaseConstraints(
+        pubspecExists: true,
+        flutterText: flutterText,
+        dartText: dartText,
+        flutterConstraint: VersionConstraint.parse(flutterText),
+        dartConstraint: VersionConstraint.parse(dartText),
+      );
+    } on Object {
+      return const _ProjectReleaseConstraints(
+        pubspecExists: true,
+        problem: 'pubspec.yaml has invalid project constraints',
+      );
+    }
+  }
+
+  final bool pubspecExists;
+  final String? flutterText;
+  final String? dartText;
+  final VersionConstraint? flutterConstraint;
+  final VersionConstraint? dartConstraint;
+  final String? problem;
+
+  String? incompatibilityFor(InstalledRelease release, HostPlatform host) {
+    if (!pubspecExists) return null;
+    final projectProblem = problem;
+    if (projectProblem != null) return projectProblem;
+    if (release.host != host.catalogOs) {
+      return 'release is for ${release.host}, not ${host.catalogOs}';
+    }
+    final dartVersionText = release.dartVersion;
+    if (dartVersionText == null) {
+      return 'bundled Dart version is unknown';
+    }
+    try {
+      final flutterVersion = Version.parse(release.version);
+      final dartVersion = Version.parse(dartVersionText);
+      final constraintsMatch =
+          flutterConstraint!.allows(flutterVersion) &&
+          dartConstraint!.allows(dartVersion);
+      final betaExplicitlyAllowed =
+          release.channel != 'beta' ||
+          (_explicitlyAllowsPrerelease(flutterText!, flutterVersion) &&
+              _explicitlyAllowsPrerelease(dartText!, dartVersion));
+      if (constraintsMatch && betaExplicitlyAllowed) return null;
+      return 'does not satisfy the project Flutter and Dart constraints';
+    } on FormatException {
+      return 'release or bundled Dart version is invalid';
+    }
+  }
+
+  String? selectRelease(HostPlatform host, List<InstalledRelease> installed) {
+    if (!pubspecExists || problem != null) return null;
+    final matching =
+        installed
+            .where((release) => incompatibilityFor(release, host) == null)
+            .toList()
+          ..sort((left, right) {
+            try {
+              return Version.parse(right.version)
+                  .compareTo(Version.parse(left.version));
+            } on FormatException {
+              return right.version.compareTo(left.version);
+            }
+          });
+    return matching.isEmpty ? null : matching.first.version;
+  }
 }
 
 /// Wren-specific command base with shared output, verbosity and context.
@@ -721,6 +778,7 @@ Future<int> runWren(
     ..addCommand(_CleanupCommand(context))
     ..addCommand(_UpgradeWrenCommand(context))
     ..addCommand(_ListCommand(context))
+    ..addCommand(_DoctorCommand(context))
     ..addCommand(_SetCommand(context))
     ..addCommand(_SdkPathCommand(context))
     ..addCommand(_SetupCommand(context))
@@ -1038,6 +1096,172 @@ class _ListCommand extends WrenCommand {
       writeOut(
         '${release.version}  ${release.channel}  ${release.host}  '
         '$readiness$reason',
+      );
+    }
+    return 0;
+  }
+}
+
+class _DoctorCommand extends WrenCommand {
+  new(super.context);
+
+  @override
+  String get name => 'doctor';
+
+  @override
+  String get description =>
+      'Quickly check installed releases and current project selection.';
+
+  @override
+  Future<int> run() async {
+    if (argResults!.rest.isNotEmpty) {
+      failUsage('doctor does not accept positional arguments.');
+    }
+    final targetHost = context.host;
+    if (targetHost == null) {
+      throw const InstallException(
+        'this host is unsupported. Wren supports Linux x86_64 and macOS arm64.',
+      );
+    }
+
+    final installed =
+        context.installedReleasesOverride ??
+        await context.traceOperation<List<InstalledRelease>>(
+          'release.list_installed',
+          context.installer.listInstalled,
+        );
+    final project = context._projectReleaseConstraints();
+    final compatibleProjectRelease = project.selectRelease(
+      targetHost,
+      installed,
+    );
+    final commandLineRelease = globalResults?.option('release')?.trim();
+    final environmentRelease =
+        context.flutterReleaseOverride ??
+        io.Platform.environment['WREN_FLUTTER_RELEASE'];
+    final normalizedEnvironmentRelease = environmentRelease?.trim();
+    final fallback = await context.globalFallback;
+
+    late final String? selectedRelease;
+    late final String selectionSource;
+    if (commandLineRelease != null) {
+      selectedRelease = commandLineRelease;
+      selectionSource = 'command-line --release override';
+    } else if (normalizedEnvironmentRelease != null &&
+        normalizedEnvironmentRelease.isNotEmpty) {
+      selectedRelease = normalizedEnvironmentRelease;
+      selectionSource = 'WREN_FLUTTER_RELEASE environment override';
+    } else if (compatibleProjectRelease != null) {
+      selectedRelease = compatibleProjectRelease;
+      selectionSource = 'current project constraints';
+    } else if (fallback != null && fallback.isNotEmpty) {
+      selectedRelease = fallback;
+      selectionSource = 'global fallback';
+    } else {
+      selectedRelease = null;
+      selectionSource = 'none';
+    }
+
+    writeOut('Wren quick diagnosis (offline).');
+    if (installed.isEmpty) {
+      writeOut('No Flutter releases are installed.');
+    } else {
+      writeOut('Installed Flutter releases:');
+      for (final release in installed) {
+        final readiness = release.needsRepair ? 'needs repair' : 'ready';
+        final projectProblem = project.incompatibilityFor(release, targetHost);
+        final compatibility = !project.pubspecExists
+            ? 'not applicable'
+            : projectProblem == null
+            ? 'compatible'
+            : 'incompatible';
+        final dart = release.dartVersion == null
+            ? 'Dart unknown'
+            : 'Dart ${release.dartVersion}';
+        final reason = release.repairReason == null
+            ? ''
+            : ' — ${release.repairReason}';
+        writeOut(
+          '  Flutter ${release.version}  ${release.channel}  ${release.host}  '
+          '$dart  $readiness$reason; project: $compatibility',
+        );
+        if (verbose) {
+          writeOut(
+            '    Quick readiness uses the same inexpensive checks as '
+            '`wren list` and SDK prelaunch.',
+          );
+          if (projectProblem != null) {
+            writeOut('    Project compatibility: $projectProblem.');
+          }
+        }
+        if (release.needsRepair) {
+          writeOut('    Next step: run `wren repair ${release.version}`.');
+        }
+      }
+    }
+
+    if (!project.pubspecExists) {
+      writeOut(
+        'Project compatibility: not applicable (no pubspec.yaml in the '
+        'current directory).',
+      );
+    } else if (project.problem != null) {
+      writeOut(
+        'Project compatibility could not be evaluated: ${project.problem}.',
+      );
+    } else if (compatibleProjectRelease == null) {
+      writeOut(
+        'No installed release satisfies the current project constraints.',
+      );
+    } else {
+      writeOut(
+        'Project-compatible release: Flutter $compatibleProjectRelease.',
+      );
+    }
+
+    if (selectedRelease == null) {
+      writeOut(
+        'Effective selection: none. Run `wren install <release>` and '
+        '`wren set <release>` to choose a release.',
+      );
+      return 0;
+    }
+    writeOut(
+      'Effective selection: Flutter $selectedRelease '
+      '(source: $selectionSource).',
+    );
+    final selected = installed.where(
+      (release) => release.version == selectedRelease,
+    );
+    if (selected.isEmpty) {
+      writeOut(
+        'Finding: Flutter $selectedRelease is not installed; install it '
+        'before running SDK commands.',
+      );
+    } else {
+      final release = selected.first;
+      if (release.needsRepair) {
+        writeOut(
+          'Finding: the effective selection needs repair. Run '
+          '`wren repair $selectedRelease`.',
+        );
+      }
+      if (project.pubspecExists &&
+          project.incompatibilityFor(release, targetHost) != null) {
+        writeOut(
+          'Finding: the effective selection is incompatible with the current '
+          'project constraints (informational).',
+        );
+      }
+    }
+    if (commandLineRelease == null &&
+        normalizedEnvironmentRelease == null &&
+        compatibleProjectRelease == null &&
+        selectedRelease == fallback &&
+        project.pubspecExists) {
+      writeOut(
+        'Finding: the global fallback is used because no installed release '
+        'matches the current project (informational).',
       );
     }
     return 0;

@@ -72,6 +72,7 @@ WREN_FLUTTER_RELEASE=3.27.4 wren flutter test
 | `wren releases <version>` | Checks whether a release can be installed on this machine and shows its bundled Dart version. |
 | `wren install <version>` | Downloads and installs an eligible Flutter release. |
 | `wren list` or `wren ls` | Lists installed releases and whether each is ready to use. |
+| `wren doctor` | Quickly checks installed releases, project compatibility, and the effective release selection. |
 | `wren set <version>` or `wren use <version>` | Updates existing Flutter and Dart constraints in the current project's `pubspec.yaml`. |
 | `wren set -g <version>` | Also sets the global fallback. |
 | `wren flutter ...` or `wren dart ...` | Runs a command with the selected release and forwards its output and exit status. |

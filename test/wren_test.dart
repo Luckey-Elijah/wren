@@ -382,6 +382,217 @@ environment:
     });
   });
 
+  group('wren doctor', () {
+    late Directory temporaryDirectory;
+    late Directory projectDirectory;
+    late Directory dataDirectory;
+
+    setUp(() async {
+      temporaryDirectory = await Directory.systemTemp.createTemp(
+        'wren-doctor-',
+      );
+      projectDirectory = Directory('${temporaryDirectory.path}/project')
+        ..createSync();
+      dataDirectory = Directory('${temporaryDirectory.path}/data')
+        ..createSync();
+    });
+
+    tearDown(() async {
+      await temporaryDirectory.delete(recursive: true);
+    });
+
+    Future<int> runDoctor(
+      List<String> arguments, {
+      required StringSink output,
+      required List<InstalledRelease> installed,
+      StringSink? errors,
+      String? fallback,
+      String? environmentRelease,
+    }) => runWren(
+      arguments,
+      host: HostPlatform.linuxX64,
+      installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+      projectDirectory: projectDirectory,
+      installedReleases: installed,
+      globalFallback: fallback,
+      flutterReleaseOverride: environmentRelease,
+      stdoutSink: output,
+      stderrSink: errors ?? StringBuffer(),
+    );
+
+    test(
+      'reports all releases and picks one compatible with both ranges',
+      () async {
+        await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: ">=3.46.0 <3.48.0"
+  sdk: ">=3.13.0 <3.14.0"
+''');
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: [
+            _installed('3.47.8'),
+            _installed('3.48.0', dartVersion: '3.14.0'),
+            _installed('3.45.0', needsRepair: true),
+          ],
+        );
+
+        expect(status, 0);
+        expect(output.toString(), contains('Flutter 3.47.8  stable  linux'));
+        expect(output.toString(), contains('Flutter 3.48.0  stable  linux'));
+        expect(output.toString(), contains('Flutter 3.45.0  stable  linux'));
+        expect(
+          output.toString(),
+          contains('Dart 3.13.7  ready; project: compatible'),
+        );
+        expect(output.toString(), contains('project: incompatible'));
+        expect(output.toString(), contains('wren repair 3.45.0'));
+        expect(
+          output.toString(),
+          contains(
+            'Effective selection: Flutter 3.47.8 '
+            '(source: current project constraints).',
+          ),
+        );
+      },
+    );
+
+    test('uses exact override before environment and reports source', () async {
+      final output = StringBuffer();
+
+      final status = await runDoctor(
+        ['--release', '3.45.0', 'doctor'],
+        output: output,
+        installed: [_installed('3.47.8'), _installed('3.45.0')],
+        environmentRelease: '3.47.8',
+      );
+
+      expect(status, 0);
+      expect(
+        output.toString(),
+        contains(
+          'Effective selection: Flutter 3.45.0 '
+          '(source: command-line --release override).',
+        ),
+      );
+    });
+
+    test('reports environment override as the selection source', () async {
+      final output = StringBuffer();
+
+      final status = await runDoctor(
+        ['doctor'],
+        output: output,
+        installed: [_installed('3.47.8')],
+        environmentRelease: '3.47.8',
+      );
+
+      expect(status, 0);
+      expect(
+        output.toString(),
+        contains(
+          'Effective selection: Flutter 3.47.8 '
+          '(source: WREN_FLUTTER_RELEASE environment override).',
+        ),
+      );
+    });
+
+    test(
+      'keeps an incompatible global fallback and no selection informational',
+      () async {
+        await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: ^3.50.0
+  sdk: ^3.14.0
+''');
+        final installed = [_installed('3.47.8')];
+        final fallbackOutput = StringBuffer();
+
+        final fallbackStatus = await runDoctor(
+          ['doctor'],
+          output: fallbackOutput,
+          installed: installed,
+          fallback: '3.47.8',
+        );
+
+        expect(fallbackStatus, 0);
+        expect(fallbackOutput.toString(), contains('source: global fallback'));
+        expect(
+          fallbackOutput.toString(),
+          contains('the effective selection is incompatible'),
+        );
+
+        final noSelectionOutput = StringBuffer();
+        final noSelectionStatus = await runDoctor(
+          ['doctor'],
+          output: noSelectionOutput,
+          installed: installed,
+        );
+        expect(noSelectionStatus, 0);
+        expect(
+          noSelectionOutput.toString(),
+          contains('Effective selection: none.'),
+        );
+      },
+    );
+
+    test(
+      'reports incompatible fallback and absent project as informational',
+      () async {
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: [_installed('3.47.8')],
+          fallback: '3.46.0',
+        );
+
+        expect(status, 0);
+        expect(
+          output.toString(),
+          contains('Project compatibility: not applicable (no pubspec.yaml'),
+        );
+        expect(
+          output.toString(),
+          contains(
+            'Effective selection: Flutter 3.46.0 (source: global fallback).',
+          ),
+        );
+        expect(output.toString(), contains('is not installed'));
+      },
+    );
+
+    test(
+      'verbose adds quick-check details without changing its scan',
+      () async {
+        final plain = StringBuffer();
+        final verbose = StringBuffer();
+        final installed = [_installed('3.47.8')];
+
+        expect(
+          await runDoctor(['doctor'], output: plain, installed: installed),
+          0,
+        );
+        expect(
+          await runDoctor(
+            ['doctor', '--verbose'],
+            output: verbose,
+            installed: installed,
+          ),
+          0,
+        );
+
+        expect(verbose.toString(), contains('same inexpensive checks'));
+        expect(verbose.toString(), contains('Flutter 3.47.8'));
+        expect(plain.toString(), isNot(contains('same inexpensive checks')));
+      },
+    );
+  });
+
   group('wren releases', () {
     test(
       'SDK commands suggest set or install when no release is selected',

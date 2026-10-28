@@ -631,6 +631,40 @@ printf '\376\000\n' >&2
       ) as Map<String, Object?>;
       expect(releaseMarker['readiness'], 'needs-repair');
 
+      var sdkLaunched = false;
+      final doctorOutput = StringBuffer();
+      final doctorStatus = await runWren(
+        ['doctor'],
+        host: HostPlatform.linuxX64,
+        installEnvironment: environment,
+        stdoutSink: doctorOutput,
+        stderrSink: StringBuffer(),
+        sdkLauncher:
+            ({
+              required release,
+              required executable,
+              required arguments,
+            }) async {
+              sdkLaunched = true;
+              return 0;
+            },
+      );
+      expect(doctorStatus, 0);
+      expect(doctorOutput.toString(), contains('needs repair'));
+      expect(doctorOutput.toString(), contains('wren repair $_version'));
+      expect(sdkLaunched, isFalse);
+      expect(
+        File(p.join(installed.path, 'bin/cache/linux-sdk.stamp')).existsSync(),
+        isFalse,
+      );
+      expect(
+        (jsonDecode(
+          await File(p.join(installed.path, '.wren-release.json'))
+              .readAsString(),
+        ) as Map<String, Object?>)['readiness'],
+        'needs-repair',
+      );
+
       await File(p.join(installed.path, 'bin/cache/linux-sdk.stamp'))
           .writeAsString('$_engineRevision\n');
       final actualSourceDart = File(
