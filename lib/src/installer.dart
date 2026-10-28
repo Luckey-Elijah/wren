@@ -1681,9 +1681,15 @@ Future<void> _releaseLock(Directory lock) async {
   final releasedLock = Directory('${lock.path}.released-${_randomId()}');
   try {
     await lock.rename(releasedLock.path);
+  } on FileSystemException {
+    if (lock.existsSync()) rethrow;
+    // A stale-lock recovery may have moved it already.
+    return;
+  }
+  try {
     await releasedLock.delete(recursive: true);
   } on FileSystemException {
-    // A stale-lock recovery may have moved it already.
+    // The active lock is already gone; only an orphaned tombstone remains.
   }
 }
 
