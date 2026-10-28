@@ -10,7 +10,9 @@ A developer can preview and reclaim crash-orphaned stages and unreferenced share
 
 ## Acceptance criteria
 
-- [ ] `cleanup --dry-run` previews provable candidates without deleting them; ordinary `cleanup` reports what it reclaimed.
+- [x] `cleanup --dry-run` previews provable candidates without deleting them; ordinary `cleanup` reports what it reclaimed.
 - [ ] Cleanup removes only stages and sources with no installed-release or active install/repair reference and coordinates with concurrent operations.
-- [ ] It preserves the optional shared Git repository and Wren's rollback binary and needs no second confirmation.
-- [ ] Failure returns `4`; tests exercise referenced and active entries, crash orphans, dry-run output, and cancellation of a required wait.
+- [x] It preserves the optional shared Git repository and Wren's rollback binary and needs no second confirmation.
+- [x] Failure returns `4`; tests exercise referenced and active entries, crash orphans, dry-run output, and cancellation of a required wait.
+
+Remaining work: repair tickets 13 and 14 are still unimplemented, so their stage naming and lifecycle locks are not yet available for cleanup integration. This change handles the current install stages and shared source operations; keep this ticket open until cleanup can identify repair stages and verify coordination with active repair operations.
