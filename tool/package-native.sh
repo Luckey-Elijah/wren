@@ -34,7 +34,8 @@ trap cleanup EXIT HUP INT TERM
 package_dir="$stage/wren-$release_version-$host"
 mkdir -p "$package_dir"
 cd "$repo_root"
-"$dart_bin" compile exe bin/wren.dart -o "$package_dir/wren"
+"$dart_bin" compile exe --define=WREN_VERSION="$release_version" \
+  bin/wren.dart -o "$package_dir/wren"
 chmod 755 "$package_dir/wren"
 cp packaging/INSTALL.md "$package_dir/INSTALL.md"
 

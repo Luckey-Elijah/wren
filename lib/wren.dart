@@ -5,6 +5,7 @@ import 'dart:io' as io;
 import 'package:args/command_runner.dart';
 import 'package:pub_semver/pub_semver.dart';
 import 'package:wren/src/installer.dart';
+import 'package:wren/src/self_upgrade.dart';
 import 'package:wren/src/tracing.dart';
 import 'package:yaml/yaml.dart';
 import 'package:yaml_edit/yaml_edit.dart';
@@ -30,6 +31,10 @@ typedef SdkLauncher = Future<int> Function({
 typedef WrenConfirmation = Future<bool?> Function(String message);
 
 const _minimumDartVersion = '2.19.0';
+const _wrenVersion = String.fromEnvironment(
+  'WREN_VERSION',
+  defaultValue: '1.0.0',
+);
 const _linuxCatalog =
     'https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json';
 const _macosCatalog =
@@ -54,6 +59,9 @@ class WrenContext {
     this.installedReleasesOverride,
     this.sdkLauncher,
     this.wrenExecutable,
+    this.runningExecutablePath,
+    this.upgradeReleaseApiUri,
+    this.wrenVersionOverride,
     this.stdinStream,
     DateTime? traceStartedAt,
     Stopwatch? traceElapsed,
@@ -105,6 +113,15 @@ class WrenContext {
   /// Production setup uses the running Wren executable. The override allows
   /// CLI tests to run generated shims against a controlled child process.
   final String? wrenExecutable;
+
+  /// Current executable used by upgrade-wren; injectable for CLI fixtures.
+  final String? runningExecutablePath;
+
+  /// Release API endpoint used by upgrade-wren; injectable for fixtures.
+  final Uri? upgradeReleaseApiUri;
+
+  /// Version compiled into this executable; injectable for CLI fixtures.
+  final String? wrenVersionOverride;
 
   /// Input forwarded to SDK processes; defaults to the current process stdin.
   final Stream<List<int>>? stdinStream;
@@ -316,6 +333,25 @@ class WrenContext {
     return fallback == null || fallback.isEmpty ? null : fallback;
   }
 
+  /// Upgrades the running Wren executable when a newer stable release exists.
+  Future<WrenUpgradeResult> upgradeWren() {
+    final targetHost = host;
+    if (targetHost == null) {
+      throw const WrenUpgradeException(
+        'self-upgrade is supported only on Linux x86_64 and macOS arm64.',
+      );
+    }
+    return WrenSelfUpgrade(
+      currentVersion: wrenVersionOverride ?? _wrenVersion,
+      hostAssetName: targetHost.nativeAssetName,
+      executablePath: runningExecutablePath ?? io.Platform.resolvedExecutable,
+      dataDirectory: installEnvironment.dataDirectory.absolute.path,
+      stdout: stdoutSink,
+      stderr: stderrSink,
+      releaseApiUri: upgradeReleaseApiUri,
+    ).run();
+  }
+
   /// Starts the selected SDK command.
   Future<int> launchSdk(
     String release, {
@@ -432,6 +468,12 @@ class WrenCommandRunner {
           return 4;
         }
       }
+      if (args.length == 1 && args.single == '--version') {
+        context.stdoutSink.writeln(
+          'wren ${context.wrenVersionOverride ?? _wrenVersion}',
+        );
+        return await _finishTrace(0, '--version');
+      }
       final sdkCommandIndex = _sdkCommandIndex(args);
       if (sdkCommandIndex != null) {
         context._sdkArguments = args.skip(sdkCommandIndex + 1).toList();
@@ -507,7 +549,7 @@ class WrenCommandRunner {
       await trace.finish(
         command: command,
         host: context.host?.label,
-        wrenVersion: '1.0.0',
+        wrenVersion: context.wrenVersionOverride ?? _wrenVersion,
         exitStatus: status,
       );
       return status;
@@ -612,6 +654,7 @@ class _WrenPackageCommandRunner extends CommandRunner<int> {
         negatable: false,
         help: 'Show additional Wren diagnostic output.',
       )
+      ..addFlag('version', negatable: false, help: 'Print the Wren version.')
       ..addOption(
         'release',
         help: 'Run an SDK command with this exact installed Flutter release.',
@@ -643,6 +686,9 @@ Future<int> runWren(
   SdkLauncher? sdkLauncher,
   String? wrenExecutable,
   Stream<List<int>>? stdinStream,
+  String? runningExecutablePath,
+  Uri? upgradeReleaseApiUri,
+  String? wrenVersion,
 }) async {
   final tracingRequested = _traceOptionPresentBeforeCommand(arguments);
   final traceStartedAt = tracingRequested ? DateTime.now().toUtc() : null;
@@ -660,6 +706,9 @@ Future<int> runWren(
     installedReleasesOverride: installedReleases,
     sdkLauncher: sdkLauncher,
     wrenExecutable: wrenExecutable,
+    runningExecutablePath: runningExecutablePath,
+    upgradeReleaseApiUri: upgradeReleaseApiUri,
+    wrenVersionOverride: wrenVersion,
     stdinStream: stdinStream,
     traceStartedAt: traceStartedAt,
     traceElapsed: traceElapsed,
@@ -670,6 +719,7 @@ Future<int> runWren(
     ..addCommand(_RemoveCommand(context))
     ..addCommand(_RepairCommand(context))
     ..addCommand(_CleanupCommand(context))
+    ..addCommand(_UpgradeWrenCommand(context))
     ..addCommand(_ListCommand(context))
     ..addCommand(_SetCommand(context))
     ..addCommand(_SdkPathCommand(context))
@@ -785,6 +835,30 @@ class _CleanupCommand extends WrenCommand {
       );
     }
     return 0;
+  }
+}
+
+class _UpgradeWrenCommand extends WrenCommand {
+  new(super.context);
+
+  @override
+  String get name => 'upgrade-wren';
+
+  @override
+  String get description => 'Upgrade the Wren executable safely.';
+
+  @override
+  Future<int> run() async {
+    if (argResults!.rest.isNotEmpty) {
+      failUsage('upgrade-wren does not accept arguments.');
+    }
+    try {
+      await context.upgradeWren();
+      return 0;
+    } on WrenUpgradeException catch (error) {
+      writeError('wren: ${error.message}');
+      return 4;
+    }
   }
 }
 
@@ -1410,6 +1484,7 @@ enum HostPlatform {
     catalogUrl: _linuxCatalog,
     catalogOs: 'linux',
     catalogArchitecture: 'x64',
+    nativeAssetName: 'linux-x64',
   ),
 
   /// macOS on Apple Silicon.
@@ -1418,6 +1493,7 @@ enum HostPlatform {
     catalogUrl: _macosCatalog,
     catalogOs: 'macos',
     catalogArchitecture: 'arm64',
+    nativeAssetName: 'macos-arm64',
   );
 
   /// Creates a host platform from catalog identifiers.
@@ -1426,6 +1502,7 @@ enum HostPlatform {
     required this.catalogUrl,
     required this.catalogOs,
     required this.catalogArchitecture,
+    required this.nativeAssetName,
   });
 
   /// User-facing host name.
@@ -1439,6 +1516,9 @@ enum HostPlatform {
 
   /// Architecture identifier used by the catalog.
   final String catalogArchitecture;
+
+  /// Host suffix used by Wren's standalone native release archives.
+  final String nativeAssetName;
 
   /// Detects the current supported host.
   static HostPlatform? get current {

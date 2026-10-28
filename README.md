@@ -81,6 +81,7 @@ WREN_FLUTTER_RELEASE=3.27.4 wren flutter test
 | `wren remove <version>` | Removes an installed release. |
 | `wren cleanup --dry-run` | Previews abandoned install stages and unused shared sources that cleanup can remove. |
 | `wren cleanup` | Removes those abandoned stages and unused shared sources. |
+| `wren upgrade-wren` | Installs the newest stable Wren executable and keeps the previous binary for rollback. |
 
 ## What Wren changes on your system
 
@@ -98,6 +99,7 @@ Wren's configuration and integration writes are:
 - `wren set -g` writes the global fallback to `config.json` in Wren's data directory. `wren remove` clears that fallback if it points to the removed release. Removal does not edit `pubspec.yaml`.
 - `wren setup` writes `bin/flutter` and `bin/dart` shims under Wren's data directory. It prints a PATH command for you to add to your shell. It does not edit shell startup files or editor settings.
 - `wren sdk-path` prints an installed SDK's fixed directory and records that an external tool may use it. Wren asks for confirmation before removing that release later.
+- `wren upgrade-wren` updates a suitable direct Wren installation to the newest stable release and retains the prior executable as `wren.previous` in Wren's data directory.
 - Wren does not write trace logs by default. Add `--trace` before a Wren command to write a JSON Lines trace under `traces/` in Wren's data directory. Use `--trace=/path/to/file` to choose another trace file.
 
 ## Run Wren from source
