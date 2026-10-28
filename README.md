@@ -7,12 +7,12 @@ Wren supports Linux x86_64 and macOS on Apple Silicon.
 ## Get a project running
 
 ```sh
-wren releases
-wren releases 3.27.4
-wren install 3.27.4
+wren releases         # list available flutter releases
+wren releases 3.27.4  # just pull one release's details
+wren install 3.27.4   # download a release
 cd path/to/your_flutter_project
-wren set 3.27.4
-wren flutter pub get
+wren set 3.27.4       # start using that release in your project
+wren flutter pub get  # use the active release
 ```
 
 Replace `3.27.4` with a version shown by `wren releases`. The version-specific query shows the bundled Dart version. Run `wren set` from a project directory whose `pubspec.yaml` has both `environment.flutter` and `environment.sdk` entries. Wren updates those entries to constraints for the installed Flutter release and its bundled Dart SDK.
@@ -57,21 +57,21 @@ WREN_FLUTTER_RELEASE=3.27.4 wren flutter test
 
 ## Common commands
 
-| Command | What it does |
-| --- | --- |
-| `wren releases` | Lists eligible stable and beta Flutter releases for this machine. |
-| `wren releases <version>` | Checks whether a release can be installed on this machine and shows its bundled Dart version. |
-| `wren install <version>` | Downloads and installs an eligible Flutter release. |
-| `wren list` or `wren ls` | Lists installed releases and whether each is ready to use. |
-| `wren set <version>` or `wren use <version>` | Updates existing Flutter and Dart constraints in the current project's `pubspec.yaml`. |
-| `wren set -g <version>` | Also sets the global fallback. |
-| `wren flutter ...` or `wren dart ...` | Runs a command with the selected release and forwards its output and exit status. |
-| `wren sdk-path [<version>]` | Prints the fixed SDK directory for the active or named release. |
-| `wren setup` | Creates optional `flutter` and `dart` PATH shims and prints shell and editor setup steps. |
-| `wren repair <version>` | Checks or restores the retained shared engine source used by a release. |
-| `wren remove <version>` | Removes an installed release. |
-| `wren cleanup --dry-run` | Previews abandoned install stages and unused shared sources that cleanup can remove. |
-| `wren cleanup` | Removes those abandoned stages and unused shared sources. |
+| Command                                      | What it does                                                                                  |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `wren releases`                              | Lists eligible stable and beta Flutter releases for this machine.                             |
+| `wren releases <version>`                    | Checks whether a release can be installed on this machine and shows its bundled Dart version. |
+| `wren install <version>`                     | Downloads and installs an eligible Flutter release.                                           |
+| `wren list` or `wren ls`                     | Lists installed releases and whether each is ready to use.                                    |
+| `wren set <version>` or `wren use <version>` | Updates existing Flutter and Dart constraints in the current project's `pubspec.yaml`.        |
+| `wren set -g <version>`                      | Also sets the global fallback.                                                                |
+| `wren flutter ...` or `wren dart ...`        | Runs a command with the selected release and forwards its output and exit status.             |
+| `wren sdk-path [<version>]`                  | Prints the fixed SDK directory for the active or named release.                               |
+| `wren setup`                                 | Creates optional `flutter` and `dart` PATH shims and prints shell and editor setup steps.     |
+| `wren repair <version>`                      | Checks or restores the retained shared engine source used by a release.                       |
+| `wren remove <version>`                      | Removes an installed release.                                                                 |
+| `wren cleanup --dry-run`                     | Previews abandoned install stages and unused shared sources that cleanup can remove.          |
+| `wren cleanup`                               | Removes those abandoned stages and unused shared sources.                                     |
 
 ## What Wren changes on your system
 
