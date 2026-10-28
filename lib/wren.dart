@@ -15,7 +15,8 @@ export 'src/installer.dart'
         InstallEnvironment,
         InstallException,
         InstallResult,
-        InstalledRelease;
+        InstalledRelease,
+        RepairResult;
 
 /// Testable SDK launch boundary used by [WrenContext].
 typedef SdkLauncher = Future<int> Function({
@@ -480,6 +481,7 @@ Future<int> runWren(
     ..addCommand(_ReleasesCommand(context))
     ..addCommand(_InstallCommand(context))
     ..addCommand(_RemoveCommand(context))
+    ..addCommand(_RepairCommand(context))
     ..addCommand(_CleanupCommand(context))
     ..addCommand(_ListCommand(context))
     ..addCommand(_SetCommand(context))
@@ -574,6 +576,38 @@ class _CleanupCommand extends WrenCommand {
         '${dryRun ? 'Would reclaim' : 'Reclaimed'} unreferenced shared '
         'source: $source',
       );
+    }
+    return 0;
+  }
+}
+
+class _RepairCommand extends WrenCommand {
+  new(super.context);
+
+  @override
+  String get name => 'repair';
+
+  @override
+  String get description => 'Validate or repair a retained shared source.';
+
+  @override
+  Future<int> run() async {
+    final arguments = argResults!.rest;
+    if (arguments.length != 1) {
+      failUsage('repair requires exactly one Flutter release version.');
+    }
+    final targetHost = context.host;
+    if (targetHost == null) {
+      throw const InstallException(
+        'this host is unsupported. Wren supports Linux x86_64 and macOS arm64.',
+      );
+    }
+    final version = arguments.single;
+    final result = await context.installer.repair(version, host: targetHost);
+    if (result.replaced) {
+      writeOut('Repaired the shared engine source for Flutter $version.');
+    } else {
+      writeOut('The shared engine source for Flutter $version is healthy.');
     }
     return 0;
   }

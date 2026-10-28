@@ -139,6 +139,18 @@ class CleanupResult {
   final List<String> sources;
 }
 
+/// Describes a retained shared source repair.
+class RepairResult {
+  /// Creates a source repair result.
+  const new({required this.sourceKey, required this.replaced});
+
+  /// Shared artifact source that was checked or replaced.
+  final String sourceKey;
+
+  /// Whether the damaged source was replaced.
+  final bool replaced;
+}
+
 /// Describes an installed Flutter release and its readiness.
 class InstalledRelease {
   /// Creates a summary of an installed release.
@@ -323,6 +335,259 @@ class FlutterInstaller {
       }
     });
     return List.unmodifiable(installed);
+  }
+
+  /// Validates and, if needed, replaces the shared source for [releaseVersion].
+  ///
+  /// This operation only changes the retained shared source. It does not
+  /// mutate the live cache of any installed release, so editors may continue
+  /// using those release paths while the source is rebuilt.
+  Future<RepairResult> repair(
+    String releaseVersion, {
+    required HostPlatform host,
+  }) async {
+    final root = environment.dataDirectory.absolute;
+    final releases = Directory(p.join(root.path, 'releases'));
+    Directory? target;
+    Map<String, Object?>? manifest;
+    if (releases.existsSync()) {
+      await for (final entity in releases.list(followLinks: false)) {
+        if (entity is! Directory) continue;
+        final marker = File(p.join(entity.path, '.wren-release.json'));
+        if (!marker.existsSync()) continue;
+        try {
+          final data = jsonDecode(await marker.readAsString());
+          if (data is Map<String, Object?> &&
+              data['version'] == releaseVersion &&
+              data['host'] == host.catalogOs &&
+              data['architecture'] == host.catalogArchitecture &&
+              p.basename(entity.path).endsWith('-${_archiveVariant(host)}')) {
+            target = entity;
+            manifest = data;
+            break;
+          }
+        } on Object {
+          // Invalid records cannot identify the requested release.
+        }
+      }
+    }
+    final releaseDirectory = target;
+    final releaseManifest = manifest;
+    if (releaseDirectory == null || releaseManifest == null) {
+      throw InstallException('Flutter $releaseVersion is not installed.');
+    }
+    final releaseKey = p.basename(releaseDirectory.path);
+    final releaseLock = await _acquireLock(
+      Directory(p.join(root.path, 'locks', 'install-$releaseKey')),
+      cancellation: _waitCancellation,
+      onWait: () =>
+          _progress('Waiting for Flutter $releaseVersion install work'),
+    );
+    try {
+      final frameworkRevision = releaseManifest['frameworkRevision'];
+      final engineRevision = releaseManifest['engineRevision'];
+      final sourceKey = releaseManifest['sourceKey'];
+      if (releaseManifest['state'] != 'ready' ||
+          frameworkRevision is! String ||
+          !RegExp(_engineRevisionPattern).hasMatch(frameworkRevision) ||
+          engineRevision is! String ||
+          !RegExp(_engineRevisionPattern).hasMatch(engineRevision) ||
+          sourceKey is! String ||
+          sourceKey != _sourceKey(engineRevision, host)) {
+        throw InstallException(
+          'Flutter $releaseVersion has invalid release or source identity.',
+        );
+      }
+
+      final source = Directory(p.join(root.path, 'sources', sourceKey));
+      final sourceLock = await _acquireLock(
+        Directory(p.join(root.path, 'locks', 'source-$sourceKey')),
+        cancellation: _waitCancellation,
+        onWait: () => _progress('Waiting for shared source $sourceKey'),
+      );
+      try {
+        // A removal may have been waiting for the same source lock. Re-read the
+        // target after acquiring it so we never publish for a removed release.
+        final latestData = jsonDecode(
+          await File(p.join(releaseDirectory.path, '.wren-release.json'))
+              .readAsString(),
+        );
+        if (latestData is! Map<String, Object?> ||
+            latestData['state'] != 'ready' ||
+            latestData['sourceKey'] != sourceKey) {
+          throw InstallException(
+            'Flutter $releaseVersion is no longer available for repair.',
+          );
+        }
+
+        var sourceIsValid = true;
+        try {
+          await _validateSource(
+            source,
+            engineRevision: engineRevision,
+            host: host,
+          );
+        } on InstallException {
+          sourceIsValid = false;
+        }
+        if (sourceIsValid) {
+          final readiness = await _readiness(releaseDirectory, root);
+          if (readiness?.needsRepair ?? true) {
+            throw InstallException(
+              'Flutter $releaseVersion has damaged release-private files; '
+              'run `wren repair $releaseVersion` after source repair.',
+            );
+          }
+          return RepairResult(sourceKey: sourceKey, replaced: false);
+        }
+        // An invalid retained source is rebuilt from the pinned Flutter
+        // checkout below. The current source remains untouched until the new
+        // source has been fully validated.
+
+        final stagingRoot = Directory(
+          p.join(root.path, 'staging', 'repair-$releaseKey-${_randomId()}'),
+        );
+        final checkout = Directory(p.join(stagingRoot.path, 'checkout'));
+        final sourceStage = Directory(p.join(stagingRoot.path, 'source'));
+        final sourceBackup = Directory(
+          p.join(stagingRoot.path, 'source-backup'),
+        );
+        var worktreeCreated = false;
+        var oldSourceMoved = false;
+        var newSourcePublished = false;
+        try {
+          await checkout.parent.create(recursive: true);
+          await _requireGit();
+          final gitLock = await _acquireLock(
+            Directory(p.join(root.path, 'locks', 'flutter-git')),
+            cancellation: _waitCancellation,
+            onWait: () => _progress('Waiting for the shared Flutter Git lock'),
+          );
+          try {
+            await _ensureSharedRepository(root);
+            await _fetchFrameworkCommit(
+              root,
+              frameworkRevision,
+              releaseVersion,
+            );
+            await _runGit(root, [
+              '--git-dir',
+              p.join(root.path, 'flutter.git'),
+              'worktree',
+              'add',
+              '--detach',
+              checkout.path,
+              frameworkRevision,
+            ], userMessage: 'could not create a repair Flutter worktree');
+            worktreeCreated = true;
+          } finally {
+            await _releaseLock(gitLock);
+          }
+
+          final actualFramework = await _gitText(checkout.path, [
+            'rev-parse',
+            'HEAD',
+          ], userMessage: 'could not verify the repair Flutter checkout');
+          if (actualFramework.toLowerCase() !=
+              frameworkRevision.toLowerCase()) {
+            throw const InstallException(
+              'repair Flutter checkout does not match the installed release.',
+            );
+          }
+          final actualEngine = (await File(
+            p.join(checkout.path, 'bin/internal/engine.version'),
+          ).readAsString()).trim();
+          if (actualEngine.toLowerCase() != engineRevision.toLowerCase()) {
+            throw const InstallException(
+              'repair Flutter checkout has a different engine revision.',
+            );
+          }
+
+          final dartVersion = releaseManifest['canonicalDartVersion'];
+          final archive = releaseManifest['archive'];
+          final archiveSha256 = releaseManifest['archiveSha256'];
+          if (dartVersion is! String ||
+              archive is! String ||
+              archiveSha256 is! String) {
+            throw InstallException(
+              'Flutter $releaseVersion is missing validation metadata.',
+            );
+          }
+          final release = FlutterRelease(
+            version: releaseVersion,
+            channel: releaseManifest['channel']! as String,
+            frameworkRevision: frameworkRevision,
+            dartVersion: dartVersion,
+            dartSemVersion: Version.parse(dartVersion),
+            archive: archive,
+            archiveSha256: archiveSha256,
+          );
+          _progress('Rebuilding shared source for Flutter $releaseVersion');
+          await _runFlutter(
+            checkout,
+            _precacheArguments(host),
+            userMessage: 'Flutter failed to prepare a replacement source',
+          );
+          await _validateCheckout(
+            checkout,
+            release: release,
+            frameworkRevision: frameworkRevision,
+            engineRevision: engineRevision,
+            host: host,
+          );
+          await _createSource(
+            checkout,
+            sourceStage,
+            engineRevision: engineRevision,
+            host: host,
+          );
+          await _validateSource(
+            sourceStage,
+            engineRevision: engineRevision,
+            host: host,
+          );
+
+          if (source.existsSync() ||
+              FileSystemEntity.typeSync(source.path, followLinks: false) ==
+                  FileSystemEntityType.link) {
+            await source.rename(sourceBackup.path);
+            oldSourceMoved = true;
+          }
+          await sourceStage.rename(source.path);
+          newSourcePublished = true;
+          // Recheck the published copy before discarding the damaged backup.
+          await _validateSource(
+            source,
+            engineRevision: engineRevision,
+            host: host,
+          );
+          if (sourceBackup.existsSync()) {
+            await sourceBackup.delete(recursive: true);
+          }
+          return RepairResult(sourceKey: sourceKey, replaced: true);
+        } catch (error) {
+          if (newSourcePublished && source.existsSync()) {
+            await source.delete(recursive: true);
+          }
+          if (oldSourceMoved && sourceBackup.existsSync()) {
+            await sourceBackup.rename(source.path);
+          }
+          if (error is InstallException) rethrow;
+          throw InstallException(
+            'Flutter $releaseVersion source repair failed: $error',
+          );
+        } finally {
+          if (worktreeCreated) await _discardWorktree(root, checkout.path);
+          if (stagingRoot.existsSync()) {
+            await stagingRoot.delete(recursive: true);
+          }
+        }
+      } finally {
+        await _releaseLock(sourceLock);
+      }
+    } finally {
+      await _releaseLock(releaseLock);
+    }
   }
 
   /// Runs [executable] from the exact installed [releaseVersion].
@@ -1678,6 +1943,24 @@ class FlutterInstaller {
         if (!Directory(p.join(source.path, relativePath)).existsSync()) {
           throw const InstallException(
             'the retained host artifact source is damaged.',
+          );
+        }
+      }
+      final missingArtifact = _readinessMissingArtifact(source.path, host);
+      if (missingArtifact != null) {
+        throw InstallException(
+          'the retained host artifact source is missing: $missingArtifact.',
+        );
+      }
+      for (final executable in [
+        _dartExecutable,
+        ..._readinessHostExecutables(host),
+      ]) {
+        final file = File(p.join(source.path, executable));
+        if ((file.statSync().mode & 0x49) == 0) {
+          throw InstallException(
+            'the retained host artifact source executable is not runnable: '
+            '$executable.',
           );
         }
       }

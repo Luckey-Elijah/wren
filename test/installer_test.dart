@@ -743,10 +743,7 @@ printf '\376\000\n' >&2
       expect(
         await runWren(
           ['install', failedVersion],
-          catalogJson: _catalog(
-            failedRevision,
-            releaseVersion: failedVersion,
-          ),
+          catalogJson: _catalog(failedRevision, releaseVersion: failedVersion),
           host: HostPlatform.linuxX64,
           installEnvironment: environment,
           stdoutSink: StringBuffer(),
@@ -758,6 +755,241 @@ printf '\376\000\n' >&2
       expect(sharedSource.existsSync(), isTrue);
       expect(await secondRelease.readAsString(), originalDart);
     });
+
+    test(
+      'repairs one source for all releases without changing live SDKs',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+
+        const secondVersion = '3.47.9';
+        await _writeFixtureSdk(repositoryWorktree, version: secondVersion);
+        await File(p.join(repositoryWorktree.path, 'README.md'))
+            .writeAsString('second framework revision\n');
+        await _git(repositoryWorktree.path, ['add', '.']);
+        await _git(repositoryWorktree.path, ['commit', '-m', 'second fixture']);
+        await _git(repositoryWorktree.path, ['tag', '-f', secondVersion]);
+        final secondRevision = await _git(repositoryWorktree.path, [
+          'rev-parse',
+          'HEAD',
+        ]);
+        expect(
+          await runWren(
+            ['install', secondVersion],
+            catalogJson: _catalog(
+              secondRevision,
+              releaseVersion: secondVersion,
+            ),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+
+        final source = Directory(
+          p.join(dataDirectory.path, 'sources/$_engineRevision-linux-x64'),
+        );
+        final sourceDart = File(
+          p.join(source.path, 'bin/cache/dart-sdk/bin/dart'),
+        );
+        final chmod = await Process.run('chmod', ['-x', sourceDart.path]);
+        expect(chmod.exitCode, 0);
+        final firstRelease = Directory(
+          p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
+        );
+        final secondRelease = Directory(
+          p.join(
+            dataDirectory.path,
+            'releases/stable-$secondVersion-linux-x64',
+          ),
+        );
+        final firstLiveDart = File(
+          p.join(firstRelease.path, 'bin/cache/dart-sdk/bin/dart'),
+        );
+        final secondLiveDart = File(
+          p.join(secondRelease.path, 'bin/cache/dart-sdk/bin/dart'),
+        );
+        final secondPrivateStamp = File(
+          p.join(secondRelease.path, 'bin/cache/linux-sdk.stamp'),
+        );
+        await secondPrivateStamp.delete();
+        final firstLiveBefore = await firstLiveDart.readAsString();
+        final secondLiveBefore = await secondLiveDart.readAsString();
+        final damagedList = StringBuffer();
+        expect(
+          await runWren(
+            ['list'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: damagedList,
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        expect(
+          damagedList.toString(),
+          contains('$_version  stable  linux  needs repair'),
+        );
+        expect(
+          damagedList.toString(),
+          contains('$secondVersion  stable  linux  needs repair'),
+        );
+        expect(
+          await runWren(
+            ['--release', _version, 'dart', '--version'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          3,
+        );
+
+        final firstManifest = File(
+          p.join(firstRelease.path, '.wren-release.json'),
+        );
+        final firstData = jsonDecode(
+          await firstManifest.readAsString(),
+        ) as Map<String, Object?>;
+        firstData['externalUse'] = true;
+        await firstManifest.writeAsString(jsonEncode(firstData));
+        var confirmationRequested = false;
+        final repairOutput = StringBuffer();
+        final repairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            confirmation: (_) async {
+              confirmationRequested = true;
+              return false;
+            },
+            stdoutSink: repairOutput,
+            stderrSink: repairError,
+          ),
+          0,
+          reason: repairError.toString(),
+        );
+        expect(confirmationRequested, isFalse);
+        expect(
+          repairOutput.toString(),
+          contains('Repaired the shared engine source'),
+        );
+        expect(sourceDart.statSync().mode & 0x49, isNot(0));
+        expect(await firstLiveDart.readAsString(), firstLiveBefore);
+        expect(await secondLiveDart.readAsString(), secondLiveBefore);
+
+        final repairedList = StringBuffer();
+        expect(
+          await runWren(
+            ['list'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: repairedList,
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        expect(
+          repairedList.toString(),
+          contains('$_version  stable  linux  ready'),
+        );
+        expect(
+          repairedList.toString(),
+          contains('$secondVersion  stable  linux  needs repair'),
+        );
+        expect(
+          Directory(p.join(dataDirectory.path, 'staging')).listSync(),
+          isEmpty,
+        );
+      },
+    );
+
+    test(
+      'failed source repair preserves the source and live release',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        final sourceDart = File(
+          p.join(
+            dataDirectory.path,
+            'sources/$_engineRevision-linux-x64/bin/cache/dart-sdk/bin/dart',
+          ),
+        );
+        final chmod = await Process.run('chmod', ['-x', sourceDart.path]);
+        expect(chmod.exitCode, 0);
+        final sourceModeBefore = sourceDart.statSync().mode;
+        final liveDart = File(
+          p.join(
+            dataDirectory.path,
+            'releases/stable-$_version-linux-x64/bin/cache/dart-sdk/bin/dart',
+          ),
+        );
+        final liveBefore = await liveDart.readAsString();
+        await File(p.join(dataDirectory.path, 'fail-precache'))
+            .writeAsString('');
+
+        final error = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: error,
+          ),
+          4,
+          reason: error.toString(),
+        );
+        expect(sourceDart.statSync().mode, sourceModeBefore);
+        expect(await liveDart.readAsString(), liveBefore);
+        expect(
+          Directory(p.join(dataDirectory.path, 'staging')).listSync(),
+          isEmpty,
+        );
+        final launchError = StringBuffer();
+        expect(
+          await runWren(
+            ['--release', _version, 'dart', '--version'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: launchError,
+          ),
+          3,
+          reason: launchError.toString(),
+        );
+      },
+    );
 
     test(
       'installs a native macOS arm64 release from its host artifacts',
@@ -840,7 +1072,6 @@ printf '\376\000\n' >&2
           Directory(p.join(dataDirectory.path, 'staging')).listSync(),
           isEmpty,
         );
-
       },
     );
 
