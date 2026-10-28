@@ -1069,8 +1069,24 @@ exec '${child.path}' "\$@"
 
     test('dry-run previews only orphaned stages and sources', () async {
       const stageName = 'install-stable-3.47.8-linux-x64';
+      final sourceRepairStageName =
+          'repair-stable-3.47.8-linux-x64-'
+          '${List.filled(32, 'a').join()}';
+      final privateRepairStageName =
+          'repair-private-stable-3.47.8-linux-x64-'
+          '${List.filled(32, 'b').join()}';
+      const unknownStageName = 'repair-stable-3.47.8-linux-x64-incomplete';
       final stage = Directory('${dataDirectory.path}/staging/$stageName')
         ..createSync(recursive: true);
+      final sourceRepairStage = Directory(
+        '${dataDirectory.path}/staging/$sourceRepairStageName',
+      )..createSync(recursive: true);
+      final privateRepairStage = Directory(
+        '${dataDirectory.path}/staging/$privateRepairStageName',
+      )..createSync(recursive: true);
+      final unknownStage = Directory(
+        '${dataDirectory.path}/staging/$unknownStageName',
+      )..createSync(recursive: true);
       final source = Directory('${dataDirectory.path}/sources/orphan-engine')
         ..createSync(recursive: true);
       final retained = Directory(
@@ -1096,6 +1112,9 @@ exec '${child.path}' "\$@"
 
       expect(status, 0);
       expect(stage.existsSync(), isTrue);
+      expect(sourceRepairStage.existsSync(), isTrue);
+      expect(privateRepairStage.existsSync(), isTrue);
+      expect(unknownStage.existsSync(), isTrue);
       expect(source.existsSync(), isTrue);
       expect(retained.existsSync(), isTrue);
       expect(repository.existsSync(), isTrue);
@@ -1104,6 +1123,15 @@ exec '${child.path}' "\$@"
         output.toString(),
         contains('Would reclaim orphaned stage: $stageName'),
       );
+      expect(
+        output.toString(),
+        contains('Would reclaim orphaned stage: $sourceRepairStageName'),
+      );
+      expect(
+        output.toString(),
+        contains('Would reclaim orphaned stage: $privateRepairStageName'),
+      );
+      expect(output.toString(), isNot(contains(unknownStageName)));
       expect(
         output.toString(),
         contains('Would reclaim unreferenced shared source: orphan-engine'),
@@ -1115,8 +1143,13 @@ exec '${child.path}' "\$@"
       'reclaims crash orphans and preserves referenced recovery data',
       () async {
         const stageName = 'install-stable-3.47.8-linux-x64';
+        const repairStageName =
+            'repair-stable-3.47.8-linux-x64-cccccccccccccccccccccccccccccccc';
         final stage = Directory('${dataDirectory.path}/staging/$stageName')
           ..createSync(recursive: true);
+        final repairStage = Directory(
+          '${dataDirectory.path}/staging/$repairStageName',
+        )..createSync(recursive: true);
         final source = Directory('${dataDirectory.path}/sources/orphan-engine')
           ..createSync(recursive: true);
         final retained = Directory(
@@ -1141,6 +1174,7 @@ exec '${child.path}' "\$@"
 
         expect(status, 0);
         expect(stage.existsSync(), isFalse);
+        expect(repairStage.existsSync(), isFalse);
         expect(source.existsSync(), isFalse);
         expect(retained.existsSync(), isTrue);
         expect(repository.existsSync(), isTrue);
@@ -1148,6 +1182,10 @@ exec '${child.path}' "\$@"
         expect(
           output.toString(),
           contains('Reclaimed orphaned stage: $stageName'),
+        );
+        expect(
+          output.toString(),
+          contains('Reclaimed orphaned stage: $repairStageName'),
         );
         expect(
           output.toString(),
@@ -1187,6 +1225,46 @@ exec '${child.path}' "\$@"
         await cancellation.close();
       },
     );
+
+    test('waits for active source and private repair stages', () async {
+      const releaseKey = 'stable-3.47.8-linux-x64';
+      final stageNames = [
+        'repair-$releaseKey-${List.filled(32, 'd').join()}',
+        'repair-private-$releaseKey-${List.filled(32, 'e').join()}',
+      ];
+
+      for (final stageName in stageNames) {
+        final stage = Directory('${dataDirectory.path}/staging/$stageName')
+          ..createSync(recursive: true);
+        final lock = Directory(
+          '${dataDirectory.path}/locks/install-$releaseKey',
+        )..createSync(recursive: true);
+        File('${lock.path}/owner').writeAsStringSync('$pid\n');
+        final cancellation = StreamController<void>();
+        final errors = StringBuffer();
+        final cleanup = runWren(
+          ['cleanup'],
+          installEnvironment: InstallEnvironment(
+            dataDirectory: dataDirectory,
+            waitCancellation: cancellation.stream,
+          ),
+          stdoutSink: StringBuffer(),
+          stderrSink: errors,
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+        cancellation.add(null);
+
+        expect(await cleanup, 6);
+        expect(stage.existsSync(), isTrue);
+        expect(
+          errors.toString(),
+          contains('Waiting for active work on stage $stageName'),
+        );
+        await cancellation.close();
+        await lock.delete(recursive: true);
+        await stage.delete(recursive: true);
+      }
+    });
 
     test('waits for an active source operation before reclaiming it', () async {
       const sourceKey = 'active-engine';

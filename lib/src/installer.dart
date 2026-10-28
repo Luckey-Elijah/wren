@@ -265,12 +265,10 @@ class FlutterInstaller {
           continue;
         }
         final name = p.basename(entry.path);
-        final releaseMatch = RegExp(r'^install-(.+)$').firstMatch(name);
-        final lockPath = name == 'flutter-repo'
-            ? p.join(root, 'locks', 'flutter-git')
-            : releaseMatch == null
+        final operationLockName = _stageOperationLockName(name);
+        final lockPath = operationLockName == null
             ? null
-            : p.join(root, 'locks', 'install-${releaseMatch.group(1)}');
+            : p.join(root, 'locks', operationLockName);
         if (lockPath == null) continue;
 
         _progress('Checking orphaned stage $name');
@@ -3010,6 +3008,18 @@ bool _sameVersion(String left, String right) {
 
 String _sourceKey(String engineRevision, HostPlatform host) =>
     '$engineRevision-${host.catalogOs}-${host.catalogArchitecture}';
+
+String? _stageOperationLockName(String stageName) {
+  if (stageName == 'flutter-repo') return 'flutter-git';
+  if (stageName.startsWith('install-') &&
+      stageName.length > 'install-'.length) {
+    return 'install-${stageName.substring('install-'.length)}';
+  }
+  final repairMatch = RegExp(r'^repair-(?:private-)?(.+)-[a-fA-F0-9]{32}$')
+      .firstMatch(stageName);
+  if (repairMatch == null) return null;
+  return 'install-${repairMatch.group(1)}';
+}
 
 String _randomId() {
   final random = Random.secure();
