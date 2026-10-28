@@ -7,6 +7,8 @@ import 'package:wren/wren.dart';
 
 const _version = '3.47.8';
 const _dartVersion = '3.13.7';
+const _betaVersion = '3.50.0-0.2.pre';
+const _betaDartVersion = '3.14.0-315.3.beta';
 final String _engineRevision = List<String>.filled(40, 'e').join();
 final String _archiveDigest = List<String>.filled(64, 'a').join();
 
@@ -122,6 +124,116 @@ void main() {
       );
       expect(secondRun, 0);
     });
+
+    for (final host in HostPlatform.values) {
+      test('installs a native beta release on ${host.label}', () async {
+        await _writeFixtureSdk(
+          repositoryWorktree,
+          version: _betaVersion,
+          reportedDartVersion: _betaDartVersion,
+          runtimeDartVersion: _betaDartVersion,
+          host: host,
+        );
+        await _git(repositoryWorktree.path, ['add', '.']);
+        await _git(repositoryWorktree.path, [
+          'commit',
+          '-m',
+          'fixture Flutter beta',
+        ]);
+        await _git(repositoryWorktree.path, ['tag', _betaVersion]);
+        final betaFrameworkRevision = await _git(repositoryWorktree.path, [
+          'rev-parse',
+          'HEAD',
+        ]);
+        final stdout = StringBuffer();
+        final stderr = StringBuffer();
+
+        final status = await runWren(
+          ['install', _betaVersion],
+          catalogJson: _betaCatalog(betaFrameworkRevision, host: host),
+          host: host,
+          installEnvironment: InstallEnvironment(
+            dataDirectory: dataDirectory,
+            flutterRepository: Uri.file(repositoryWorktree.path),
+          ),
+          stdoutSink: stdout,
+          stderrSink: stderr,
+        );
+
+        expect(status, 0, reason: stderr.toString());
+        expect(stdout.toString(), contains('Installed Flutter $_betaVersion'));
+        final archiveVariant = host == HostPlatform.linuxX64
+            ? 'linux-x64'
+            : 'darwin-arm64';
+        final installed = Directory(
+          p.join(
+            dataDirectory.path,
+            'releases',
+            'beta-$_betaVersion-$archiveVariant',
+          ),
+        );
+        final manifest = jsonDecode(
+          await File(p.join(installed.path, '.wren-release.json'))
+              .readAsString(),
+        ) as Map<String, Object?>;
+        expect(manifest['state'], 'ready');
+        expect(manifest['channel'], 'beta');
+        expect(manifest['version'], _betaVersion);
+        expect(manifest['frameworkRevision'], betaFrameworkRevision);
+        expect(manifest['canonicalDartVersion'], _betaDartVersion);
+      });
+    }
+
+    test(
+      'rejects a beta Dart executable that disagrees with the catalog',
+      () async {
+        await _writeFixtureSdk(
+          repositoryWorktree,
+          version: _betaVersion,
+          reportedDartVersion: _betaDartVersion,
+          runtimeDartVersion: '3.14.0-314.3.beta',
+        );
+        await _git(repositoryWorktree.path, ['add', '.']);
+        await _git(repositoryWorktree.path, [
+          'commit',
+          '-m',
+          'fixture beta mismatch',
+        ]);
+        await _git(repositoryWorktree.path, ['tag', _betaVersion]);
+        final betaFrameworkRevision = await _git(repositoryWorktree.path, [
+          'rev-parse',
+          'HEAD',
+        ]);
+        final stderr = StringBuffer();
+
+        final status = await runWren(
+          ['install', _betaVersion],
+          catalogJson: _betaCatalog(betaFrameworkRevision),
+          host: HostPlatform.linuxX64,
+          installEnvironment: InstallEnvironment(
+            dataDirectory: dataDirectory,
+            flutterRepository: Uri.file(repositoryWorktree.path),
+          ),
+          stderrSink: stderr,
+        );
+
+        expect(status, 4);
+        expect(
+          stderr.toString(),
+          contains('bundled Dart reports 3.14.0-314.3.beta'),
+        );
+        expect(
+          Directory(
+            p.join(
+              dataDirectory.path,
+              'releases',
+              'beta-$_betaVersion-linux-x64',
+            ),
+          ).existsSync(),
+          isFalse,
+        );
+      },
+    );
 
     test(
       'launches the exact release with transparent child behavior',
@@ -781,6 +893,28 @@ printf '\376\000\n' >&2
       expect(stderr.toString(), contains('bundled Dart version is missing'));
       expect(dataDirectory.existsSync(), isFalse);
     });
+
+    test('rejects a beta below the stable Dart floor before staging', () async {
+      final stderr = StringBuffer();
+
+      final status = await runWren(
+        ['install', _betaVersion],
+        catalogJson: _betaCatalog(
+          frameworkRevision,
+          dartVersion: '2.19.0 (build 2.19.0-1.beta)',
+        ),
+        host: HostPlatform.linuxX64,
+        installEnvironment: InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        ),
+        stderrSink: stderr,
+      );
+
+      expect(status, 4);
+      expect(stderr.toString(), contains('below the minimum 2.19.0'));
+      expect(dataDirectory.existsSync(), isFalse);
+    });
   });
 }
 
@@ -800,6 +934,26 @@ String _catalog(
       'archive': host == HostPlatform.linuxX64
           ? 'stable/linux/flutter_linux_$releaseVersion-stable.tar.xz'
           : 'stable/macos/flutter_macos_arm64_$releaseVersion-stable.zip',
+      'sha256': _archiveDigest,
+    },
+  ],
+});
+
+String _betaCatalog(
+  String frameworkRevision, {
+  HostPlatform host = HostPlatform.linuxX64,
+  String dartVersion = '3.14.0 (build $_betaDartVersion)',
+}) => jsonEncode({
+  'releases': [
+    {
+      'channel': 'beta',
+      'version': _betaVersion,
+      'hash': frameworkRevision,
+      'dart_sdk_version': dartVersion,
+      'dart_sdk_arch': host.catalogArchitecture,
+      'archive': host == HostPlatform.linuxX64
+          ? 'beta/linux/flutter_linux_$_betaVersion-beta.tar.xz'
+          : 'beta/macos/flutter_macos_arm64_$_betaVersion-beta.zip',
       'sha256': _archiveDigest,
     },
   ],

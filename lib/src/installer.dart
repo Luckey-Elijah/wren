@@ -723,9 +723,9 @@ class FlutterInstaller {
         'the Flutter catalog has a missing or invalid framework revision.',
       );
     }
-    if (release.channel != 'stable') {
+    if (release.channel != 'stable' && release.channel != 'beta') {
       throw const InstallException(
-        'this Wren version can install stable Flutter releases only.',
+        'the Flutter release catalog specifies an unsupported channel.',
       );
     }
     final root = environment.dataDirectory.absolute;

@@ -507,7 +507,8 @@ class _InstallCommand extends WrenCommand {
   String get name => 'install';
 
   @override
-  String get description => 'Install an eligible stable Flutter release.';
+  String get description =>
+      'Install an eligible stable or beta Flutter release.';
 
   @override
   Future<int> run() async {
