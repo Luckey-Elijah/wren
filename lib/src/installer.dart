@@ -361,6 +361,97 @@ class FlutterInstaller {
     }
   }
 
+  /// Returns the fixed SDK root for [releaseVersion] and records that an
+  /// external tool may continue to use its files.
+  Future<String> sdkPath(
+    String releaseVersion, {
+    required HostPlatform host,
+  }) async {
+    final root = environment.dataDirectory.absolute.path;
+    final releasesDirectory = Directory(p.join(root, 'releases'));
+    Directory? candidate;
+    if (releasesDirectory.existsSync()) {
+      await for (final entity in releasesDirectory.list(followLinks: false)) {
+        if (entity is! Directory ||
+            FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+                FileSystemEntityType.directory) {
+          continue;
+        }
+        final marker = File(p.join(entity.path, '.wren-release.json'));
+        if (!marker.existsSync()) continue;
+        try {
+          final data = jsonDecode(await marker.readAsString());
+          if (data is Map<String, Object?> &&
+              data['version'] == releaseVersion &&
+              data['host'] == host.catalogOs &&
+              data['architecture'] == host.catalogArchitecture) {
+            candidate = entity;
+            break;
+          }
+        } on Object {
+          // Invalid records are reported as unavailable below.
+        }
+      }
+    }
+    if (candidate == null) {
+      throw SdkLaunchException(
+        status: 3,
+        message:
+            'Flutter $releaseVersion is not installed for ${host.label}; '
+            'run `wren install $releaseVersion`.',
+      );
+    }
+
+    final releaseKey = p.basename(candidate.path);
+    final lifecycleLock = await _acquireLock(
+      Directory(p.join(root, 'locks', 'lifecycle-$releaseKey')),
+    );
+    try {
+      final installed = await listInstalled();
+      InstalledRelease? selected;
+      for (final release in installed) {
+        if (release.version == releaseVersion &&
+            release.host == host.catalogOs) {
+          selected = release;
+          break;
+        }
+      }
+      if (selected == null) {
+        throw SdkLaunchException(
+          status: 3,
+          message:
+              'Flutter $releaseVersion is not installed for ${host.label}; '
+              'run `wren install $releaseVersion`.',
+        );
+      }
+      if (selected.needsRepair) {
+        throw SdkLaunchException(
+          status: 3,
+          message:
+              'Flutter $releaseVersion needs repair; run '
+              '`wren repair $releaseVersion`.',
+        );
+      }
+
+      final marker = File(p.join(candidate.path, '.wren-release.json'));
+      final data = jsonDecode(await marker.readAsString());
+      if (data is! Map<String, Object?>) {
+        throw SdkLaunchException(
+          status: 3,
+          message:
+              'Flutter $releaseVersion needs repair; run '
+              '`wren repair $releaseVersion`.',
+        );
+      }
+      if (data['externalUse'] != true) {
+        await _publishManifest(candidate.path, {...data, 'externalUse': true});
+      }
+      return await candidate.resolveSymbolicLinks();
+    } finally {
+      await _releaseLock(lifecycleLock);
+    }
+  }
+
   Future<InstalledRelease?> _readiness(
     Directory release,
     Directory root,

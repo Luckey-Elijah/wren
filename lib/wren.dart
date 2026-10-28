@@ -440,6 +440,7 @@ Future<int> runWren(
     ..addCommand(_InstallCommand(context))
     ..addCommand(_ListCommand(context))
     ..addCommand(_SetCommand(context))
+    ..addCommand(_SdkPathCommand(context))
     ..addCommand(_FlutterCommand(context))
     ..addCommand(_DartCommand(context));
   return await runner.run(arguments);
@@ -800,6 +801,63 @@ class _FlutterCommand extends _SdkCommand {
 
 class _DartCommand extends _SdkCommand {
   new(WrenContext context) : super(context, 'dart');
+}
+
+class _SdkPathCommand extends WrenCommand {
+  new(super.context);
+
+  @override
+  String get name => 'sdk-path';
+
+  @override
+  String get description =>
+      'Print the fixed SDK root for an installed release.';
+
+  @override
+  Future<int> run() async {
+    if (argResults!.rest.length > 1) {
+      failUsage('sdk-path accepts at most one Flutter release.');
+    }
+    final targetHost = context.host;
+    if (targetHost == null) {
+      throw const SdkLaunchException(
+        status: 3,
+        message:
+            'this host is unsupported. Wren supports Linux x86_64 and '
+            'macOS arm64.',
+      );
+    }
+
+    final installed =
+        context.installedReleasesOverride ??
+        await context.installer.listInstalled();
+    final requestedRelease = argResults!.rest.isEmpty
+        ? null
+        : argResults!.rest.single;
+    final environmentRelease =
+        context.flutterReleaseOverride ??
+        io.Platform.environment['WREN_FLUTTER_RELEASE'];
+    final exactRelease =
+        requestedRelease ??
+        (environmentRelease?.trim().isNotEmpty ?? false
+            ? environmentRelease!.trim()
+            : null);
+    final release =
+        exactRelease ??
+        await context.selectProjectRelease(targetHost, installed);
+    if (release == null || release.isEmpty) {
+      throw const SdkLaunchException(
+        status: 3,
+        message:
+            'No installed Flutter release matches this project and no global '
+            'fallback is configured. Run `wren set <release>` or '
+            '`wren install <release>`.',
+      );
+    }
+    final path = await context.installer.sdkPath(release, host: targetHost);
+    writeOut(path);
+    return 0;
+  }
 }
 
 abstract class _SdkCommand extends WrenCommand {

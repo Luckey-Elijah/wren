@@ -125,6 +125,154 @@ void main() {
       expect(secondRun, 0);
     });
 
+    test(
+      'sdk-path prints and records fixed active and exact SDK roots',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        final installStable = await runWren(
+          ['install', _version],
+          catalogJson: _catalog(frameworkRevision),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        );
+        expect(installStable, 0);
+
+        await _writeFixtureSdk(
+          repositoryWorktree,
+          version: _betaVersion,
+          reportedDartVersion: _betaDartVersion,
+          runtimeDartVersion: _betaDartVersion,
+        );
+        await _git(repositoryWorktree.path, ['add', '.']);
+        await _git(repositoryWorktree.path, [
+          'commit',
+          '-m',
+          'fixture Flutter beta for sdk-path',
+        ]);
+        await _git(repositoryWorktree.path, ['tag', _betaVersion]);
+        final betaFrameworkRevision = await _git(repositoryWorktree.path, [
+          'rev-parse',
+          'HEAD',
+        ]);
+        final installBeta = await runWren(
+          ['install', _betaVersion],
+          catalogJson: _betaCatalog(betaFrameworkRevision),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        );
+        expect(installBeta, 0);
+
+        final stableRoot = p.join(
+          dataDirectory.path,
+          'releases',
+          'stable-$_version-linux-x64',
+        );
+        final betaRoot = p.join(
+          dataDirectory.path,
+          'releases',
+          'beta-$_betaVersion-linux-x64',
+        );
+        final config = File(p.join(dataDirectory.path, 'config.json'))
+          ..writeAsStringSync(jsonEncode({'globalFallback': _version}));
+        final activeStdout = StringBuffer();
+        final activeStderr = StringBuffer();
+
+        final activeStatus = await runWren(
+          ['sdk-path'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: activeStdout,
+          stderrSink: activeStderr,
+        );
+
+        expect(activeStatus, 0, reason: activeStderr.toString());
+        expect(activeStdout.toString(), '$stableRoot\n');
+        expect(activeStderr.toString(), isEmpty);
+        expect(
+          (jsonDecode(
+            File(p.join(stableRoot, '.wren-release.json')).readAsStringSync(),
+          ) as Map<String, Object?>)['externalUse'],
+          isTrue,
+        );
+
+        config.writeAsStringSync(jsonEncode({'globalFallback': _betaVersion}));
+        final changedStdout = StringBuffer();
+        final changedStatus = await runWren(
+          ['sdk-path'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: changedStdout,
+          stderrSink: StringBuffer(),
+        );
+        expect(changedStatus, 0);
+        expect(changedStdout.toString(), '$betaRoot\n');
+        expect(Directory(stableRoot).existsSync(), isTrue);
+
+        final overrideStdout = StringBuffer();
+        final overrideStatus = await runWren(
+          ['sdk-path'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          flutterReleaseOverride: _version,
+          stdoutSink: overrideStdout,
+          stderrSink: StringBuffer(),
+        );
+        expect(overrideStatus, 0);
+        expect(overrideStdout.toString(), '$stableRoot\n');
+
+        final exactStdout = StringBuffer();
+        final exactStatus = await runWren(
+          ['sdk-path', _version],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: exactStdout,
+          stderrSink: StringBuffer(),
+        );
+        expect(exactStatus, 0);
+        expect(exactStdout.toString(), '$stableRoot\n');
+        expect(
+          (jsonDecode(
+            File(p.join(betaRoot, '.wren-release.json')).readAsStringSync(),
+          ) as Map<String, Object?>)['externalUse'],
+          isTrue,
+        );
+
+        final missingStdout = StringBuffer();
+        final missingStderr = StringBuffer();
+        final missingStatus = await runWren(
+          ['sdk-path', '9.9.9'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: missingStdout,
+          stderrSink: missingStderr,
+        );
+        expect(missingStatus, 3);
+        expect(missingStdout.toString(), isEmpty);
+        expect(missingStderr.toString(), contains('is not installed'));
+
+        File(p.join(betaRoot, 'bin/flutter')).deleteSync();
+        final damagedStdout = StringBuffer();
+        final damagedStderr = StringBuffer();
+        final damagedStatus = await runWren(
+          ['sdk-path', _betaVersion],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: damagedStdout,
+          stderrSink: damagedStderr,
+        );
+        expect(damagedStatus, 3);
+        expect(damagedStdout.toString(), isEmpty);
+        expect(damagedStderr.toString(), contains('needs repair'));
+      },
+    );
+
     for (final host in HostPlatform.values) {
       test('installs a native beta release on ${host.label}', () async {
         await _writeFixtureSdk(
