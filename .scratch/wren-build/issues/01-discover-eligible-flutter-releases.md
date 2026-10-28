@@ -1,6 +1,6 @@
 # 01: Discover eligible Flutter releases
 
-Status: ready-for-agent
+Status: complete
 Blocked by: None (can start immediately)
 Contract: [Wren version manager spec](../../wren-version-manager/spec.md)
 
@@ -10,8 +10,8 @@ A developer can run `wren releases` on either supported host and see stable and 
 
 ## Acceptance criteria
 
-- [ ] `releases` reads the host catalog and shows only entries with a native artifact and a known canonical bundled Dart version at or above stable 2.19.0.
-- [ ] Stable and beta entries retain their channel and version identity; a catalog prerelease build uses its full Dart SemVer for eligibility.
-- [ ] Linux x86_64 and macOS arm64 filtering follows native host availability rather than accepting an Intel macOS artifact through Rosetta.
-- [ ] CLI usage errors return status `2`; `--verbose` is accepted for Wren commands without changing normal output semantics.
-- [ ] CLI-level tests use fixture catalogs for missing Dart metadata, prerelease versions below the floor, and unsupported host artifacts.
+- [x] `releases` reads the host catalog and shows only entries with a native artifact and a known canonical bundled Dart version at or above stable 2.19.0.
+- [x] Stable and beta entries retain their channel and version identity; a catalog prerelease build uses its full Dart SemVer for eligibility.
+- [x] Linux x86_64 and macOS arm64 filtering follows native host availability rather than accepting an Intel macOS artifact through Rosetta.
+- [x] CLI usage errors return status `2`; `--verbose` is accepted for Wren commands without changing normal output semantics.
+- [x] CLI-level tests use fixture catalogs for missing Dart metadata, prerelease versions below the floor, and unsupported host artifacts.
