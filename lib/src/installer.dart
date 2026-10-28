@@ -467,6 +467,216 @@ class FlutterInstaller {
     }
   }
 
+  /// Removes an installed release after Wren-launched and external users
+  /// have released it. A failed deletion leaves a non-ready record for retry.
+  Future<void> remove(
+    String releaseVersion, {
+    required HostPlatform host,
+    required Future<bool?> Function(String message) confirmExternalUse,
+    required Future<bool?> Function(String message) confirmSharedRepository,
+    required Future<void> Function() onUnavailable,
+  }) async {
+    final root = environment.dataDirectory.absolute.path;
+    final variant = _archiveVariant(host);
+    final releases = Directory(p.join(root, 'releases'));
+    Directory? target;
+    Map<String, Object?>? manifest;
+    if (releases.existsSync()) {
+      await for (final entity in releases.list(followLinks: false)) {
+        if (entity is! Directory) continue;
+        final marker = File(p.join(entity.path, '.wren-release.json'));
+        if (!marker.existsSync()) continue;
+        try {
+          final data = jsonDecode(await marker.readAsString());
+          if (data is Map<String, Object?> &&
+              data['version'] == releaseVersion &&
+              data['host'] == host.catalogOs &&
+              data['architecture'] == host.catalogArchitecture &&
+              p.basename(entity.path).endsWith('-$variant')) {
+            target = entity;
+            manifest = data;
+            break;
+          }
+        } on Object {
+          // Invalid release metadata cannot identify a requested release.
+        }
+      }
+    }
+    final removals = Directory(p.join(root, 'removals'));
+    if (target == null && removals.existsSync()) {
+      await for (final entity in removals.list(followLinks: false)) {
+        if (entity is! File) continue;
+        try {
+          final data = jsonDecode(await entity.readAsString());
+          if (data is Map<String, Object?> &&
+              data['version'] == releaseVersion &&
+              data['host'] == host.catalogOs &&
+              data['architecture'] == host.catalogArchitecture &&
+              data['releaseKey'] is String) {
+            manifest = data;
+            target = Directory(
+              p.join(root, 'releases', data['releaseKey']! as String),
+            );
+            break;
+          }
+        } on Object {
+          // Invalid removal records cannot identify a requested release.
+        }
+      }
+    }
+    if (target == null || manifest == null) {
+      throw InstallException('Flutter $releaseVersion is not installed.');
+    }
+
+    final releaseKey = p.basename(target.path);
+    final releaseLock = await _acquireLock(
+      Directory(p.join(root, 'locks', 'install-$releaseKey')),
+      cancellation: _waitCancellation,
+      onWait: () =>
+          _progress('Waiting for Flutter $releaseVersion install work'),
+    );
+    try {
+      final lifecycleLock = await _acquireLock(
+        Directory(p.join(root, 'locks', 'lifecycle-$releaseKey')),
+        cancellation: _waitCancellation,
+        onWait: () => _progress('Waiting for Flutter $releaseVersion users'),
+      );
+      try {
+        final leases = Directory(p.join(root, 'leases', releaseKey));
+        while (leases.existsSync() && leases.listSync().isNotEmpty) {
+          _progress('Waiting for Flutter $releaseVersion to finish running');
+          await _waitBriefly();
+        }
+
+        if (manifest['externalUse'] == true) {
+          final confirmed = await confirmExternalUse(
+            'Flutter $releaseVersion was exposed to an editor or external '
+            'Close editors using it and confirm removal.',
+          );
+          if (confirmed != true) {
+            throw InstallCancelledException(
+              'removal cancelled; Flutter $releaseVersion was not changed.',
+            );
+          }
+        }
+
+        manifest = Map<String, Object?>.from(manifest)
+          ..['state'] = 'removing'
+          ..['releaseKey'] = releaseKey;
+        await removals.create(recursive: true);
+        await File(p.join(removals.path, '$releaseKey.json'))
+            .writeAsString(jsonEncode(manifest), flush: true);
+        if (target.existsSync()) {
+          await _publishManifest(target.path, manifest);
+        }
+        await onUnavailable();
+
+        final sourceKey = manifest['sourceKey'];
+        final sourceLock = sourceKey is String
+            ? await _acquireLock(
+                Directory(p.join(root, 'locks', 'source-$sourceKey')),
+                cancellation: _waitCancellation,
+                onWait: () => _progress('Waiting for shared artifact users'),
+              )
+            : null;
+        try {
+          if (sourceKey is String && !_sourceIsReferenced(root, sourceKey)) {
+            final source = Directory(p.join(root, 'sources', sourceKey));
+            if (source.existsSync()) await source.delete(recursive: true);
+          }
+          if (target.existsSync()) {
+            await _discardWorktree(Directory(root), target.path);
+          }
+          if (Directory(target.path).existsSync()) {
+            await Directory(target.path).delete(recursive: true);
+          }
+        } finally {
+          if (sourceLock != null) await _releaseLock(sourceLock);
+        }
+        final journal = File(p.join(removals.path, '$releaseKey.json'));
+        if (journal.existsSync()) await journal.delete();
+      } finally {
+        await _releaseLock(lifecycleLock);
+      }
+    } finally {
+      await _releaseLock(releaseLock);
+    }
+
+    final remaining = releases.existsSync()
+        ? releases.listSync().whereType<Directory>().where(
+            (entry) =>
+                File(p.join(entry.path, '.wren-release.json')).existsSync(),
+          )
+        : const <Directory>[];
+    if (remaining.isEmpty) {
+      final repository = Directory(p.join(root, 'flutter.git'));
+      if (repository.existsSync()) {
+        final confirmed = await confirmSharedRepository(
+          'This was the final installed Flutter release. Delete the unused '
+          'shared Flutter Git repository?',
+        );
+        if (confirmed == true) {
+          final repoLock = await _acquireLock(
+            Directory(p.join(root, 'locks', 'flutter-git')),
+            cancellation: _waitCancellation,
+            onWait: () =>
+                _progress('Waiting for shared Flutter Git operations'),
+          );
+          try {
+            if (repository.existsSync()) {
+              await repository.delete(recursive: true);
+            }
+          } finally {
+            await _releaseLock(repoLock);
+          }
+        } else {
+          _progress('Kept the shared Flutter Git repository.');
+        }
+      }
+    }
+  }
+
+  Future<void> _waitBriefly() async {
+    final cancelled = Completer<void>();
+    final subscription = _waitCancellation.listen((_) {
+      if (!cancelled.isCompleted) cancelled.complete();
+    });
+    try {
+      await Future.any<void>([
+        Future<void>.delayed(const Duration(milliseconds: 100)),
+        cancelled.future,
+      ]);
+      if (cancelled.isCompleted) {
+        throw InstallCancelledException(
+          'cancelled while waiting for Flutter SDK users.',
+        );
+      }
+    } finally {
+      await subscription.cancel();
+    }
+  }
+
+  bool _sourceIsReferenced(String root, String sourceKey) {
+    final releases = Directory(p.join(root, 'releases'));
+    if (!releases.existsSync()) return false;
+    for (final entity in releases.listSync(followLinks: false)) {
+      if (entity is! Directory) continue;
+      final marker = File(p.join(entity.path, '.wren-release.json'));
+      if (!marker.existsSync()) continue;
+      try {
+        final data = jsonDecode(marker.readAsStringSync());
+        if (data is Map<String, Object?> &&
+            data['state'] == 'ready' &&
+            data['sourceKey'] == sourceKey) {
+          return true;
+        }
+      } on Object {
+        // An unreadable record is not a provable reference.
+      }
+    }
+    return false;
+  }
+
   Future<InstalledRelease?> _readiness(
     Directory release,
     Directory root,
@@ -878,6 +1088,7 @@ class FlutterInstaller {
         await stagingRoot.delete(recursive: true);
       }
       await stagingRoot.create(recursive: true);
+      Directory? heldSourceLock;
       try {
         _progress('Preparing Flutter ${release.version} for ${host.label}');
         await _requireGit();
@@ -945,68 +1156,64 @@ class FlutterInstaller {
           resolvedSourceKey,
         );
 
-        final sourceLock = await _acquireLock(
+        heldSourceLock = await _acquireLock(
           Directory(p.join(root.path, 'locks', 'source-$resolvedSourceKey')),
           cancellation: _waitCancellation,
           onWait: () => _progress('Waiting for the shared engine source lock'),
         );
-        try {
-          var artifactsPrepared = false;
-          final sourceDirectory = Directory(resolvedSourcePath);
-          if (sourceDirectory.existsSync()) {
-            await _validateSource(
-              sourceDirectory,
-              engineRevision: engineRevision,
-              host: host,
-            );
-            await _materializeSource(sourceDirectory, checkoutStage, host);
-          } else {
-            _progress('Downloading ${host.label} and web artifacts');
-            // Flutter's artifact updater validates storage-provider transfer
-            // checksums and rejects archives it cannot extract. Wren checks
-            // the runtime identity and resulting host artifact layout.
-            await _runFlutter(
-              checkoutStage,
-              _precacheArguments(host),
-              userMessage:
-                  'Flutter failed to download or extract required artifacts',
-            );
-            await _validateCheckout(
-              checkoutStage,
-              release: release,
-              frameworkRevision: checkoutRevision,
-              engineRevision: engineRevision,
-              host: host,
-            );
-            artifactsPrepared = true;
-            final sourceStage = Directory(p.join(stagingRoot.path, 'source'));
-            await _createSource(
-              checkoutStage,
-              sourceStage,
-              engineRevision: engineRevision,
-              host: host,
-            );
-            await sourceDirectory.parent.create(recursive: true);
-            await sourceStage.rename(sourceDirectory.path);
-          }
-          if (!artifactsPrepared) {
-            _progress('Validating ${host.label} and web artifacts');
-            await _runFlutter(
-              checkoutStage,
-              _precacheArguments(host),
-              userMessage:
-                  'Flutter failed to validate or prepare required artifacts',
-            );
-            await _validateCheckout(
-              checkoutStage,
-              release: release,
-              frameworkRevision: checkoutRevision,
-              engineRevision: engineRevision,
-              host: host,
-            );
-          }
-        } finally {
-          await _releaseLock(sourceLock);
+        var artifactsPrepared = false;
+        final sourceDirectory = Directory(resolvedSourcePath);
+        if (sourceDirectory.existsSync()) {
+          await _validateSource(
+            sourceDirectory,
+            engineRevision: engineRevision,
+            host: host,
+          );
+          await _materializeSource(sourceDirectory, checkoutStage, host);
+        } else {
+          _progress('Downloading ${host.label} and web artifacts');
+          // Flutter's artifact updater validates storage-provider transfer
+          // checksums and rejects archives it cannot extract. Wren checks
+          // the runtime identity and resulting host artifact layout.
+          await _runFlutter(
+            checkoutStage,
+            _precacheArguments(host),
+            userMessage:
+                'Flutter failed to download or extract required artifacts',
+          );
+          await _validateCheckout(
+            checkoutStage,
+            release: release,
+            frameworkRevision: checkoutRevision,
+            engineRevision: engineRevision,
+            host: host,
+          );
+          artifactsPrepared = true;
+          final sourceStage = Directory(p.join(stagingRoot.path, 'source'));
+          await _createSource(
+            checkoutStage,
+            sourceStage,
+            engineRevision: engineRevision,
+            host: host,
+          );
+          await sourceDirectory.parent.create(recursive: true);
+          await sourceStage.rename(sourceDirectory.path);
+        }
+        if (!artifactsPrepared) {
+          _progress('Validating ${host.label} and web artifacts');
+          await _runFlutter(
+            checkoutStage,
+            _precacheArguments(host),
+            userMessage:
+                'Flutter failed to validate or prepare required artifacts',
+          );
+          await _validateCheckout(
+            checkoutStage,
+            release: release,
+            frameworkRevision: checkoutRevision,
+            engineRevision: engineRevision,
+            host: host,
+          );
         }
         _validatePrivateCacheBoundary(checkoutStage, root);
 
@@ -1070,6 +1277,9 @@ class FlutterInstaller {
         }
         if (stagingRoot.existsSync()) {
           await stagingRoot.delete(recursive: true);
+        }
+        if (heldSourceLock != null) {
+          await _releaseLock(heldSourceLock);
         }
       }
     } finally {

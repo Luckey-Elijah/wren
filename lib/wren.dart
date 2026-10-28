@@ -186,6 +186,29 @@ class WrenContext {
     globalFallbackOverride = update.release;
   }
 
+  Future<void> _clearGlobalFallback(String release) async {
+    if (globalFallbackOverride == release) globalFallbackOverride = null;
+    final config = io.File(
+      '${installEnvironment.dataDirectory.absolute.path}/config.json',
+    );
+    if (!config.existsSync()) return;
+    final decoded = jsonDecode(config.readAsStringSync());
+    if (decoded is! Map<String, Object?> ||
+        decoded['globalFallback'] != release) {
+      return;
+    }
+    final values = Map<String, Object?>.from(decoded)..remove('globalFallback');
+    if (values.isEmpty) {
+      await config.delete();
+    } else {
+      _replaceFileAtomically(
+        config,
+        '${const JsonEncoder.withIndent('  ').convert(values)}\n',
+        temporarySuffix: '.tmp',
+      );
+    }
+  }
+
   /// Asks the user to confirm a language-version change.
   Future<bool?> confirm(String message) async {
     if (confirmation != null) return await confirmation!(message);
@@ -455,6 +478,7 @@ Future<int> runWren(
   final runner = WrenCommandRunner(context)
     ..addCommand(_ReleasesCommand(context))
     ..addCommand(_InstallCommand(context))
+    ..addCommand(_RemoveCommand(context))
     ..addCommand(_ListCommand(context))
     ..addCommand(_SetCommand(context))
     ..addCommand(_SdkPathCommand(context))
@@ -462,6 +486,50 @@ Future<int> runWren(
     ..addCommand(_FlutterCommand(context))
     ..addCommand(_DartCommand(context));
   return await runner.run(arguments);
+}
+
+class _RemoveCommand extends WrenCommand {
+  new(super.context);
+
+  @override
+  String get name => 'remove';
+
+  @override
+  String get description => 'Remove an installed Flutter release.';
+
+  @override
+  Future<int> run() async {
+    final arguments = argResults!.rest;
+    if (arguments.length != 1) {
+      failUsage('remove requires exactly one Flutter release version.');
+    }
+    final targetHost = context.host;
+    if (targetHost == null) {
+      throw const InstallException(
+        'this host is unsupported. Wren supports Linux x86_64 and macOS arm64.',
+      );
+    }
+    final version = arguments.single;
+    final fallback = await context.globalFallback;
+    await context.installer.remove(
+      version,
+      host: targetHost,
+      confirmExternalUse: context.confirm,
+      confirmSharedRepository: context.confirm,
+      onUnavailable: () async {
+        if (fallback == version) await context._clearGlobalFallback(version);
+      },
+    );
+
+    final installed = await context.installer.listInstalled();
+    final active = await context.selectProjectRelease(targetHost, installed);
+    if (active == null || active.isEmpty) {
+      writeOut('Removed Flutter $version. No release is active.');
+    } else {
+      writeOut('Removed Flutter $version. Active release: Flutter $active.');
+    }
+    return 0;
+  }
 }
 
 class _ReleasesCommand extends WrenCommand {

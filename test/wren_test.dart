@@ -815,6 +815,239 @@ exec '${child.path}' "\$@"
       },
     );
   });
+
+  group('remove', () {
+    late Directory temporaryDirectory;
+    late Directory dataDirectory;
+
+    setUp(() async {
+      temporaryDirectory = await Directory.systemTemp.createTemp(
+        'wren-remove-',
+      );
+      dataDirectory = Directory('${temporaryDirectory.path}/data')
+        ..createSync();
+    });
+
+    tearDown(() async {
+      await temporaryDirectory.delete(recursive: true);
+    });
+
+    Future<Directory> addRelease({bool externalUse = false}) async {
+      final directory = Directory(
+        '${dataDirectory.path}/releases/stable-3.47.8-linux-x64',
+      )..createSync(recursive: true);
+      await File('${directory.path}/.wren-release.json').writeAsString(
+        jsonEncode({
+          'channel': 'stable',
+          'version': '3.47.8',
+          'host': 'linux',
+          'architecture': 'x64',
+          'state': 'ready',
+          'externalUse': externalUse,
+        }),
+      );
+      return directory;
+    }
+
+    test('removes an active fallback and leaves pubspec unchanged', () async {
+      final release = await addRelease();
+      const sourceKey = 'unused-engine-linux-x64';
+      final releaseMarker = File('${release.path}/.wren-release.json');
+      final releaseData =
+          jsonDecode(releaseMarker.readAsStringSync()) as Map<String, Object?>;
+      releaseData['sourceKey'] = sourceKey;
+      await releaseMarker.writeAsString(jsonEncode(releaseData));
+      final source = Directory('${dataDirectory.path}/sources/$sourceKey')
+        ..createSync(recursive: true);
+      final project = Directory('${temporaryDirectory.path}/project')
+        ..createSync();
+      final pubspec = File('${project.path}/pubspec.yaml')
+        ..writeAsStringSync('environment:\n  flutter: ^3.47.8\n');
+      final originalPubspec = pubspec.readAsStringSync();
+      final config = File('${dataDirectory.path}/config.json')
+        ..writeAsStringSync('{"globalFallback":"3.47.8"}');
+      final output = StringBuffer();
+      final status = await runWren(
+        ['remove', '3.47.8'],
+        host: HostPlatform.linuxX64,
+        installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+        projectDirectory: project,
+        stdoutSink: output,
+        stderrSink: StringBuffer(),
+      );
+
+      expect(status, 0);
+      expect(release.existsSync(), isFalse);
+      expect(source.existsSync(), isFalse);
+      expect(pubspec.readAsStringSync(), originalPubspec);
+      expect(config.existsSync(), isFalse);
+      expect(output.toString(), contains('No release is active'));
+    });
+
+    test(
+      'external-use cancellation returns 6 without changing files',
+      () async {
+        final release = await addRelease(externalUse: true);
+        var prompted = false;
+        final status = await runWren(
+          ['remove', '3.47.8'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+          confirmation: (message) async {
+            prompted = message.contains('Close editors');
+            return false;
+          },
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        );
+
+        expect(status, 6);
+        expect(prompted, isTrue);
+        expect(release.existsSync(), isTrue);
+        final manifest = jsonDecode(
+          File('${release.path}/.wren-release.json').readAsStringSync(),
+        ) as Map<String, Object?>;
+        expect(manifest['state'], 'ready');
+      },
+    );
+
+    test(
+      'waits for a Wren-launched SDK lease before deleting the release',
+      () async {
+        final release = await addRelease();
+        final leaseDirectory = Directory(
+          '${dataDirectory.path}/leases/stable-3.47.8-linux-x64',
+        )..createSync(recursive: true);
+        final lease = File('${leaseDirectory.path}/active')
+          ..writeAsStringSync('$pid\n');
+        final output = StringBuffer();
+        final errors = StringBuffer();
+        final removal = runWren(
+          ['remove', '3.47.8'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+          stdoutSink: output,
+          stderrSink: errors,
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        expect(release.existsSync(), isTrue);
+        await lease.delete();
+        expect(await removal, 0);
+        expect(release.existsSync(), isFalse);
+        expect(errors.toString(), contains('finish running'));
+      },
+    );
+
+    test(
+      'keeps a source still referenced by another installed release',
+      () async {
+        final release = await addRelease();
+        final other = Directory(
+          '${dataDirectory.path}/releases/stable-3.46.0-linux-x64',
+        )..createSync(recursive: true);
+        await File('${other.path}/.wren-release.json').writeAsString(
+          jsonEncode({
+            'channel': 'stable',
+            'version': '3.46.0',
+            'host': 'linux',
+            'architecture': 'x64',
+            'state': 'ready',
+            'sourceKey': 'shared-engine-linux-x64',
+          }),
+        );
+        const sourceKey = 'shared-engine-linux-x64';
+        for (final installation in [release, other]) {
+          final marker = File('${installation.path}/.wren-release.json');
+          final manifest =
+              jsonDecode(marker.readAsStringSync()) as Map<String, Object?>;
+          manifest['sourceKey'] = sourceKey;
+          await marker.writeAsString(jsonEncode(manifest));
+        }
+        final source = Directory('${dataDirectory.path}/sources/$sourceKey')
+          ..createSync(recursive: true);
+        final status = await runWren(
+          ['remove', '3.47.8'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        );
+
+        expect(status, 0);
+        expect(release.existsSync(), isFalse);
+        expect(other.existsSync(), isTrue);
+        expect(source.existsSync(), isTrue);
+      },
+    );
+
+    test('retries cleanup from an unavailable removal record', () async {
+      const releaseKey = 'stable-3.47.8-linux-x64';
+      const sourceKey = 'orphaned-engine-linux-x64';
+      final source = Directory('${dataDirectory.path}/sources/$sourceKey')
+        ..createSync(recursive: true);
+      final journal = File('${dataDirectory.path}/removals/$releaseKey.json')
+        ..createSync(recursive: true);
+      await journal.writeAsString(
+        jsonEncode({
+          'channel': 'stable',
+          'version': '3.47.8',
+          'host': 'linux',
+          'architecture': 'x64',
+          'state': 'removing',
+          'sourceKey': sourceKey,
+          'releaseKey': releaseKey,
+        }),
+      );
+
+      final status = await runWren(
+        ['remove', '3.47.8'],
+        host: HostPlatform.linuxX64,
+        installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+        stdoutSink: StringBuffer(),
+        stderrSink: StringBuffer(),
+      );
+
+      expect(status, 0);
+      expect(source.existsSync(), isFalse);
+      expect(journal.existsSync(), isFalse);
+    });
+
+    test(
+      'declining final shared repository deletion keeps the repository',
+      () async {
+        await addRelease();
+        final repository = Directory('${dataDirectory.path}/flutter.git')
+          ..createSync();
+        var prompted = false;
+        final status = await runWren(
+          ['remove', '3.47.8'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+          confirmation: (message) async {
+            prompted = message.contains('final installed');
+            return false;
+          },
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        );
+
+        expect(status, 0);
+        expect(prompted, isTrue);
+        expect(repository.existsSync(), isTrue);
+      },
+    );
+
+    test('requires one release argument', () async {
+      expect(
+        await runWren(
+          ['remove'],
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        ),
+        2,
+      );
+    });
+  });
 }
 
 List<Map<String, Object?>> _fixtureReleases() => [
