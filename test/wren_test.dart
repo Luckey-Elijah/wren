@@ -63,6 +63,70 @@ void main() {
       expect(verboseError.toString(), normalError.toString());
     });
 
+    test('--verbose is accepted after a Wren command', () async {
+      final plain = StringBuffer();
+      final placedAfter = StringBuffer();
+
+      final plainStatus = await runWren(
+        ['releases'],
+        catalogJson: jsonEncode({
+          'releases': [_release()],
+        }),
+        host: HostPlatform.linuxX64,
+        stdoutSink: plain,
+        stderrSink: StringBuffer(),
+      );
+      final verboseStatus = await runWren(
+        ['releases', '--verbose'],
+        catalogJson: jsonEncode({
+          'releases': [_release()],
+        }),
+        host: HostPlatform.linuxX64,
+        stdoutSink: placedAfter,
+        stderrSink: StringBuffer(),
+      );
+
+      expect(plainStatus, 0);
+      expect(verboseStatus, 0);
+      expect(placedAfter.toString(), plain.toString());
+    });
+
+    test('help uses the registered command tree', () async {
+      final stdout = StringBuffer();
+      final stderr = StringBuffer();
+
+      final status = await runWren(
+        ['--help'],
+        stdoutSink: stdout,
+        stderrSink: stderr,
+      );
+
+      expect(status, 0);
+      expect(stderr.toString(), isEmpty);
+      expect(stdout.toString(), contains('releases'));
+      expect(stdout.toString(), contains('install'));
+      expect(stdout.toString(), contains('--verbose'));
+    });
+
+    test('missing command is a usage error', () async {
+      final stdout = StringBuffer();
+      final stderr = StringBuffer();
+
+      final status = await runWren([], stdoutSink: stdout, stderrSink: stderr);
+
+      expect(status, 2);
+      expect(stdout.toString(), isEmpty);
+      expect(stderr.toString(), contains('a command is required'));
+      expect(stderr.toString(), contains('Usage: wren'));
+
+      final verboseOnlyStatus = await runWren(
+        ['--verbose'],
+        stdoutSink: StringBuffer(),
+        stderrSink: StringBuffer(),
+      );
+      expect(verboseOnlyStatus, 2);
+    });
+
     test(
       'checks an explicitly requested ineligible release with its reason',
       () async {

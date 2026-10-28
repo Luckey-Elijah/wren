@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:ffi' show Abi;
 import 'dart:io' as io;
 
+import 'package:args/command_runner.dart';
 import 'package:pub_semver/pub_semver.dart';
 
 import 'src/installer.dart';
@@ -15,10 +16,124 @@ const _linuxCatalog =
 const _macosCatalog =
     'https://storage.googleapis.com/flutter_infra_release/releases/releases_macos.json';
 
-/// Runs the Wren CLI and returns its process exit status.
+/// Shared values and services for one invocation of the Wren CLI.
 ///
-/// [catalogJson] and [host] make the command boundary usable with local catalog
-/// fixtures. Production callers should omit both values.
+/// A fresh context is constructed for each [runWren] call and then shared by
+/// every command registered for that run.
+class WrenContext {
+  WrenContext({
+    StringSink? stdoutSink,
+    StringSink? stderrSink,
+    this.catalogJson,
+    this.hostOverride,
+    this.configuredInstallEnvironment,
+  }) : _stdoutSink = stdoutSink ?? io.stdout,
+       _stderrSink = stderrSink ?? io.stderr;
+
+  final StringSink _stdoutSink;
+  final StringSink _stderrSink;
+  final String? catalogJson;
+  final HostPlatform? hostOverride;
+  final InstallEnvironment? configuredInstallEnvironment;
+
+  String get minimumDartVersion => _minimumDartVersion;
+  StringSink get stdoutSink => _stdoutSink;
+  StringSink get stderrSink => _stderrSink;
+  HostPlatform? get host => hostOverride ?? HostPlatform.current;
+  InstallEnvironment get installEnvironment =>
+      configuredInstallEnvironment ?? InstallEnvironment();
+
+  FlutterInstaller get installer => FlutterInstaller(
+    installEnvironment,
+    onProgress: (message) => stderrSink.writeln(message),
+  );
+
+  Future<ReleaseCatalog> loadReleaseCatalog(HostPlatform targetHost) =>
+      catalogJson == null
+      ? ReleaseCatalog.fetch(targetHost.catalogUri, host: targetHost)
+      : Future.value(ReleaseCatalog.parse(catalogJson!, host: targetHost));
+}
+
+/// Wren-specific command base with shared output, verbosity and context.
+abstract class WrenCommand extends Command<int> {
+  WrenCommand(this.context) {
+    argParser.addFlag(
+      'verbose',
+      negatable: false,
+      help: 'Show additional Wren diagnostic output.',
+    );
+  }
+
+  final WrenContext context;
+
+  bool get verbose =>
+      (globalResults?.flag('verbose') ?? false) ||
+      (argResults?.flag('verbose') ?? false);
+
+  void writeOut(Object? message) => context.stdoutSink.writeln(message);
+  void writeError(Object? message) => context.stderrSink.writeln(message);
+
+  Never failUsage(String message) => usageException(message);
+}
+
+/// Composition wrapper which only accepts Wren-owned commands.
+class WrenCommandRunner {
+  WrenCommandRunner(this.context)
+    : _runner = _WrenPackageCommandRunner(context);
+
+  final WrenContext context;
+  final _WrenPackageCommandRunner _runner;
+
+  void addCommand(WrenCommand command) => _runner.addCommand(command);
+
+  Future<int> run(Iterable<String> arguments) async {
+    final args = arguments.toList(growable: false);
+    try {
+      if (args.isEmpty || args.every((argument) => argument == '--verbose')) {
+        context.stderrSink
+          ..writeln('wren: a command is required.')
+          ..writeln(_runner.usage);
+        return 2;
+      }
+      return await _runner.run(args) ?? 0;
+    } on UsageException catch (error) {
+      context.stderrSink
+        ..writeln('wren: ${error.message}')
+        ..writeln(error.usage);
+      return 2;
+    } on ReleaseCatalogException catch (error) {
+      context.stderrSink.writeln('wren: ${error.message}');
+      return 4;
+    } on InstallException catch (error) {
+      context.stderrSink.writeln('wren: ${error.message}');
+      return 4;
+    } on Object catch (error) {
+      context.stderrSink.writeln('wren: command failed: $error');
+      return 4;
+    }
+  }
+}
+
+class _WrenPackageCommandRunner extends CommandRunner<int> {
+  _WrenPackageCommandRunner(this.context)
+    : super('wren', 'A standalone Flutter and Dart version manager.') {
+    argParser.addFlag(
+      'verbose',
+      negatable: false,
+      help: 'Show additional Wren diagnostic output.',
+    );
+  }
+
+  final WrenContext context;
+
+  @override
+  void printUsage() => context.stdoutSink.write(usage);
+}
+
+/// Runs Wren's command tree and returns its process exit status.
+///
+/// [catalogJson], [host], and [installEnvironment] make the CLI invocation
+/// seam usable with local fixtures. Production callers should omit them.
 Future<int> runWren(
   List<String> arguments, {
   StringSink? stdoutSink,
@@ -27,154 +142,112 @@ Future<int> runWren(
   HostPlatform? host,
   InstallEnvironment? installEnvironment,
 }) async {
-  final out = stdoutSink ?? io.stdout;
-  final err = stderrSink ?? io.stderr;
-  final parsed = _parseArguments(arguments);
-  if (parsed.error != null) {
-    err.writeln('wren: ${parsed.error}');
-    err.writeln(_usage);
-    return 2;
-  }
+  final context = WrenContext(
+    stdoutSink: stdoutSink,
+    stderrSink: stderrSink,
+    catalogJson: catalogJson,
+    hostOverride: host,
+    configuredInstallEnvironment: installEnvironment,
+  );
+  final runner = WrenCommandRunner(context)
+    ..addCommand(_ReleasesCommand(context))
+    ..addCommand(_InstallCommand(context));
+  return runner.run(arguments);
+}
 
-  if (parsed.help) {
-    out.writeln(_usage);
-    return 0;
-  }
+class _ReleasesCommand extends WrenCommand {
+  _ReleasesCommand(super.context);
 
-  if (parsed.command != 'releases' && parsed.command != 'install') {
-    err.writeln('wren: unknown command "${parsed.command}".');
-    err.writeln(_usage);
-    return 2;
-  }
-  if (parsed.command == 'install' && parsed.releaseVersion == null) {
-    err.writeln('wren: `install` requires a Flutter release version.');
-    err.writeln(_usage);
-    return 2;
-  }
+  @override
+  String get name => 'releases';
 
-  final targetHost = host ?? HostPlatform.current;
-  if (targetHost == null) {
-    err.writeln(
-      'wren: this host is unsupported. Wren supports Linux x86_64 and macOS arm64.',
-    );
-    return 4;
-  }
+  @override
+  String get description =>
+      'List eligible stable and beta Flutter releases.\n'
+      'Optionally check one release version.';
 
-  try {
-    final catalog = catalogJson == null
-        ? await ReleaseCatalog.fetch(targetHost.catalogUri, host: targetHost)
-        : ReleaseCatalog.parse(catalogJson, host: targetHost);
-    if (parsed.command == 'install') {
-      final version = parsed.releaseVersion!;
-      final eligibility = catalog.eligibilityForVersion(version);
-      final release = eligibility.release;
-      if (release == null) {
-        err.writeln(
-          'wren: Flutter $version cannot be installed: ${eligibility.reason}',
-        );
-        return 4;
-      }
-      final installer = FlutterInstaller(
-        installEnvironment ?? InstallEnvironment(),
-        onProgress: err.writeln,
-      );
-      final result = await installer.install(release, host: targetHost);
-      out.writeln(result.message);
-      return 0;
+  @override
+  Future<int> run() async {
+    if (argResults!.rest.length > 1) {
+      failUsage('unexpected argument "${argResults!.rest[1]}".');
     }
-    if (parsed.releaseVersion case final version?) {
+    final targetHost = context.host;
+    if (targetHost == null) {
+      writeError(
+        'wren: this host is unsupported. Wren supports Linux x86_64 and macOS arm64.',
+      );
+      return 4;
+    }
+    final catalog = await context.loadReleaseCatalog(targetHost);
+    final version = argResults!.rest.isEmpty ? null : argResults!.rest.single;
+    if (version != null) {
       final eligibility = catalog.eligibilityForVersion(version);
       if (eligibility.release case final release?) {
-        out.writeln(
+        writeOut(
           'Flutter $version is eligible for ${targetHost.label}: '
           '${release.channel}, bundled Dart ${release.dartVersion}.',
         );
         return 0;
       }
-      err.writeln(
+      writeError(
         'wren: Flutter $version is not eligible for ${targetHost.label}: '
         '${eligibility.reason}',
       );
       return 4;
     }
     if (catalog.releases.isEmpty) {
-      out.writeln('No eligible Flutter releases for ${targetHost.label}.');
+      writeOut('No eligible Flutter releases for ${targetHost.label}.');
       return 0;
     }
-    out.writeln('Eligible Flutter releases for ${targetHost.label}:');
+    writeOut('Eligible Flutter releases for ${targetHost.label}:');
     for (final release in catalog.releases) {
-      out.writeln(
+      writeOut(
         '${release.version}  ${release.channel}  Dart ${release.dartVersion}',
       );
     }
     return 0;
-  } on ReleaseCatalogException catch (error) {
-    err.writeln('wren: ${error.message}');
-    return 4;
-  } on InstallException catch (error) {
-    err.writeln('wren: ${error.message}');
-    return 4;
-  } on Object catch (error) {
-    err.writeln('wren: ${parsed.command} failed: $error');
-    return 4;
   }
 }
 
-const _usage =
-    'Usage: wren [--verbose] <command> [<release>]\n'
-    'Commands:\n'
-    '  releases   List eligible stable and beta Flutter releases\n'
-    '             Check one release with: wren releases <release>\n'
-    '  install    Install a stable Flutter release: wren install <release>';
+class _InstallCommand extends WrenCommand {
+  _InstallCommand(super.context);
 
-class _ParsedArguments {
-  const _ParsedArguments({
-    this.command = '',
-    this.releaseVersion,
-    this.verbose = false,
-    this.help = false,
-    this.error,
-  });
+  @override
+  String get name => 'install';
 
-  final String command;
-  final String? releaseVersion;
-  final bool verbose;
-  final bool help;
-  final String? error;
-}
+  @override
+  String get description => 'Install an eligible stable Flutter release.';
 
-_ParsedArguments _parseArguments(List<String> arguments) {
-  var verbose = false;
-  final remaining = <String>[];
-  for (final argument in arguments) {
-    if (argument == '--verbose') {
-      verbose = true;
-    } else {
-      remaining.add(argument);
+  @override
+  Future<int> run() async {
+    if (argResults!.rest.length != 1) {
+      failUsage(
+        argResults!.rest.isEmpty
+            ? '`install` requires a Flutter release version.'
+            : 'unexpected argument "${argResults!.rest[1]}".',
+      );
     }
+    final targetHost = context.host;
+    if (targetHost == null) {
+      writeError(
+        'wren: this host is unsupported. Wren supports Linux x86_64 and macOS arm64.',
+      );
+      return 4;
+    }
+    final catalog = await context.loadReleaseCatalog(targetHost);
+    final version = argResults!.rest.single;
+    final eligibility = catalog.eligibilityForVersion(version);
+    final release = eligibility.release;
+    if (release == null) {
+      writeError(
+        'wren: Flutter $version cannot be installed: ${eligibility.reason}',
+      );
+      return 4;
+    }
+    final result = await context.installer.install(release, host: targetHost);
+    writeOut(result.message);
+    return 0;
   }
-
-  if (remaining.isEmpty) {
-    return _ParsedArguments(error: 'a command is required.');
-  }
-  if (remaining.length == 1 &&
-      (remaining.single == '--help' || remaining.single == '-h')) {
-    return _ParsedArguments(verbose: verbose, help: true);
-  }
-  if (remaining.any((argument) => argument.startsWith('-'))) {
-    return _ParsedArguments(
-      error:
-          'unknown option "${remaining.firstWhere((a) => a.startsWith('-'))}".',
-    );
-  }
-  if (remaining.length > 2) {
-    return _ParsedArguments(error: 'unexpected argument "${remaining[2]}".');
-  }
-  return _ParsedArguments(
-    command: remaining.first,
-    releaseVersion: remaining.length == 2 ? remaining[1] : null,
-    verbose: verbose,
-  );
 }
 
 enum HostPlatform {
