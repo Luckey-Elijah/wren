@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -98,7 +99,7 @@ List<String> _precacheArguments(HostPlatform host) => [
 /// Provides the data directory and Flutter source repository for Wren.
 class InstallEnvironment {
   /// Creates an environment with optional directory and repository overrides.
-  new({Directory? dataDirectory, Uri? flutterRepository})
+  new({Directory? dataDirectory, Uri? flutterRepository, this.waitCancellation})
     : dataDirectory = dataDirectory ?? _defaultDataDirectory(),
       flutterRepository = flutterRepository ?? Uri.parse(_flutterGitUrl);
 
@@ -107,6 +108,11 @@ class InstallEnvironment {
 
   /// Git repository used to create Flutter release checkouts.
   final Uri flutterRepository;
+
+  /// Optional cancellation signal used while waiting for an install lock.
+  ///
+  /// When omitted, Ctrl-C cancels the current lock wait.
+  final Stream<void>? waitCancellation;
 }
 
 /// Describes the result of a Flutter release installation.
@@ -158,6 +164,15 @@ class InstallException implements Exception {
   const new(this.message);
 
   /// Explanation of the failed operation.
+  final String message;
+}
+
+/// An install wait cancelled by the caller.
+class InstallCancelledException implements Exception {
+  /// Creates a cancellation result with an actionable message.
+  new(this.message);
+
+  /// Explanation of the cancelled operation.
   final String message;
 }
 
@@ -826,6 +841,7 @@ class FlutterInstaller {
     final lockPath = p.join(root.path, 'locks', 'install-$releaseKey');
     final releaseLock = await _acquireLock(
       Directory(lockPath),
+      cancellation: _waitCancellation,
       onWait: () => _progress(
         'Waiting for another install of Flutter ${release.version}',
       ),
@@ -867,6 +883,7 @@ class FlutterInstaller {
         await _requireGit();
         final repoLock = await _acquireLock(
           Directory(p.join(root.path, 'locks', 'flutter-git')),
+          cancellation: _waitCancellation,
           onWait: () => _progress('Waiting for the shared Flutter Git lock'),
         );
         try {
@@ -930,6 +947,7 @@ class FlutterInstaller {
 
         final sourceLock = await _acquireLock(
           Directory(p.join(root.path, 'locks', 'source-$resolvedSourceKey')),
+          cancellation: _waitCancellation,
           onWait: () => _progress('Waiting for the shared engine source lock'),
         );
         try {
@@ -996,6 +1014,7 @@ class FlutterInstaller {
         checkoutPublished = true;
         final worktreeRepairLock = await _acquireLock(
           Directory(p.join(root.path, 'locks', 'flutter-git')),
+          cancellation: _waitCancellation,
         );
         try {
           await _runGit(root, [
@@ -1028,6 +1047,8 @@ class FlutterInstaller {
           message: 'Installed Flutter ${release.version} for ${host.label}.',
           alreadyInstalled: false,
         );
+      } on InstallCancelledException {
+        rethrow;
       } on InstallException {
         rethrow;
       } on Object catch (error) {
@@ -1055,6 +1076,9 @@ class FlutterInstaller {
       await _releaseLock(releaseLock);
     }
   }
+
+  Stream<void> get _waitCancellation =>
+      environment.waitCancellation ?? ProcessSignal.sigint.watch().map((_) {});
 
   void _progress(String message) => onProgress?.call(message);
 
@@ -1583,34 +1607,62 @@ Directory _defaultDataDirectory() {
 Future<Directory> _acquireLock(
   Directory lock, {
   void Function()? onWait,
+  Stream<void>? cancellation,
 }) async {
   await lock.parent.create(recursive: true);
   var reportedWait = false;
-  for (var attempt = 0; attempt < 36000; attempt++) {
-    try {
-      await lock.create();
-      await File(p.join(lock.path, 'owner')).writeAsString('$pid\n');
-      return lock;
-    } on FileSystemException {
-      if (!lock.existsSync()) rethrow;
-      if (await _isStaleLock(lock)) {
-        try {
-          await lock.delete(recursive: true);
-        } on FileSystemException {
-          // Another waiter may have removed it first.
+  final cancelled = Completer<void>();
+  StreamSubscription<void>? cancellationSubscription;
+  try {
+    for (var attempt = 0; attempt < 36000; attempt++) {
+      try {
+        await lock.create(recursive: true);
+        final owner = File(p.join(lock.path, 'owner'));
+        await owner.create(exclusive: true);
+        await owner.writeAsString('$pid\n', flush: true);
+        return lock;
+      } on FileSystemException {
+        if (!lock.existsSync()) continue;
+        if (await _isStaleLock(lock)) {
+          try {
+            final staleLock = Directory('${lock.path}.stale-${_randomId()}');
+            await lock.rename(staleLock.path);
+            await staleLock.delete(recursive: true);
+          } on FileSystemException {
+            // Another waiter may have replaced or removed it first.
+          }
+          continue;
         }
-        continue;
+        if (!reportedWait) {
+          reportedWait = true;
+          onWait?.call();
+          if (cancellation != null) {
+            cancellationSubscription = cancellation.listen((_) {
+              if (!cancelled.isCompleted) cancelled.complete();
+            });
+          }
+        }
+        if (cancellationSubscription == null) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        } else {
+          await Future.any<void>([
+            Future<void>.delayed(const Duration(milliseconds: 100)),
+            cancelled.future,
+          ]);
+          if (cancelled.isCompleted) {
+            throw InstallCancelledException(
+              'cancelled while waiting for Wren install lock ${lock.path}.',
+            );
+          }
+        }
       }
-      if (!reportedWait) {
-        reportedWait = true;
-        onWait?.call();
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 100));
     }
+    throw InstallException(
+      'timed out waiting for Wren install lock ${lock.path}.',
+    );
+  } finally {
+    await cancellationSubscription?.cancel();
   }
-  throw InstallException(
-    'timed out waiting for Wren install lock ${lock.path}.',
-  );
 }
 
 Future<bool> _isStaleLock(Directory lock) async {
@@ -1625,7 +1677,14 @@ Future<bool> _isStaleLock(Directory lock) async {
 }
 
 Future<void> _releaseLock(Directory lock) async {
-  if (lock.existsSync()) await lock.delete(recursive: true);
+  if (!lock.existsSync()) return;
+  final releasedLock = Directory('${lock.path}.released-${_randomId()}');
+  try {
+    await lock.rename(releasedLock.path);
+    await releasedLock.delete(recursive: true);
+  } on FileSystemException {
+    // A stale-lock recovery may have moved it already.
+  }
 }
 
 Future<void> _copyTree(

@@ -9,7 +9,12 @@ import 'package:yaml/yaml.dart';
 import 'package:yaml_edit/yaml_edit.dart';
 
 export 'src/installer.dart'
-    show InstallEnvironment, InstallException, InstallResult, InstalledRelease;
+    show
+        InstallCancelledException,
+        InstallEnvironment,
+        InstallException,
+        InstallResult,
+        InstalledRelease;
 
 /// Testable SDK launch boundary used by [WrenContext].
 typedef SdkLauncher = Future<int> Function({
@@ -356,6 +361,9 @@ class WrenCommandRunner {
     } on InstallException catch (error) {
       context.stderrSink.writeln('wren: ${error.message}');
       return 4;
+    } on InstallCancelledException catch (error) {
+      context.stderrSink.writeln('wren: ${error.message}');
+      return 6;
     } on Object catch (error) {
       context.stderrSink.writeln('wren: command failed: $error');
       return 4;

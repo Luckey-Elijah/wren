@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -839,6 +840,47 @@ printf '\376\000\n' >&2
           Directory(p.join(dataDirectory.path, 'staging')).listSync(),
           isEmpty,
         );
+
+        const retryVersion = '3.47.10';
+        await _writeFixtureSdk(repositoryWorktree, version: retryVersion);
+        await _git(repositoryWorktree.path, ['add', '.']);
+        await _git(repositoryWorktree.path, ['commit', '-m', 'retry fixture']);
+        await _git(repositoryWorktree.path, ['tag', retryVersion]);
+        final retryRevision = await _git(repositoryWorktree.path, [
+          'rev-parse',
+          'HEAD',
+        ]);
+        await File(p.join(dataDirectory.path, 'fail-precache')).create();
+        await File(p.join(dataDirectory.path, 'hold-failure')).create();
+        final failing = await _startInstallWorker(
+          dataDirectory,
+          repositoryWorktree,
+          retryVersion,
+          retryRevision,
+        );
+        await _waitForFile(File(p.join(dataDirectory.path, 'failure-started')));
+        final retry = await _startInstallWorker(
+          dataDirectory,
+          repositoryWorktree,
+          retryVersion,
+          retryRevision,
+        );
+        await _waitForText(
+          retry.stderr,
+          'Waiting for another install of Flutter',
+        );
+        await File(p.join(dataDirectory.path, 'continue-failure')).create();
+        expect(await failing.process.exitCode, 4);
+        expect(await retry.process.exitCode, 0);
+        expect(
+          File(
+            p.join(
+              dataDirectory.path,
+              'releases/stable-$retryVersion-linux-x64/.wren-release.json',
+            ),
+          ).existsSync(),
+          isTrue,
+        );
       },
     );
 
@@ -990,6 +1032,129 @@ printf '\376\000\n' >&2
           stderrSink: StringBuffer(),
         );
         expect(retried, 0);
+      },
+    );
+
+    test('cancelling a contended install lock returns status 6', () async {
+      final cancellation = StreamController<void>.broadcast();
+      addTearDown(cancellation.close);
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+        waitCancellation: cancellation.stream,
+      );
+      final releaseLock = Directory(
+        p.join(
+          dataDirectory.path,
+          'locks',
+          'install-stable-$_version-linux-x64',
+        ),
+      )..createSync(recursive: true);
+      File(p.join(releaseLock.path, 'owner')).writeAsStringSync('$pid\n');
+      final stderr = StringBuffer();
+      final statusFuture = runWren(
+        ['install', _version],
+        catalogJson: _catalog(frameworkRevision),
+        host: HostPlatform.linuxX64,
+        installEnvironment: environment,
+        stdoutSink: StringBuffer(),
+        stderrSink: stderr,
+      );
+
+      for (var attempt = 0; attempt < 100; attempt++) {
+        if (stderr.toString().contains('Waiting for another install')) break;
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(stderr.toString(), contains('Waiting for another install'));
+      cancellation.add(null);
+
+      expect(await statusFuture, 6);
+      expect(releaseLock.existsSync(), isTrue);
+      expect(
+        Directory(p.join(dataDirectory.path, 'staging')).existsSync(),
+        isFalse,
+      );
+      await releaseLock.delete(recursive: true);
+    });
+
+    test(
+      'separate processes join installs and cancel only their own wait',
+      () async {
+        const secondVersion = '3.47.9';
+        await _writeFixtureSdk(repositoryWorktree, version: secondVersion);
+        await File(p.join(repositoryWorktree.path, 'README.md'))
+            .writeAsString('concurrent fixture\n');
+        await _git(repositoryWorktree.path, ['add', '.']);
+        await _git(repositoryWorktree.path, [
+          'commit',
+          '-m',
+          'concurrent fixture',
+        ]);
+        await _git(repositoryWorktree.path, ['tag', secondVersion]);
+        final secondRevision = await _git(repositoryWorktree.path, [
+          'rev-parse',
+          'HEAD',
+        ]);
+        await dataDirectory.create(recursive: true);
+        await File(p.join(dataDirectory.path, 'hold-precache')).create();
+
+        final first = await _startInstallWorker(
+          dataDirectory,
+          repositoryWorktree,
+          _version,
+          frameworkRevision,
+        );
+        await _waitForFile(
+          File(p.join(dataDirectory.path, 'precache-started')),
+        );
+
+        final cancelled = await _startInstallWorker(
+          dataDirectory,
+          repositoryWorktree,
+          secondVersion,
+          secondRevision,
+        );
+        await _waitForText(
+          cancelled.stderr,
+          'Waiting for the shared engine source lock',
+        );
+        cancelled.process.kill(ProcessSignal.sigint);
+        expect(await cancelled.process.exitCode, 6);
+
+        final joined = await _startInstallWorker(
+          dataDirectory,
+          repositoryWorktree,
+          secondVersion,
+          secondRevision,
+        );
+        await _waitForText(
+          joined.stderr,
+          'Waiting for the shared engine source lock',
+        );
+
+        final sameRelease = await _startInstallWorker(
+          dataDirectory,
+          repositoryWorktree,
+          _version,
+          frameworkRevision,
+        );
+        await _waitForText(
+          sameRelease.stderr,
+          'Waiting for another install of Flutter',
+        );
+
+        await File(p.join(dataDirectory.path, 'continue-precache')).create();
+        expect(await first.process.exitCode, 0);
+        expect(await joined.process.exitCode, 0);
+        expect(await sameRelease.process.exitCode, 0);
+        expect(
+          File(p.join(dataDirectory.path, 'source-seeded')).existsSync(),
+          isTrue,
+        );
+        expect(
+          Directory(p.join(dataDirectory.path, 'staging')).listSync(),
+          isEmpty,
+        );
       },
     );
 
@@ -1211,8 +1376,16 @@ if [ "\$1" = "precache" ]; then
   fi
   if [ -f ../../../fail-precache ]; then
     rm -f ../../../fail-precache
+    if [ -f ../../../hold-failure ]; then
+      touch ../../../failure-started
+      while [ ! -f ../../../continue-failure ]; do sleep 0.05; done
+    fi
     echo "fixture precache failure" >&2
     exit 17
+  fi
+  if [ -f ../../../hold-precache ]; then
+    touch ../../../precache-started
+    while [ ! -f ../../../continue-precache ]; do sleep 0.05; done
   fi
   mkdir -p bin/cache/dart-sdk/bin
   mkdir -p bin/cache/artifacts/engine/common/flutter_patched_sdk
@@ -1275,6 +1448,59 @@ Future<String> _git(String cwd, List<String> arguments) async {
     throw StateError('${result.stderr}\n${result.stdout}');
   }
   return '${result.stdout}'.trim();
+}
+
+Future<_InstallWorker> _startInstallWorker(
+  Directory dataDirectory,
+  Directory repository,
+  String version,
+  String revision,
+) async {
+  final packageConfig = p.join(
+    Directory.current.path,
+    '.dart_tool/package_config.json',
+  );
+  final helper = p.join(
+    Directory.current.path,
+    'test/support/install_worker.dart',
+  );
+  final process = await Process.start(Platform.resolvedExecutable, [
+    '--packages=$packageConfig',
+    helper,
+    dataDirectory.path,
+    repository.path,
+    version,
+    revision,
+  ]);
+  final stdout = StringBuffer();
+  final stderr = StringBuffer();
+  process.stdout.transform(utf8.decoder).listen(stdout.write);
+  process.stderr.transform(utf8.decoder).listen(stderr.write);
+  return _InstallWorker(process, stdout, stderr);
+}
+
+Future<void> _waitForText(StringBuffer output, String expected) async {
+  for (var attempt = 0; attempt < 500; attempt++) {
+    if (output.toString().contains(expected)) return;
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+  fail('Timed out waiting for "$expected" in output:\n$output');
+}
+
+Future<void> _waitForFile(File file) async {
+  for (var attempt = 0; attempt < 500; attempt++) {
+    if (file.existsSync()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+  fail('Timed out waiting for ${file.path}.');
+}
+
+class _InstallWorker {
+  new(this.process, this.stdout, this.stderr);
+
+  final Process process;
+  final StringBuffer stdout;
+  final StringBuffer stderr;
 }
 
 bool _hasLinkTo(Directory root, String targetRoot) {
