@@ -954,7 +954,15 @@ class _RepairCommand extends WrenCommand {
     if (result.privateFilesRepaired) {
       writeOut('Repaired private files for Flutter $version.');
     }
-    if (!result.replaced && !result.privateFilesRepaired) {
+    if (result.optionalArtifactsRepaired) {
+      writeOut('Repaired optional artifacts for Flutter $version.');
+    } else if (result.optionalArtifactsValidated) {
+      writeOut('Validated optional artifacts for Flutter $version.');
+    }
+    if (!result.replaced &&
+        !result.privateFilesRepaired &&
+        !result.optionalArtifactsRepaired &&
+        !result.optionalArtifactsValidated) {
       writeOut('The shared engine source for Flutter $version is healthy.');
     }
     return 0;

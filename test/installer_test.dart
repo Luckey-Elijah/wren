@@ -1844,6 +1844,390 @@ printf '\376\000\n' >&2
       },
     );
 
+    test(
+      'repairs evidenced Linux Android artifacts and retains their inventory',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        final installError = StringBuffer();
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: installError,
+          ),
+          0,
+          reason: installError.toString(),
+        );
+
+        final release = Directory(
+          p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
+        );
+        final androidRoot = Directory(
+          p.join(
+            release.path,
+            'bin/cache/artifacts/engine/android-x64-profile',
+          ),
+        );
+        await androidRoot.create(recursive: true);
+        final unusedError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: unusedError,
+          ),
+          0,
+          reason: unusedError.toString(),
+        );
+        expect(
+          File(p.join(dataDirectory.path, 'android-precache-ran')).existsSync(),
+          isFalse,
+          reason: 'an empty shared artifact directory is not evidence of use',
+        );
+
+        final stamp = File(p.join(release.path, 'bin/cache/android-sdk.stamp'));
+        final damagedArtifact = File(
+          p.join(androidRoot.path, 'linux-x64/optional-target.bin'),
+        );
+        await damagedArtifact.parent.create(recursive: true);
+        // A distinctive file without a stamp is enough evidence. Its bytes
+        // are sound, so the first repair fetches and records trusted content.
+        await damagedArtifact.writeAsString('trusted Android engine\n');
+        final externalGradleCache = Directory(
+          p.join(temp.path, 'external-gradle-cache'),
+        );
+        await externalGradleCache.create();
+        final externalMavenFile = File(
+          p.join(externalGradleCache.path, 'artifact.jar'),
+        );
+        await externalMavenFile.writeAsString('managed by Gradle');
+        final repairOutput = StringBuffer();
+        final repairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: repairOutput,
+            stderrSink: repairError,
+          ),
+          0,
+          reason: repairError.toString(),
+        );
+        expect(
+          await damagedArtifact.readAsString(),
+          'trusted Android engine\n',
+        );
+        expect(
+          repairOutput.toString(),
+          contains('Validated optional artifacts'),
+        );
+        expect(
+          File(p.join(dataDirectory.path, 'android-precache-ran')).existsSync(),
+          isTrue,
+        );
+        expect(
+          File(p.join(dataDirectory.path, 'external-gradle-cache-modified'))
+              .existsSync(),
+          isFalse,
+          reason: 'repair must select the Android engine artifact only',
+        );
+        expect(await externalMavenFile.readAsString(), 'managed by Gradle');
+
+        final marker = File(p.join(release.path, '.wren-release.json'));
+        var manifest =
+            jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+        final records =
+            manifest['optionalArtifactGroups']! as Map<String, Object?>;
+        expect(records.containsKey('android-engine'), isTrue);
+        expect(
+          await File(p.join(dataDirectory.path, 'android-precache-ran'))
+              .readAsString(),
+          'x',
+          reason: 'the first-seen group is fetched once and recorded',
+        );
+
+        final healthyRepairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: healthyRepairError,
+          ),
+          0,
+          reason: healthyRepairError.toString(),
+        );
+        expect(
+          await File(p.join(dataDirectory.path, 'android-precache-ran'))
+              .readAsString(),
+          'x',
+          reason: 'trusted group contents make later checks download-free',
+        );
+
+        await damagedArtifact.writeAsString('corrupt editor artifact');
+        if (stamp.existsSync()) await stamp.delete();
+        final internalStamp = File(
+          p.join(
+            release.path,
+            'bin/cache/android-internal-build-artifacts.stamp',
+          ),
+        );
+        if (internalStamp.existsSync()) await internalStamp.delete();
+        final damagedRepairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: damagedRepairError,
+          ),
+          0,
+          reason: damagedRepairError.toString(),
+        );
+        expect(
+          await damagedArtifact.readAsString(),
+          'trusted Android engine\n',
+        );
+        expect(
+          await File(p.join(dataDirectory.path, 'android-precache-ran'))
+              .readAsString(),
+          'xx',
+          reason: 'a retained group identity fetches its trusted source',
+        );
+
+        await androidRoot.delete(recursive: true);
+        await stamp.delete();
+        await File(
+          p.join(
+            release.path,
+            'bin/cache/android-internal-build-artifacts.stamp',
+          ),
+        ).delete();
+        final deletedRepairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: deletedRepairError,
+          ),
+          0,
+          reason: deletedRepairError.toString(),
+        );
+        expect(
+          await damagedArtifact.readAsString(),
+          'trusted Android engine\n',
+        );
+        manifest =
+            jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+        expect(manifest['optionalArtifactsNeedRepair'], isNull);
+      },
+    );
+
+    test('uses the Flutter 3.7 Linux artifact family for repair', () async {
+      const historicalVersion = '3.7.9';
+      await _writeFixtureSdk(repositoryWorktree, version: historicalVersion);
+      await _git(repositoryWorktree.path, ['add', '.']);
+      await _git(repositoryWorktree.path, [
+        'commit',
+        '-m',
+        'Flutter 3.7 fixture',
+      ]);
+      await _git(repositoryWorktree.path, ['tag', historicalVersion]);
+      final historicalRevision = await _git(repositoryWorktree.path, [
+        'rev-parse',
+        'HEAD',
+      ]);
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      final installError = StringBuffer();
+      expect(
+        await runWren(
+          ['install', historicalVersion],
+          catalogJson: _catalog(
+            historicalRevision,
+            releaseVersion: historicalVersion,
+          ),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: installError,
+        ),
+        0,
+        reason: installError.toString(),
+      );
+
+      final release = Directory(
+        p.join(
+          dataDirectory.path,
+          'releases/stable-$historicalVersion-linux-x64',
+        ),
+      );
+      await File(p.join(release.path, 'bin/cache/android-sdk.stamp'))
+          .writeAsString('stale\n');
+      final repairError = StringBuffer();
+      expect(
+        await runWren(
+          ['repair', historicalVersion],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: repairError,
+        ),
+        0,
+        reason: repairError.toString(),
+      );
+      expect(
+        File(p.join(dataDirectory.path, 'android-precache-ran')).existsSync(),
+        isTrue,
+      );
+      final manifest = jsonDecode(
+        await File(p.join(release.path, '.wren-release.json')).readAsString(),
+      ) as Map<String, Object?>;
+      expect(
+        (manifest['optionalArtifactGroups']! as Map<String, Object?>)
+            .containsKey('android-engine'),
+        isTrue,
+      );
+    });
+
+    test(
+      'requires editor confirmation before replacing optional artifacts',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        final release = Directory(
+          p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
+        );
+        final stamp = File(p.join(release.path, 'bin/cache/android-sdk.stamp'));
+        await stamp.writeAsString('stale\n');
+        final artifact = File(
+          p.join(
+            release.path,
+            'bin/cache/artifacts/engine/android-x64-profile/linux-x64/optional-target.bin',
+          ),
+        );
+        final marker = File(p.join(release.path, '.wren-release.json'));
+        final manifest =
+            jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+        await marker.writeAsString(
+          jsonEncode({...manifest, 'externalUse': true}),
+        );
+
+        final declinedError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            confirmation: (_) async => false,
+            stdoutSink: StringBuffer(),
+            stderrSink: declinedError,
+          ),
+          6,
+        );
+        expect(artifact.existsSync(), isFalse);
+        final declinedManifest =
+            jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+        expect(declinedManifest['optionalArtifactsNeedRepair'], isTrue);
+
+        final confirmedError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            confirmation: (_) async => true,
+            stdoutSink: StringBuffer(),
+            stderrSink: confirmedError,
+          ),
+          0,
+          reason: confirmedError.toString(),
+        );
+        expect(await artifact.readAsString(), 'trusted Android engine\n');
+      },
+    );
+
+    test('keeps an unavailable optional source marked for repair', () async {
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      expect(
+        await runWren(
+          ['install', _version],
+          catalogJson: _catalog(frameworkRevision),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+      final release = Directory(
+        p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
+      );
+      await File(p.join(release.path, 'bin/cache/android-sdk.stamp'))
+          .writeAsString('stale\n');
+      await File(p.join(dataDirectory.path, 'fail-android-precache'))
+          .writeAsString('');
+      final repairError = StringBuffer();
+      expect(
+        await runWren(
+          ['repair', _version],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: repairError,
+        ),
+        4,
+        reason: repairError.toString(),
+      );
+      final marker = jsonDecode(
+        await File(p.join(release.path, '.wren-release.json')).readAsString(),
+      ) as Map<String, Object?>;
+      expect(marker['optionalArtifactsNeedRepair'], isTrue);
+      final listOutput = StringBuffer();
+      expect(
+        await runWren(
+          ['list'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: listOutput,
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+      expect(listOutput.toString(), contains('needs repair'));
+    });
+
     test('rejects an ineligible release before creating storage', () async {
       final stdout = StringBuffer();
       final stderr = StringBuffer();
@@ -1973,6 +2357,28 @@ Future<void> _writeFixtureSdk(
 #!/bin/sh
 set -eu
 if [ "\$1" = "precache" ]; then
+  if [ "\$2" = "--android" ]; then
+    touch ../../../external-gradle-cache-modified
+    exit 19
+  fi
+  if [ "\$2" = "--android_gen_snapshot" ]; then
+    printf 'x' >> ../../../android-precache-ran
+    if [ -f ../../../fail-android-precache ]; then
+      rm -f ../../../fail-android-precache
+      echo "fixture Android artifact failure" >&2
+      exit 17
+    fi
+    if [ "\$3" = "--android_internal_build" ]; then
+      if [ "\$4" != "--no-universal" ]; then exit 18; fi
+      printf '$_engineRevision\n' > bin/cache/android-internal-build-artifacts.stamp
+    elif [ "\$3" != "--no-universal" ]; then
+      exit 18
+    fi
+    mkdir -p bin/cache/artifacts/engine/android-x64-profile/linux-x64
+    printf 'trusted Android engine\n' > bin/cache/artifacts/engine/android-x64-profile/linux-x64/optional-target.bin
+    printf '$_engineRevision\n' > bin/cache/android-sdk.stamp
+    exit 0
+  fi
   if [ "\$2" != "$precacheFlag" ] || [ "\$3" != "--web" ]; then
     echo "unexpected precache target: \$2 \$3" >&2
     exit 18

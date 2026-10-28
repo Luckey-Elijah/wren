@@ -93,6 +93,71 @@ List<String> _precacheArguments(HostPlatform host) => [
   '--web',
 ];
 
+class _OptionalArtifactGroup {
+  const new({
+    required this.id,
+    required this.stampFiles,
+    required this.arguments,
+    required this.pathPrefixes,
+  });
+
+  final String id;
+  final List<String> stampFiles;
+  final List<String> arguments;
+  final List<String> pathPrefixes;
+}
+
+/// Artifact footprints used by Linux Flutter checkouts from 3.7 onward.
+///
+/// The framework cache layout is intentionally selected from the pinned
+/// Flutter version. Linux host artifacts remain in the required-source
+/// inventory; optional target groups use their own engine or Fuchsia roots.
+List<_OptionalArtifactGroup> _linuxOptionalArtifactGroups(String version) {
+  final parsed = Version.parse(version);
+  if (parsed < Version(3, 7, 0)) {
+    throw InstallException(
+      'optional artifact repair does not support Flutter $version.',
+    );
+  }
+
+  final legacy = parsed < Version(3, 10, 0);
+  return [
+    _OptionalArtifactGroup(
+      id: 'android-engine',
+      stampFiles: legacy
+          ? const ['android-sdk.stamp']
+          : const [
+              'android-sdk.stamp',
+              'android-internal-build-artifacts.stamp',
+            ],
+      arguments: legacy
+          ? const ['precache', '--android_gen_snapshot', '--no-universal']
+          : const [
+              'precache',
+              '--android_gen_snapshot',
+              '--android_internal_build',
+              '--no-universal',
+            ],
+      pathPrefixes: const ['bin/cache/artifacts/engine/android-'],
+    ),
+    const _OptionalArtifactGroup(
+      id: 'fuchsia-linux',
+      stampFiles: ['fuchsia-linux.stamp'],
+      arguments: ['precache', '--fuchsia', '--no-universal'],
+      pathPrefixes: ['bin/cache/artifacts/fuchsia/sdk/core/linux-amd64/'],
+    ),
+    const _OptionalArtifactGroup(
+      id: 'flutter-runner',
+      stampFiles: [
+        'flutter_runner.stamp',
+        'flutter_runner_debug_symbols.stamp',
+      ],
+      arguments: ['precache', '--flutter_runner', '--no-universal'],
+      pathPrefixes: ['bin/cache/artifacts/flutter_runner/'],
+    ),
+  ];
+}
+
 /// Local storage and source locations for one Wren installation.
 ///
 /// The optional values are also useful for exercising installs against a
@@ -147,6 +212,8 @@ class RepairResult {
     required this.sourceKey,
     required this.replaced,
     this.privateFilesRepaired = false,
+    this.optionalArtifactsRepaired = false,
+    this.optionalArtifactsValidated = false,
   });
 
   /// Shared artifact source that was checked or replaced.
@@ -157,6 +224,12 @@ class RepairResult {
 
   /// Whether release-private files were restored from the retained source.
   final bool privateFilesRepaired;
+
+  /// Whether optional device or build-target files were restored.
+  final bool optionalArtifactsRepaired;
+
+  /// Whether present optional artifacts were validated.
+  final bool optionalArtifactsValidated;
 }
 
 /// Describes an installed Flutter release and its readiness.
@@ -508,6 +581,16 @@ class FlutterInstaller {
             externalUse: releaseManifest['externalUse'] == true,
             confirmExternalUse: confirmExternalUse,
           );
+          final optionalArtifactOutcome = await _repairOptionalArtifacts(
+            releaseDirectory,
+            root,
+            releaseKey: releaseKey,
+            releaseVersion: releaseVersion,
+            frameworkRevision: frameworkRevision,
+            engineRevision: engineRevision,
+            host: host,
+            confirmExternalUse: confirmExternalUse,
+          );
           final readiness = await _readiness(releaseDirectory, root);
           if (readiness?.needsRepair ?? true) {
             throw InstallException(
@@ -519,6 +602,8 @@ class FlutterInstaller {
             sourceKey: sourceKey,
             replaced: false,
             privateFilesRepaired: privateFilesRepaired,
+            optionalArtifactsRepaired: optionalArtifactOutcome.repaired,
+            optionalArtifactsValidated: optionalArtifactOutcome.validated,
           );
         }
         // An invalid retained source is rebuilt from the pinned Flutter
@@ -651,6 +736,16 @@ class FlutterInstaller {
             externalUse: releaseManifest['externalUse'] == true,
             confirmExternalUse: confirmExternalUse,
           );
+          final optionalArtifactOutcome = await _repairOptionalArtifacts(
+            releaseDirectory,
+            root,
+            releaseKey: releaseKey,
+            releaseVersion: releaseVersion,
+            frameworkRevision: frameworkRevision,
+            engineRevision: engineRevision,
+            host: host,
+            confirmExternalUse: confirmExternalUse,
+          );
           final readiness = await _readiness(releaseDirectory, root);
           if (readiness?.needsRepair ?? true) {
             throw InstallException(
@@ -665,6 +760,8 @@ class FlutterInstaller {
             sourceKey: sourceKey,
             replaced: true,
             privateFilesRepaired: privateFilesRepaired,
+            optionalArtifactsRepaired: optionalArtifactOutcome.repaired,
+            optionalArtifactsValidated: optionalArtifactOutcome.validated,
           );
         } catch (error) {
           if (newSourcePublished && source.existsSync()) {
@@ -1230,10 +1327,12 @@ class FlutterInstaller {
                     host,
                   ) ??
                   '';
-              if (reason.isEmpty && data['privateFilesNeedRepair'] == true) {
+              if (reason.isEmpty &&
+                  (data['privateFilesNeedRepair'] == true ||
+                      data['optionalArtifactsNeedRepair'] == true)) {
                 reason =
                     data['readinessReason'] as String? ??
-                    'release-private artifact contents need repair';
+                    'release artifact contents need repair';
               }
             }
           }
@@ -2286,6 +2385,592 @@ class FlutterInstaller {
     }
   }
 
+  Future<_OptionalArtifactRepairOutcome> _repairOptionalArtifacts(
+    Directory release,
+    Directory root, {
+    required String releaseKey,
+    required String releaseVersion,
+    required String frameworkRevision,
+    required String engineRevision,
+    required HostPlatform host,
+    required Future<bool?> Function(String message) confirmExternalUse,
+  }) async {
+    if (host != HostPlatform.linuxX64) {
+      return const _OptionalArtifactRepairOutcome();
+    }
+    final marker = File(p.join(release.path, '.wren-release.json'));
+    final decodedManifest = jsonDecode(await marker.readAsString());
+    if (decodedManifest is! Map<String, Object?>) {
+      throw const InstallException('installed release metadata is invalid.');
+    }
+    final releaseManifest = Map<String, Object?>.from(decodedManifest);
+    final externalUse = releaseManifest['externalUse'] == true;
+    final groups = _linuxOptionalArtifactGroups(releaseVersion);
+    final recordsValue = releaseManifest['optionalArtifactGroups'];
+    if (recordsValue != null && recordsValue is! Map<String, Object?>) {
+      await _setOptionalRepairMarker(release, needsRepair: true);
+      throw const InstallException(
+        'the optional artifact inventory is invalid.',
+      );
+    }
+    final records = Map<String, Object?>.from(
+      recordsValue as Map<String, Object?>? ?? const {},
+    );
+    final knownGroupIds = groups.map((group) => group.id).toSet();
+    if (records.keys.any((id) => !knownGroupIds.contains(id))) {
+      await _setOptionalRepairMarker(release, needsRepair: true);
+      throw const InstallException(
+        'the optional artifact inventory contains an unsupported group.',
+      );
+    }
+
+    var repaired = false;
+    var validated = false;
+    var observedGroup = false;
+    for (final group in groups) {
+      final existingRecord = records[group.id];
+      final hasStamp = group.stampFiles.any(
+        (stamp) => File(p.join(release.path, 'bin/cache', stamp)).existsSync(),
+      );
+      final hasFiles = await _optionalGroupFiles(
+        release,
+        group,
+      ).then((files) => files.isNotEmpty);
+      if (existingRecord == null && !hasStamp && !hasFiles) {
+        continue;
+      }
+      observedGroup = true;
+
+      if (existingRecord != null) {
+        _validateOptionalGroupRecord(
+          existingRecord,
+          group,
+          releaseVersion: releaseVersion,
+          frameworkRevision: frameworkRevision,
+          engineRevision: engineRevision,
+        );
+        if (await _optionalGroupMatches(release, group, existingRecord)) {
+          validated = true;
+          continue;
+        }
+      }
+
+      // Preserve the damaged state if the trusted group source is unavailable.
+      await _setOptionalRepairMarker(release, needsRepair: true);
+      releaseManifest
+        ..['optionalArtifactsNeedRepair'] = true
+        ..['readiness'] = 'needs-repair'
+        ..['readinessReason'] = 'optional artifact contents need repair';
+      final staged = await _stageOptionalArtifactGroup(
+        release,
+        root,
+        group,
+        releaseKey: releaseKey,
+        releaseVersion: releaseVersion,
+        frameworkRevision: frameworkRevision,
+        engineRevision: engineRevision,
+      );
+      try {
+        if (existingRecord != null &&
+            !_sameOptionalGroupInventory(existingRecord, staged.record)) {
+          throw InstallException(
+            'trusted ${group.id} artifacts no longer match the retained '
+            'Flutter $releaseVersion inventory.',
+          );
+        }
+
+        final contentsMatch = await _optionalGroupMatches(
+          release,
+          group,
+          staged.record,
+        );
+        validated = true;
+        records[group.id] = staged.record;
+        final updatedManifest = Map<String, Object?>.from(releaseManifest)
+          ..['optionalArtifactGroups'] = records;
+        if (!contentsMatch) {
+          await _waitForReleaseUsers(releaseKey, releaseVersion);
+          if (externalUse) {
+            final confirmed = await confirmExternalUse(
+              'Flutter $releaseVersion was exposed to an editor or external '
+              'tool. Close editors using it and confirm optional artifact '
+              'repair.',
+            );
+            if (confirmed != true) {
+              throw InstallCancelledException(
+                'repair cancelled; Flutter $releaseVersion was not changed.',
+              );
+            }
+          }
+          await _publishOptionalArtifactGroup(
+            release,
+            group,
+            staged,
+            updatedManifest,
+          );
+          repaired = true;
+        } else {
+          await _publishManifest(release.path, updatedManifest);
+        }
+      } finally {
+        await _discardWorktree(root, staged.checkout.path);
+        if (staged.stagingRoot.existsSync()) {
+          await staged.stagingRoot.delete(recursive: true);
+        }
+      }
+    }
+
+    if (observedGroup ||
+        (recordsValue is Map<String, Object?> && recordsValue.isNotEmpty)) {
+      await _setOptionalRepairMarker(release, needsRepair: false);
+    }
+    return _OptionalArtifactRepairOutcome(
+      repaired: repaired,
+      validated: validated,
+    );
+  }
+
+  void _validateOptionalGroupRecord(
+    Object? value,
+    _OptionalArtifactGroup group, {
+    required String releaseVersion,
+    required String frameworkRevision,
+    required String engineRevision,
+  }) {
+    if (value is! Map<String, Object?> ||
+        value['version'] != releaseVersion ||
+        value['frameworkRevision'] != frameworkRevision ||
+        value['engineRevision'] != engineRevision ||
+        value['files'] is! List<Object?> ||
+        value['stamps'] is! Map<String, Object?>) {
+      throw InstallException(
+        'the retained ${group.id} artifact inventory is invalid.',
+      );
+    }
+    final files = value['files']! as List<Object?>;
+    if (files.isEmpty) {
+      throw InstallException(
+        'the retained ${group.id} artifact inventory is empty.',
+      );
+    }
+    for (final item in files) {
+      if (item is! Map<String, Object?> ||
+          item['path'] is! String ||
+          item['sha256'] is! String ||
+          !RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(item['sha256']! as String) ||
+          item['mode'] is! int) {
+        throw InstallException(
+          'the retained ${group.id} artifact inventory is invalid.',
+        );
+      }
+      final path = p.normalize(item['path']! as String);
+      if (p.isAbsolute(path) ||
+          p.split(path).contains('..') ||
+          !_optionalGroupOwnsPath(group, path)) {
+        throw InstallException(
+          'the retained ${group.id} artifact inventory is invalid.',
+        );
+      }
+    }
+    final stamps = value['stamps']! as Map<String, Object?>;
+    if (stamps.isEmpty ||
+        stamps.keys.any(
+          (stamp) =>
+              !group.stampFiles.contains(stamp) || stamps[stamp] is! String,
+        )) {
+      throw InstallException(
+        'the retained ${group.id} artifact stamps are invalid.',
+      );
+    }
+  }
+
+  Future<bool> _optionalGroupMatches(
+    Directory release,
+    _OptionalArtifactGroup group,
+    Object? record,
+  ) async {
+    if (record is! Map<String, Object?>) return false;
+    final expectedFiles = record['files'];
+    final expectedStamps = record['stamps'];
+    if (expectedFiles is! List<Object?> ||
+        expectedStamps is! Map<String, Object?>) {
+      return false;
+    }
+    final expectedPaths = <String>{};
+    for (final item in expectedFiles) {
+      if (item is! Map<String, Object?> ||
+          item['path'] is! String ||
+          item['sha256'] is! String ||
+          item['mode'] is! int) {
+        return false;
+      }
+      final relative = item['path']! as String;
+      expectedPaths.add(relative);
+      final file = File(p.join(release.path, relative));
+      if (FileSystemEntity.typeSync(file.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        return false;
+      }
+      final digest = await sha256.bind(file.openRead()).first;
+      if (digest.toString() != item['sha256'] ||
+          (file.statSync().mode & 0x1ff) != item['mode']) {
+        return false;
+      }
+    }
+    if (expectedPaths.isEmpty) return false;
+    final actualFiles = await _optionalGroupFiles(release, group);
+    if (actualFiles.map((entry) => entry['path']! as String).toSet().length !=
+            expectedPaths.length ||
+        !actualFiles.every(
+          (entry) => expectedPaths.contains(entry['path']! as String),
+        )) {
+      return false;
+    }
+    if (expectedStamps.values.any((value) => value is! String)) {
+      return false;
+    }
+    return true;
+  }
+
+  Future<List<Map<String, Object?>>> _optionalGroupFiles(
+    Directory release,
+    _OptionalArtifactGroup group,
+  ) async {
+    final cache = Directory(p.join(release.path, 'bin/cache'));
+    if (!cache.existsSync()) return const [];
+    final files = <Map<String, Object?>>[];
+    await for (final entity in cache.list(
+      recursive: true,
+      followLinks: false,
+    )) {
+      if (FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        continue;
+      }
+      final relative = p.relative(entity.path, from: release.path);
+      if (!_optionalGroupOwnsPath(group, relative)) continue;
+      final file = File(entity.path);
+      final digest = await sha256.bind(file.openRead()).first;
+      files.add({
+        'path': relative,
+        'sha256': digest.toString(),
+        'mode': file.statSync().mode & 0x1ff,
+      });
+    }
+    files.sort(
+      (left, right) =>
+          (left['path']! as String).compareTo(right['path']! as String),
+    );
+    return files;
+  }
+
+  bool _optionalGroupOwnsPath(
+    _OptionalArtifactGroup group,
+    String relativePath,
+  ) => group.pathPrefixes.any(relativePath.startsWith);
+
+  bool _sameOptionalGroupInventory(Object? left, Object? right) {
+    if (left is! Map<String, Object?> || right is! Map<String, Object?>) {
+      return false;
+    }
+    return jsonEncode(left['files']) == jsonEncode(right['files']) &&
+        jsonEncode(left['stamps']) == jsonEncode(right['stamps']);
+  }
+
+  Future<_StagedOptionalArtifactGroup> _stageOptionalArtifactGroup(
+    Directory release,
+    Directory root,
+    _OptionalArtifactGroup group, {
+    required String releaseKey,
+    required String releaseVersion,
+    required String frameworkRevision,
+    required String engineRevision,
+  }) async {
+    final stagingRoot = Directory(
+      p.join(
+        root.path,
+        'staging',
+        'repair-optional-$releaseKey-${group.id}-${_randomId()}',
+      ),
+    );
+    final checkout = Directory(p.join(stagingRoot.path, 'checkout'));
+    var worktreeCreated = false;
+    try {
+      await stagingRoot.create(recursive: true);
+      await _requireGit();
+      final gitLock = await _acquireOperationLock(
+        Directory(p.join(root.path, 'locks', 'flutter-git')),
+        cancellation: _waitCancellation,
+        onWait: () => _progress('Waiting for the shared Flutter Git lock'),
+      );
+      try {
+        await _ensureSharedRepository(root);
+        await _fetchFrameworkCommit(root, frameworkRevision, releaseVersion);
+        await _runGit(root, [
+          '--git-dir',
+          p.join(root.path, 'flutter.git'),
+          'worktree',
+          'add',
+          '--detach',
+          checkout.path,
+          frameworkRevision,
+        ], userMessage: 'could not create an optional repair worktree');
+        worktreeCreated = true;
+      } finally {
+        await _releaseLock(gitLock);
+      }
+
+      final actualFramework = await _gitText(checkout.path, [
+        'rev-parse',
+        'HEAD',
+      ], userMessage: 'could not verify the optional repair checkout');
+      if (actualFramework.toLowerCase() != frameworkRevision.toLowerCase()) {
+        throw const InstallException(
+          'optional repair checkout does not match the installed release.',
+        );
+      }
+      final actualEngine = (await File(
+        p.join(checkout.path, 'bin/internal/engine.version'),
+      ).readAsString()).trim();
+      if (actualEngine.toLowerCase() != engineRevision.toLowerCase()) {
+        throw const InstallException(
+          'optional repair checkout has a different engine revision.',
+        );
+      }
+
+      final liveCache = Directory(p.join(release.path, 'bin/cache'));
+      final stagedCache = Directory(p.join(checkout.path, 'bin/cache'));
+      if (stagedCache.existsSync()) {
+        await stagedCache.delete(recursive: true);
+      }
+      await _copyTree(liveCache, stagedCache);
+      await _clearOptionalGroupPaths(checkout, group);
+      for (final stamp in group.stampFiles) {
+        final file = File(p.join(stagedCache.path, stamp));
+        if (file.existsSync()) await file.delete();
+      }
+
+      _progress('Validating optional ${group.id} artifacts');
+      await _runFlutter(
+        checkout,
+        group.arguments,
+        userMessage:
+            'Flutter failed to validate optional ${group.id} artifacts',
+      );
+
+      final files = await _optionalGroupFiles(checkout, group);
+      if (files.isEmpty) {
+        throw InstallException(
+          'Flutter did not provide a trusted ${group.id} artifact inventory.',
+        );
+      }
+      final stamps = <String, Object?>{};
+      for (final stamp in group.stampFiles) {
+        final file = File(p.join(checkout.path, 'bin/cache', stamp));
+        if (file.existsSync()) stamps[stamp] = await file.readAsString();
+      }
+      if (stamps.isEmpty) {
+        throw InstallException(
+          'Flutter did not provide a trusted ${group.id} artifact stamp.',
+        );
+      }
+      return _StagedOptionalArtifactGroup(
+        stagingRoot: stagingRoot,
+        checkout: checkout,
+        record: {
+          'version': releaseVersion,
+          'frameworkRevision': frameworkRevision,
+          'engineRevision': engineRevision,
+          'files': files,
+          'stamps': stamps,
+        },
+      );
+    } catch (error) {
+      if (worktreeCreated) await _discardWorktree(root, checkout.path);
+      if (stagingRoot.existsSync()) {
+        await stagingRoot.delete(recursive: true);
+      }
+      if (error is InstallException || error is InstallCancelledException) {
+        rethrow;
+      }
+      throw InstallException(
+        'Flutter $releaseVersion optional ${group.id} repair failed: $error',
+      );
+    }
+  }
+
+  Future<void> _clearOptionalGroupPaths(
+    Directory checkout,
+    _OptionalArtifactGroup group,
+  ) async {
+    for (final prefix in group.pathPrefixes) {
+      final absolutePrefix = p.join(checkout.path, prefix);
+      final relativePrefix = p.relative(absolutePrefix, from: checkout.path);
+      final prefixName = p.basename(relativePrefix);
+      if (prefixName.endsWith('-')) {
+        final parent = Directory(p.dirname(absolutePrefix));
+        if (!parent.existsSync()) continue;
+        await for (final entity in parent.list(followLinks: false)) {
+          if (p.basename(entity.path).startsWith(prefixName) &&
+              FileSystemEntity.typeSync(entity.path, followLinks: false) ==
+                  FileSystemEntityType.directory) {
+            await Directory(entity.path).delete(recursive: true);
+          }
+        }
+      } else {
+        final type = FileSystemEntity.typeSync(
+          absolutePrefix,
+          followLinks: false,
+        );
+        if (type == FileSystemEntityType.directory) {
+          await Directory(absolutePrefix).delete(recursive: true);
+        } else if (type == FileSystemEntityType.file) {
+          await File(absolutePrefix).delete();
+        }
+      }
+    }
+  }
+
+  Future<void> _publishOptionalArtifactGroup(
+    Directory release,
+    _OptionalArtifactGroup group,
+    _StagedOptionalArtifactGroup staged,
+    Map<String, Object?> updatedManifest,
+  ) async {
+    final replacementRoot = Directory(
+      p.join(staged.stagingRoot.path, 'replacement'),
+    );
+    final backupRoot = Directory(p.join(staged.stagingRoot.path, 'backup'));
+    final expectedFiles = staged.record['files']! as List<Object?>;
+    final expectedPaths = <String>{};
+    final replacedPaths = <String>[];
+    final backedUpPaths = <String>[];
+    final changedPaths = (await _optionalGroupFiles(
+      release,
+      group,
+    )).map((entry) => entry['path']! as String).toSet();
+    try {
+      for (final item in expectedFiles) {
+        final record = item! as Map<String, Object?>;
+        final relative = record['path']! as String;
+        expectedPaths.add(relative);
+        final source = File(p.join(staged.checkout.path, relative));
+        final replacement = File(p.join(replacementRoot.path, relative));
+        await replacement.parent.create(recursive: true);
+        await source.copy(replacement.path);
+        final chmod = await Process.run('chmod', [
+          (record['mode']! as int).toRadixString(8),
+          replacement.path,
+        ]);
+        if (chmod.exitCode != 0) {
+          throw InstallException(
+            'could not preserve permissions for optional artifact $relative.',
+          );
+        }
+        final digest = await sha256.bind(replacement.openRead()).first;
+        if (digest.toString() != record['sha256']) {
+          throw InstallException(
+            'could not validate staged optional artifact $relative.',
+          );
+        }
+      }
+
+      final stampRecords = staged.record['stamps']! as Map<String, Object?>;
+      for (final entry in stampRecords.entries) {
+        final replacement = File(
+          p.join(replacementRoot.path, 'bin/cache', entry.key),
+        );
+        await replacement.parent.create(recursive: true);
+        await replacement.writeAsString(entry.value! as String, flush: true);
+      }
+
+      for (final relative in changedPaths) {
+        final destination = p.join(release.path, relative);
+        final backup = p.join(backupRoot.path, relative);
+        final type = FileSystemEntity.typeSync(destination, followLinks: false);
+        if (type != FileSystemEntityType.notFound) {
+          await Directory(p.dirname(backup)).create(recursive: true);
+          await _renameEntity(destination, backup, type);
+          backedUpPaths.add(relative);
+        }
+        if (!expectedPaths.contains(relative)) continue;
+        final stagedFile = File(p.join(replacementRoot.path, relative));
+        await Directory(p.dirname(destination)).create(recursive: true);
+        await stagedFile.rename(destination);
+        replacedPaths.add(relative);
+      }
+      for (final relative in expectedPaths.difference(changedPaths)) {
+        final destination = p.join(release.path, relative);
+        final stagedFile = File(p.join(replacementRoot.path, relative));
+        await Directory(p.dirname(destination)).create(recursive: true);
+        await stagedFile.rename(destination);
+        replacedPaths.add(relative);
+      }
+
+      for (final entry in stampRecords.entries) {
+        final destination = p.join(release.path, 'bin/cache', entry.key);
+        final backup = p.join(backupRoot.path, 'bin/cache', entry.key);
+        final type = FileSystemEntity.typeSync(destination, followLinks: false);
+        if (type != FileSystemEntityType.notFound) {
+          await Directory(p.dirname(backup)).create(recursive: true);
+          await _renameEntity(destination, backup, type);
+          backedUpPaths.add(p.relative(destination, from: release.path));
+        }
+        final stagedStamp = File(
+          p.join(replacementRoot.path, 'bin/cache', entry.key),
+        );
+        await Directory(p.dirname(destination)).create(recursive: true);
+        await stagedStamp.rename(destination);
+        replacedPaths.add(p.relative(destination, from: release.path));
+      }
+      await _publishManifest(release.path, updatedManifest);
+    } catch (_) {
+      for (final relative in replacedPaths.reversed) {
+        await _deletePathIfPresent(p.join(release.path, relative));
+      }
+      for (final relative in backedUpPaths.reversed) {
+        final backup = p.join(backupRoot.path, relative);
+        if (FileSystemEntity.typeSync(backup, followLinks: false) !=
+            FileSystemEntityType.notFound) {
+          await _renameEntity(
+            backup,
+            p.join(release.path, relative),
+            FileSystemEntity.typeSync(backup, followLinks: false),
+          );
+        }
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> _setOptionalRepairMarker(
+    Directory release, {
+    required bool needsRepair,
+  }) async {
+    final marker = File(p.join(release.path, '.wren-release.json'));
+    final decoded = jsonDecode(await marker.readAsString());
+    if (decoded is! Map<String, Object?>) {
+      throw const InstallException('installed release metadata is invalid.');
+    }
+    final updated = Map<String, Object?>.from(decoded);
+    if (needsRepair) {
+      updated['optionalArtifactsNeedRepair'] = true;
+      updated['readiness'] = 'needs-repair';
+      updated['readinessReason'] = 'optional artifact contents need repair';
+    } else {
+      updated.remove('optionalArtifactsNeedRepair');
+      if (updated['readinessReason'] ==
+          'optional artifact contents need repair') {
+        updated
+          ..remove('readiness')
+          ..remove('readinessReason');
+      }
+    }
+    if (jsonEncode(updated) != jsonEncode(decoded)) {
+      await _publishManifest(release.path, updated);
+    }
+  }
+
   Future<void> _setPrivateRepairMarker(
     Directory release, {
     required bool needsRepair,
@@ -2716,6 +3401,25 @@ class FlutterInstaller {
       );
     }
   }
+}
+
+class _OptionalArtifactRepairOutcome {
+  const new({this.repaired = false, this.validated = false});
+
+  final bool repaired;
+  final bool validated;
+}
+
+class _StagedOptionalArtifactGroup {
+  const new({
+    required this.stagingRoot,
+    required this.checkout,
+    required this.record,
+  });
+
+  final Directory stagingRoot;
+  final Directory checkout;
+  final Map<String, Object?> record;
 }
 
 enum _ExistingInstall { incomplete, healthy, damaged }
