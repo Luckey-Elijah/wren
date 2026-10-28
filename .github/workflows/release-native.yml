@@ -1,0 +1,60 @@
+name: Native Wren release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and smoke-test (${{ matrix.host }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: linux-x64
+            runner: ubuntu-24.04
+          - host: macos-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.13.4
+      - run: dart pub get
+      - name: Build, smoke-test, and checksum archive
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${RELEASE_TAG#wren-v}"
+          test "$RELEASE_TAG" = "wren-v$version"
+          sh tool/package-native.sh "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wren-${{ matrix.host }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish verified release assets
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wren-*
+          path: dist
+          merge-multiple: true
+      - name: Create aggregate checksum manifest
+        run: cd dist && sha256sum wren-*.tar.gz > SHA256SUMS
+      - name: Attach archives and checksums to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/wren-*.tar.gz dist/*.sha256 dist/SHA256SUMS --clobber

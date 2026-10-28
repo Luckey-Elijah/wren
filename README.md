@@ -4,6 +4,15 @@ Wren manages Flutter releases and the Dart SDK bundled with each release. Instal
 
 Wren supports Linux x86_64 and macOS on Apple Silicon.
 
+## Install a release
+
+Wren release archives contain a standalone native executable, so a separate
+Dart SDK is not required. Download the archive for Linux x86_64 or Apple
+Silicon macOS from the project's GitHub Releases, verify its SHA-256 checksum,
+and follow the included [manual installation guide](packaging/INSTALL.md).
+Wren requires system Git to install Flutter releases. The initial unsigned
+macOS executable may require one-time approval in Privacy & Security settings.
+
 ## Get a project running
 
 ```sh
@@ -93,7 +102,7 @@ Wren's configuration and integration writes are:
 
 ## Run Wren from source
 
-Standalone Wren release archives are not packaged yet, so the examples above assume `wren` is already on your PATH. From this checkout, prefix each command with `dart run bin/wren.dart`. This requires Dart 3.13.4 or newer.
+To run Wren from this checkout, prefix each command with `dart run bin/wren.dart`. This requires Dart 3.13.4 or newer. To install a published standalone executable, follow the instructions above.
 
 The `wren setup` PATH shims expect Wren to run as its own executable. Listing eligible releases and installing Flutter releases require network access. Installing Flutter releases also requires system Git.
 
