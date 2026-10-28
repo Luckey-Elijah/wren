@@ -120,32 +120,62 @@ class InstalledRelease {
     this.repairReason,
   });
 
+  /// Release channel, such as `stable` or `beta`.
   final String channel;
+
+  /// Flutter version.
   final String version;
+
+  /// Host operating system associated with this installation.
   final String host;
+
+  /// Whether a required file or identity check failed.
   final bool needsRepair;
+
+  /// Reason the release needs repair, when known.
   final String? repairReason;
 }
 
+/// An operation that Wren could not complete.
 class InstallException implements Exception {
-  const InstallException(this.message);
+  /// Creates an installation exception with an actionable message.
+  const new(this.message);
 
+  /// Explanation of the failed operation.
   final String message;
 }
 
-class FlutterInstaller {
-  FlutterInstaller(this.environment, {this.onProgress});
+/// An SDK launch failure with its Wren process exit status.
+class SdkLaunchException implements Exception {
+  /// Creates a launch failure.
+  const new({required this.status, required this.message});
 
+  /// Wren process exit status to return.
+  final int status;
+
+  /// Actionable explanation for the user.
+  final String message;
+}
+
+/// Installs and inspects Wren-managed Flutter releases.
+class FlutterInstaller {
+  /// Creates an installer backed by [environment].
+  new(this.environment, {this.onProgress});
+
+  /// Storage and repository configuration used by this installer.
   final InstallEnvironment environment;
+
+  /// Optional callback for progress messages.
   final void Function(String message)? onProgress;
 
   /// Lists published releases and performs the inexpensive launch-readiness
   /// checks used by Wren before selecting an SDK.
+  /// Lists published releases and checks their launch readiness.
   Future<List<InstalledRelease>> listInstalled() async {
     final releasesDirectory = Directory(
       p.join(environment.dataDirectory.absolute.path, 'releases'),
     );
-    if (!await releasesDirectory.exists()) return const [];
+    if (!releasesDirectory.existsSync()) return const [];
 
     final installed = <InstalledRelease>[];
     await for (final entity in releasesDirectory.list(followLinks: false)) {
@@ -172,6 +202,147 @@ class FlutterInstaller {
       }
     });
     return List.unmodifiable(installed);
+  }
+
+  /// Runs [executable] from the exact installed [releaseVersion].
+  ///
+  /// The per-release use lease remains present until the child exits.
+  Future<int> launch(
+    String releaseVersion, {
+    required HostPlatform host,
+    required String executable,
+    required List<String> arguments,
+    required StringSink stdoutSink,
+    required StringSink stderrSink,
+    required IOSink? stdoutByteSink,
+    required IOSink? stderrByteSink,
+    required Stream<List<int>> stdinStream,
+  }) async {
+    if (executable != 'flutter' && executable != 'dart') {
+      throw ArgumentError.value(executable, 'executable');
+    }
+    final root = environment.dataDirectory.absolute.path;
+    final releasesDirectory = Directory(p.join(root, 'releases'));
+    Directory? candidate;
+    if (releasesDirectory.existsSync()) {
+      await for (final entity in releasesDirectory.list(followLinks: false)) {
+        if (entity is! Directory ||
+            FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+                FileSystemEntityType.directory) {
+          continue;
+        }
+        final marker = File(p.join(entity.path, '.wren-release.json'));
+        if (!marker.existsSync()) continue;
+        try {
+          final data = jsonDecode(await marker.readAsString());
+          if (data is Map<String, Object?> &&
+              data['version'] == releaseVersion &&
+              data['host'] == host.catalogOs &&
+              data['architecture'] == host.catalogArchitecture) {
+            candidate = entity;
+            break;
+          }
+        } on Object {
+          // Invalid records are diagnosed by the common readiness check below.
+        }
+      }
+    }
+    if (candidate == null) {
+      throw SdkLaunchException(
+        status: 3,
+        message:
+            'Flutter $releaseVersion is not installed for ${host.label}; '
+            'run `wren install $releaseVersion`.',
+      );
+    }
+    final releaseKey = p.basename(candidate.path);
+    // Lifecycle mutations use this lock while checking for active leases.
+    final lifecycleLock = await _acquireLock(
+      Directory(p.join(root, 'locks', 'lifecycle-$releaseKey')),
+    );
+    var lifecycleLockHeld = true;
+    var leaseCreated = false;
+    final leaseDirectory = Directory(p.join(root, 'leases', releaseKey));
+    final lease = File(p.join(leaseDirectory.path, '$pid-${_randomId()}'));
+    try {
+      await leaseDirectory.create(recursive: true);
+      await lease.create(exclusive: true);
+      leaseCreated = true;
+      await lease.writeAsString('$pid\n');
+      final installed = await listInstalled();
+      InstalledRelease? selected;
+      for (final release in installed) {
+        if (release.version == releaseVersion &&
+            release.host == host.catalogOs) {
+          selected = release;
+          break;
+        }
+      }
+      if (selected == null) {
+        throw SdkLaunchException(
+          status: 3,
+          message:
+              'Flutter $releaseVersion is not installed for ${host.label}; '
+              'run `wren install $releaseVersion`.',
+        );
+      }
+      if (selected.needsRepair) {
+        throw SdkLaunchException(
+          status: 3,
+          message:
+              'Flutter $releaseVersion needs repair; run '
+              '`wren repair $releaseVersion`.',
+        );
+      }
+      await _releaseLock(lifecycleLock);
+      lifecycleLockHeld = false;
+
+      final releasePath = candidate.path;
+      final binary = p.join(
+        releasePath,
+        executable == 'flutter' ? 'bin/flutter' : _dartExecutable,
+      );
+      late final Process process;
+      try {
+        process = await Process.start(binary, arguments);
+      } on Object catch (error) {
+        throw SdkLaunchException(
+          status: 5,
+          message:
+              'could not start Flutter $releaseVersion $executable: '
+              '$error',
+        );
+      }
+      final stdoutDone = stdoutByteSink == null
+          ? process.stdout
+                .transform(utf8.decoder)
+                .listen(stdoutSink.write)
+                .asFuture<void>()
+          : stdoutByteSink.addStream(process.stdout);
+      final stderrDone = stderrByteSink == null
+          ? process.stderr
+                .transform(utf8.decoder)
+                .listen(stderrSink.write)
+                .asFuture<void>()
+          : stderrByteSink.addStream(process.stderr);
+      final stdinSubscription = stdinStream.listen(
+        process.stdin.add,
+        onDone: process.stdin.close,
+        onError: (Object _) => process.stdin.close(),
+      );
+      final childStatus = await process.exitCode;
+      await Future.wait([stdoutDone, stderrDone]);
+      await stdinSubscription.cancel();
+      if (stdoutByteSink != null) await stdoutByteSink.flush();
+      if (stderrByteSink != null) await stderrByteSink.flush();
+      return childStatus < 0 ? 128 + -childStatus : childStatus;
+    } finally {
+      if (lifecycleLockHeld) await _releaseLock(lifecycleLock);
+      if (leaseCreated && lease.existsSync()) await lease.delete();
+      if (leaseDirectory.existsSync() && leaseDirectory.listSync().isEmpty) {
+        await leaseDirectory.delete();
+      }
+    }
   }
 
   Future<InstalledRelease?> _readiness(

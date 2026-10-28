@@ -21,33 +21,69 @@ const _macosCatalog =
 /// A fresh context is constructed for each [runWren] call and then shared by
 /// every command registered for that run.
 class WrenContext {
-  WrenContext({
+  /// Creates shared configuration and services for one CLI invocation.
+  new({
     StringSink? stdoutSink,
     StringSink? stderrSink,
     this.catalogJson,
     this.hostOverride,
     this.configuredInstallEnvironment,
+    this.flutterReleaseOverride,
+    this.stdinStream,
   }) : _stdoutSink = stdoutSink ?? io.stdout,
        _stderrSink = stderrSink ?? io.stderr;
 
   final StringSink _stdoutSink;
   final StringSink _stderrSink;
+
+  /// Optional serialized catalog for local fixture runs.
   final String? catalogJson;
+
+  /// Optional host override for local fixture runs.
   final HostPlatform? hostOverride;
+
+  /// Optional installation configuration for local fixture runs.
   final InstallEnvironment? configuredInstallEnvironment;
 
+  /// Optional environment override for selecting a Flutter release.
+  final String? flutterReleaseOverride;
+
+  /// Input forwarded to SDK processes; defaults to the current process stdin.
+  final Stream<List<int>>? stdinStream;
+
+  List<String> _sdkArguments = const [];
+
+  /// Byte-capable stdout sink when the caller supplied one.
+  io.IOSink? get stdoutByteSink =>
+      _stdoutSink is io.IOSink ? _stdoutSink : null;
+
+  /// Byte-capable stderr sink when the caller supplied one.
+  io.IOSink? get stderrByteSink =>
+      _stderrSink is io.IOSink ? _stderrSink : null;
+
+  /// Minimum supported bundled Dart version.
   String get minimumDartVersion => _minimumDartVersion;
+
+  /// Destination for command output.
   StringSink get stdoutSink => _stdoutSink;
+
+  /// Destination for diagnostics and progress messages.
   StringSink get stderrSink => _stderrSink;
+
+  /// Host selected for this invocation, if supported.
   HostPlatform? get host => hostOverride ?? HostPlatform.current;
+
+  /// Installation paths and repository settings for this invocation.
   InstallEnvironment get installEnvironment =>
       configuredInstallEnvironment ?? InstallEnvironment();
 
+  /// Installer configured for this invocation.
   FlutterInstaller get installer => FlutterInstaller(
     installEnvironment,
     onProgress: (message) => stderrSink.writeln(message),
   );
 
+  /// Loads eligible Flutter releases for [targetHost].
   Future<ReleaseCatalog> loadReleaseCatalog(HostPlatform targetHost) =>
       catalogJson == null
       ? ReleaseCatalog.fetch(targetHost.catalogUri, host: targetHost)
@@ -56,39 +92,56 @@ class WrenContext {
 
 /// Wren-specific command base with shared output, verbosity and context.
 abstract class WrenCommand extends Command<int> {
-  WrenCommand(this.context) {
-    argParser.addFlag(
-      'verbose',
-      negatable: false,
-      help: 'Show additional Wren diagnostic output.',
-    );
+  /// Creates a Wren command with shared [context].
+  new(this.context, {bool sdkCommand = false}) {
+    if (!sdkCommand) {
+      argParser.addFlag(
+        'verbose',
+        negatable: false,
+        help: 'Show additional Wren diagnostic output.',
+      );
+    }
   }
 
+  /// Shared values and services for this invocation.
   final WrenContext context;
 
+  /// Whether this command or its invocation enabled verbose output.
   bool get verbose =>
       (globalResults?.flag('verbose') ?? false) ||
       (argResults?.flag('verbose') ?? false);
 
+  /// Writes a line to standard output.
   void writeOut(Object? message) => context.stdoutSink.writeln(message);
+
+  /// Writes a line to standard error.
   void writeError(Object? message) => context.stderrSink.writeln(message);
 
+  /// Raises a command usage error with [message].
   Never failUsage(String message) => usageException(message);
 }
 
 /// Composition wrapper which only accepts Wren-owned commands.
 class WrenCommandRunner {
-  WrenCommandRunner(this.context)
-    : _runner = _WrenPackageCommandRunner(context);
+  /// Creates a command runner with [context].
+  new(this.context) : _runner = _WrenPackageCommandRunner(context);
 
+  /// Shared invocation context.
   final WrenContext context;
   final _WrenPackageCommandRunner _runner;
 
+  /// Registers a Wren command.
   void addCommand(WrenCommand command) => _runner.addCommand(command);
 
+  /// Runs [arguments] and returns Wren's exit status.
   Future<int> run(Iterable<String> arguments) async {
-    final args = arguments.toList(growable: false);
+    var args = arguments.toList(growable: false);
     try {
+      final sdkCommandIndex = _sdkCommandIndex(args);
+      if (sdkCommandIndex != null) {
+        context._sdkArguments = args.skip(sdkCommandIndex + 1).toList();
+        args = args.take(sdkCommandIndex + 1).toList(growable: false);
+      }
       if (args.isEmpty || args.every((argument) => argument == '--verbose')) {
         context.stderrSink
           ..writeln('wren: a command is required.')
@@ -101,6 +154,9 @@ class WrenCommandRunner {
         ..writeln('wren: ${error.message}')
         ..writeln(error.usage);
       return 2;
+    } on SdkLaunchException catch (error) {
+      context.stderrSink.writeln('wren: ${error.message}');
+      return error.status;
     } on ReleaseCatalogException catch (error) {
       context.stderrSink.writeln('wren: ${error.message}');
       return 4;
@@ -112,16 +168,39 @@ class WrenCommandRunner {
       return 4;
     }
   }
+
+  int? _sdkCommandIndex(List<String> arguments) {
+    for (var index = 0; index < arguments.length; index++) {
+      final argument = arguments[index];
+      if (argument == '--verbose' || argument == '--help' || argument == '-h') {
+        continue;
+      }
+      if (argument == '--release') {
+        if (index + 1 >= arguments.length) return null;
+        index++;
+        continue;
+      }
+      if (argument.startsWith('--release=')) continue;
+      if (argument == 'flutter' || argument == 'dart') return index;
+      return null;
+    }
+    return null;
+  }
 }
 
 class _WrenPackageCommandRunner extends CommandRunner<int> {
-  _WrenPackageCommandRunner(this.context)
+  new(this.context)
     : super('wren', 'A standalone Flutter and Dart version manager.') {
-    argParser.addFlag(
-      'verbose',
-      negatable: false,
-      help: 'Show additional Wren diagnostic output.',
-    );
+    argParser
+      ..addFlag(
+        'verbose',
+        negatable: false,
+        help: 'Show additional Wren diagnostic output.',
+      )
+      ..addOption(
+        'release',
+        help: 'Run an SDK command with this exact installed Flutter release.',
+      );
   }
 
   final WrenContext context;
@@ -141,6 +220,8 @@ Future<int> runWren(
   String? catalogJson,
   HostPlatform? host,
   InstallEnvironment? installEnvironment,
+  String? flutterReleaseOverride,
+  Stream<List<int>>? stdinStream,
 }) async {
   final context = WrenContext(
     stdoutSink: stdoutSink,
@@ -148,16 +229,20 @@ Future<int> runWren(
     catalogJson: catalogJson,
     hostOverride: host,
     configuredInstallEnvironment: installEnvironment,
+    flutterReleaseOverride: flutterReleaseOverride,
+    stdinStream: stdinStream,
   );
   final runner = WrenCommandRunner(context)
     ..addCommand(_ReleasesCommand(context))
     ..addCommand(_InstallCommand(context))
-    ..addCommand(_ListCommand(context));
-  return runner.run(arguments);
+    ..addCommand(_ListCommand(context))
+    ..addCommand(_FlutterCommand(context))
+    ..addCommand(_DartCommand(context));
+  return await runner.run(arguments);
 }
 
 class _ReleasesCommand extends WrenCommand {
-  _ReleasesCommand(super.context);
+  new(super.context);
 
   @override
   String get name => 'releases';
@@ -287,6 +372,64 @@ class _ListCommand extends WrenCommand {
   }
 }
 
+class _FlutterCommand extends _SdkCommand {
+  new(WrenContext context) : super(context, 'flutter');
+}
+
+class _DartCommand extends _SdkCommand {
+  new(WrenContext context) : super(context, 'dart');
+}
+
+abstract class _SdkCommand extends WrenCommand {
+  new(super.context, this.name) : super(sdkCommand: true);
+
+  @override
+  final String name;
+
+  @override
+  String get description => 'Run the selected Flutter SDK $name executable.';
+
+  @override
+  Future<int> run() {
+    final targetHost = context.host;
+    if (targetHost == null) {
+      throw const SdkLaunchException(
+        status: 3,
+        message:
+            'this host is unsupported. Wren supports Linux x86_64 and '
+            'macOS arm64.',
+      );
+    }
+    final cliRelease = globalResults?.option('release');
+    final environmentRelease =
+        context.flutterReleaseOverride ??
+        io.Platform.environment['WREN_FLUTTER_RELEASE'];
+    final release = cliRelease != null
+        ? cliRelease.trim()
+        : environmentRelease?.trim();
+    if (release == null || release.isEmpty) {
+      throw const SdkLaunchException(
+        status: 3,
+        message:
+            'No Flutter release is selected. Install one with '
+            '`wren install <release>` or pass `--release <release>`.',
+      );
+    }
+    return context.installer.launch(
+      release,
+      host: targetHost,
+      executable: name,
+      arguments: context._sdkArguments,
+      stdoutSink: context.stdoutSink,
+      stderrSink: context.stderrSink,
+      stdoutByteSink: context.stdoutByteSink,
+      stderrByteSink: context.stderrByteSink,
+      stdinStream: context.stdinStream ?? io.stdin,
+    );
+  }
+}
+
+/// A supported host and its release catalog identifiers.
 enum HostPlatform {
   linuxX64(
     label: 'Linux x86_64',

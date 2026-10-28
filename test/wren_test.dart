@@ -5,6 +5,39 @@ import 'package:wren/wren.dart';
 
 void main() {
   group('wren releases', () {
+    test('SDK commands require an exact installed release', () async {
+      final stderr = StringBuffer();
+
+      final status = await runWren(
+        ['flutter', '--version'],
+        host: HostPlatform.linuxX64,
+        stdoutSink: StringBuffer(),
+        stderrSink: stderr,
+      );
+
+      expect(status, 3);
+      expect(stderr.toString(), contains('No Flutter release is selected'));
+      expect(stderr.toString(), contains('wren install'));
+    });
+
+    test(
+      'missing exact CLI selection does not fall back to environment',
+      () async {
+        final stderr = StringBuffer();
+
+        final status = await runWren(
+          ['--release', '9.9.9', 'flutter', '--version'],
+          flutterReleaseOverride: '3.47.8',
+          host: HostPlatform.linuxX64,
+          stdoutSink: StringBuffer(),
+          stderrSink: stderr,
+        );
+
+        expect(status, 3);
+        expect(stderr.toString(), contains('Flutter 9.9.9 is not installed'));
+      },
+    );
+
     test(
       'lists eligible stable and beta releases from the host catalog',
       () async {

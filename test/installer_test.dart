@@ -123,6 +123,188 @@ void main() {
       expect(secondRun, 0);
     });
 
+    test(
+      'launches the exact release with transparent child behavior',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        final installStatus = await runWren(
+          ['install', _version],
+          catalogJson: _catalog(frameworkRevision),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        );
+        expect(installStatus, 0);
+
+        final installed = Directory(
+          p.join(dataDirectory.path, 'releases', 'stable-$_version-linux-x64'),
+        );
+        final flutter = File(p.join(installed.path, 'bin/flutter'));
+        final argsFile = File(p.join(temp.path, 'child-args.txt'));
+        final startedFile = File(p.join(temp.path, 'child-started'));
+        final proceedFile = File(p.join(temp.path, 'child-proceed'));
+        await flutter.writeAsString('''
+#!/bin/sh
+printf '%s\\n' "\$@" > '${argsFile.path}'
+touch '${startedFile.path}'
+while [ ! -e '${proceedFile.path}' ]; do sleep 0.01; done
+cat
+printf 'child stdout\\n'
+printf 'child stderr\\n' >&2
+exit 23
+''');
+        await Process.run('chmod', ['+x', flutter.path]);
+
+        final stdout = StringBuffer();
+        final stderr = StringBuffer();
+        final running = runWren(
+          ['--release', _version, 'flutter', '--verbose', '--', 'a b'],
+          flutterReleaseOverride: '3.47.7',
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdinStream: Stream.value(utf8.encode('child input')),
+          stdoutSink: stdout,
+          stderrSink: stderr,
+        );
+        for (
+          var attempt = 0;
+          attempt < 300 && !startedFile.existsSync();
+          attempt++
+        ) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(startedFile.existsSync(), isTrue);
+        final leases = Directory(
+          p.join(dataDirectory.path, 'leases', 'stable-$_version-linux-x64'),
+        );
+        expect(leases.listSync(), hasLength(1));
+        await proceedFile.create();
+
+        expect(await running, 23);
+        expect(await argsFile.readAsLines(), ['--verbose', '--', 'a b']);
+        expect(stdout.toString(), contains('child input'));
+        expect(stdout.toString(), contains('child stdout'));
+        expect(stderr.toString(), contains('child stderr'));
+        expect(leases.existsSync(), isFalse);
+
+        final dartError = StringBuffer();
+        final dartStatus = await runWren(
+          ['dart', '--version'],
+          flutterReleaseOverride: _version,
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdinStream: const Stream.empty(),
+          stdoutSink: StringBuffer(),
+          stderrSink: dartError,
+        );
+        expect(dartStatus, 0);
+        expect(
+          dartError.toString(),
+          contains('Dart SDK version: $_dartVersion'),
+        );
+
+        await flutter.writeAsString(
+          r'''
+#!/bin/sh
+kill -TERM $$
+'''
+              .trimLeft(),
+        );
+        final signaledStatus = await runWren(
+          ['flutter'],
+          flutterReleaseOverride: _version,
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        );
+        expect(signaledStatus, 143);
+
+        final binaryStdout = File(p.join(temp.path, 'binary-stdout'));
+        final binaryStderr = File(p.join(temp.path, 'binary-stderr'));
+        final binaryStdoutSink = binaryStdout.openWrite();
+        final binaryStderrSink = binaryStderr.openWrite();
+        await flutter.writeAsString(
+          r'''
+#!/bin/sh
+printf '\377\000\n'
+printf '\376\000\n' >&2
+'''
+              .trimLeft(),
+        );
+        final binaryStatus = await runWren(
+          ['flutter'],
+          flutterReleaseOverride: _version,
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdinStream: const Stream.empty(),
+          stdoutSink: binaryStdoutSink,
+          stderrSink: binaryStderrSink,
+        );
+        expect(binaryStatus, 0);
+        await binaryStdoutSink.close();
+        await binaryStderrSink.close();
+        expect(await binaryStdout.readAsBytes(), [0xff, 0x00, 0x0a]);
+        expect(await binaryStderr.readAsBytes(), [0xfe, 0x00, 0x0a]);
+
+        await flutter.writeAsString(
+          '#!/no/such/interpreter${String.fromCharCode(10)}',
+        );
+        final startError = StringBuffer();
+        final failedStart = await runWren(
+          ['flutter', '--version'],
+          flutterReleaseOverride: _version,
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: startError,
+        );
+        expect(failedStart, 5);
+        expect(startError.toString(), contains('could not start Flutter'));
+        expect(leases.existsSync(), isFalse);
+
+        final releaseMarker = File(
+          p.join(installed.path, '.wren-release.json'),
+        );
+        final releaseData = jsonDecode(
+          await releaseMarker.readAsString(),
+        ) as Map<String, Object?>;
+        await releaseMarker.writeAsString(
+          jsonEncode({...releaseData, 'channel': 'beta'}),
+        );
+        final identityError = StringBuffer();
+        final identityStatus = await runWren(
+          ['flutter'],
+          flutterReleaseOverride: _version,
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: identityError,
+        );
+        expect(identityStatus, 3);
+        expect(identityError.toString(), contains('needs repair'));
+        await releaseMarker.writeAsString(jsonEncode(releaseData));
+
+        await File(p.join(installed.path, 'bin/cache/dart-sdk/bin/dart'))
+            .delete();
+        final damagedError = StringBuffer();
+        final damagedStatus = await runWren(
+          ['flutter', '--version'],
+          flutterReleaseOverride: _version,
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: damagedError,
+        );
+        expect(damagedStatus, 3);
+        expect(damagedError.toString(), contains('needs repair'));
+      },
+    );
+
     test('list and ls show readiness and hide incomplete stages', () async {
       final environment = InstallEnvironment(
         dataDirectory: dataDirectory,
