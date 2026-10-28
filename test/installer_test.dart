@@ -556,6 +556,58 @@ printf '\376\000\n' >&2
         File(p.join(dataDirectory.path, 'source-seeded')).existsSync(),
         isTrue,
       );
+
+      final firstRelease = File(
+        p.join(
+          dataDirectory.path,
+          'releases/stable-$_version-linux-x64/bin/cache/dart-sdk/bin/dart',
+        ),
+      );
+      final secondRelease = File(
+        p.join(
+          dataDirectory.path,
+          'releases/stable-$secondVersion-linux-x64/bin/cache/dart-sdk/bin/dart',
+        ),
+      );
+      final sharedSource = File(
+        p.join(
+          dataDirectory.path,
+          'sources/$_engineRevision-linux-x64/bin/cache/dart-sdk/bin/dart',
+        ),
+      );
+      final originalDart = await sharedSource.readAsString();
+      await firstRelease.writeAsString('mutated first release');
+      expect(await secondRelease.readAsString(), originalDart);
+      expect(await sharedSource.readAsString(), originalDart);
+
+      const failedVersion = '3.47.10';
+      await _writeFixtureSdk(repositoryWorktree, version: failedVersion);
+      await _git(repositoryWorktree.path, ['add', '.']);
+      await _git(repositoryWorktree.path, ['commit', '-m', 'failed consumer']);
+      await _git(repositoryWorktree.path, ['tag', failedVersion]);
+      final failedRevision = await _git(repositoryWorktree.path, [
+        'rev-parse',
+        'HEAD',
+      ]);
+      await File(p.join(dataDirectory.path, 'fail-precache')).writeAsString('');
+      final failedInstallStderr = StringBuffer();
+      expect(
+        await runWren(
+          ['install', failedVersion],
+          catalogJson: _catalog(
+            failedRevision,
+            releaseVersion: failedVersion,
+          ),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: failedInstallStderr,
+        ),
+        4,
+        reason: failedInstallStderr.toString(),
+      );
+      expect(sharedSource.existsSync(), isTrue);
+      expect(await secondRelease.readAsString(), originalDart);
     });
 
     test(

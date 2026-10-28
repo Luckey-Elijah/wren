@@ -763,6 +763,7 @@ class FlutterInstaller {
       );
       final checkoutStage = Directory(p.join(stagingRoot.path, 'checkout'));
       String? sourcePath;
+      String? resolvedSourceKey;
       var sourceCreated = false;
       var checkoutPublished = false;
       var worktreeCreated = false;
@@ -832,7 +833,7 @@ class FlutterInstaller {
             'revision.',
           );
         }
-        final resolvedSourceKey = _sourceKey(engineRevision, host);
+        resolvedSourceKey = _sourceKey(engineRevision, host);
         final resolvedSourcePath = p.join(
           root.path,
           'sources',
@@ -961,8 +962,23 @@ class FlutterInstaller {
           }
           if (sourceCreated &&
               sourcePath != null &&
+              resolvedSourceKey != null &&
               Directory(sourcePath).existsSync()) {
-            await Directory(sourcePath).delete(recursive: true);
+            final sourceLock = await _acquireLock(
+              Directory(
+                p.join(root.path, 'locks', 'source-$resolvedSourceKey'),
+              ),
+            );
+            try {
+              if (!await _hasInstalledSourceReference(
+                root,
+                resolvedSourceKey,
+              )) {
+                await Directory(sourcePath).delete(recursive: true);
+              }
+            } finally {
+              await _releaseLock(sourceLock);
+            }
           }
         }
         if (stagingRoot.existsSync()) {
@@ -1319,6 +1335,26 @@ class FlutterInstaller {
     if (Directory(path).existsSync()) {
       await Directory(path).delete(recursive: true);
     }
+  }
+
+  Future<bool> _hasInstalledSourceReference(Directory root, String sourceKey) async {
+    final releases = Directory(p.join(root.path, 'releases'));
+    if (!releases.existsSync()) return false;
+    await for (final entity in releases.list(followLinks: false)) {
+      if (entity is! Directory) continue;
+      final marker = File(p.join(entity.path, '.wren-release.json'));
+      if (!marker.existsSync()) continue;
+      try {
+        final data = jsonDecode(await marker.readAsString());
+        if (data is Map<String, Object?> && data['sourceKey'] == sourceKey) {
+          return true;
+        }
+      } on Object {
+        // An unreadable release record may reference this source. Preserve it.
+        return true;
+      }
+    }
+    return false;
   }
 
   Future<void> _discardWorktree(Directory root, String path) async {
