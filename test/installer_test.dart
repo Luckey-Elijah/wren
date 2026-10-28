@@ -922,6 +922,251 @@ printf '\376\000\n' >&2
       },
     );
 
+    test('repairs private files with external confirmation', () async {
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      final installError = StringBuffer();
+      expect(
+        await runWren(
+          ['install', _version],
+          catalogJson: _catalog(frameworkRevision),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: installError,
+        ),
+        0,
+        reason: installError.toString(),
+      );
+
+      final release = Directory(
+        p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
+      );
+      final privateDart = File(
+        p.join(release.path, 'bin/cache/dart-sdk/bin/dart'),
+      );
+      final privateFlutter = File(p.join(release.path, 'bin/flutter'));
+      final sourceDart = File(
+        p.join(
+          dataDirectory.path,
+          'sources/$_engineRevision-linux-x64/bin/cache/dart-sdk/bin/dart',
+        ),
+      );
+      final privateSnapshot = File(
+        p.join(
+          release.path,
+          'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
+        ),
+      );
+      final sourceSnapshot = File(
+        p.join(
+          dataDirectory.path,
+          'sources/$_engineRevision-linux-x64/bin/cache/artifacts/engine/linux-x64/gen_snapshot',
+        ),
+      );
+      final privateStamp = File(
+        p.join(release.path, 'bin/cache/linux-sdk.stamp'),
+      );
+      final overlappingTargetArtifact = File(
+        p.join(
+          release.path,
+          'bin/cache/artifacts/engine/linux-x64/optional-target.bin',
+        ),
+      );
+      await overlappingTargetArtifact.writeAsString('editor target cache');
+      final sourceStamp = File(
+        p.join(
+          dataDirectory.path,
+          'sources/$_engineRevision-linux-x64/.wren-source.json',
+        ),
+      );
+      await privateDart.writeAsString('corrupted private Dart');
+      await privateFlutter.writeAsString('corrupted Flutter launcher');
+      await privateSnapshot.delete();
+      await privateStamp.delete();
+      final releaseMarker = File(p.join(release.path, '.wren-release.json'));
+      final manifest = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      await releaseMarker.writeAsString(
+        jsonEncode({...manifest, 'externalUse': true}),
+      );
+
+      final leaseDirectory = Directory(
+        p.join(dataDirectory.path, 'leases/stable-$_version-linux-x64'),
+      );
+      await leaseDirectory.create(recursive: true);
+      final lease = File(p.join(leaseDirectory.path, 'fixture-user'));
+      await lease.writeAsString('active');
+      var declinedMessage = '';
+      final declinedError = StringBuffer();
+      final declinedRepair = runWren(
+        ['repair', _version],
+        host: HostPlatform.linuxX64,
+        installEnvironment: environment,
+        confirmation: (message) async {
+          declinedMessage = message;
+          return false;
+        },
+        stdoutSink: StringBuffer(),
+        stderrSink: declinedError,
+      );
+      for (
+        var i = 0;
+        i < 100 && !declinedError.toString().contains('Waiting for Flutter');
+        i++
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(declinedError.toString(), contains('Waiting for Flutter'));
+      await lease.delete();
+      expect(await declinedRepair, 6);
+      expect(declinedMessage, contains('Close editors'));
+      expect(await privateDart.readAsString(), 'corrupted private Dart');
+      expect(
+        await runWren(
+          ['--release', _version, 'dart', '--version'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        ),
+        3,
+      );
+
+      final output = StringBuffer();
+      final error = StringBuffer();
+      expect(
+        await runWren(
+          ['repair', _version],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          confirmation: (_) async => true,
+          stdoutSink: output,
+          stderrSink: error,
+        ),
+        0,
+        reason: error.toString(),
+      );
+      expect(await privateDart.readAsString(), await sourceDart.readAsString());
+      final checkoutFiles = manifest['checkoutFiles']! as List<Object?>;
+      expect(
+        await privateFlutter.readAsString(),
+        utf8.decode(
+          base64.decode(
+            (checkoutFiles.single! as Map<String, Object?>)['content']!
+                as String,
+          ),
+        ),
+      );
+      expect(
+        await privateSnapshot.readAsString(),
+        await sourceSnapshot.readAsString(),
+      );
+      expect(
+        await overlappingTargetArtifact.readAsString(),
+        'editor target cache',
+      );
+      final stampMetadata =
+          jsonDecode(await sourceStamp.readAsString()) as Map<String, Object?>;
+      expect(
+        await privateStamp.readAsString(),
+        (stampMetadata['stamps']! as Map<String, Object?>)['linux-sdk.stamp'],
+      );
+      expect(privateDart.statSync().mode & 0x49, isNot(0));
+      expect(output.toString(), contains('Repaired private files'));
+      final repairedList = StringBuffer();
+      expect(
+        await runWren(
+          ['list'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: repairedList,
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+      expect(
+        repairedList.toString(),
+        contains('$_version  stable  linux  ready'),
+      );
+      expect(
+        Directory(p.join(dataDirectory.path, 'staging')).listSync(),
+        isEmpty,
+      );
+    });
+
+    test(
+      'rolls back private file publication after a later replacement fails',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+
+        final release = Directory(
+          p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
+        );
+        final damagedSnapshot = File(
+          p.join(
+            release.path,
+            'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
+          ),
+        );
+        await damagedSnapshot.writeAsString('damaged snapshot');
+        final dartSdk = Directory(p.join(release.path, 'bin/cache/dart-sdk'));
+        final obstructedSdk = Directory('${dartSdk.path}-backup');
+        await dartSdk.rename(obstructedSdk.path);
+        await File(dartSdk.path).writeAsString('obstructed SDK directory');
+
+        final error = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: error,
+          ),
+          4,
+          reason: error.toString(),
+        );
+        expect(await damagedSnapshot.readAsString(), 'damaged snapshot');
+        expect(
+          await File(dartSdk.path).readAsString(),
+          'obstructed SDK directory',
+        );
+        expect(obstructedSdk.existsSync(), isTrue);
+        expect(
+          Directory(p.join(dataDirectory.path, 'staging')).listSync(),
+          isEmpty,
+        );
+        expect(
+          await runWren(
+            ['--release', _version, 'dart', '--version'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          3,
+        );
+      },
+    );
+
     test(
       'failed source repair preserves the source and live release',
       () async {

@@ -795,7 +795,8 @@ class _RepairCommand extends WrenCommand {
   String get name => 'repair';
 
   @override
-  String get description => 'Validate or repair a retained shared source.';
+  String get description =>
+      'Validate or repair a retained source and release-private files.';
 
   @override
   Future<int> run() async {
@@ -810,10 +811,18 @@ class _RepairCommand extends WrenCommand {
       );
     }
     final version = arguments.single;
-    final result = await context.installer.repair(version, host: targetHost);
+    final result = await context.installer.repair(
+      version,
+      host: targetHost,
+      confirmExternalUse: context.confirm,
+    );
     if (result.replaced) {
       writeOut('Repaired the shared engine source for Flutter $version.');
-    } else {
+    }
+    if (result.privateFilesRepaired) {
+      writeOut('Repaired private files for Flutter $version.');
+    }
+    if (!result.replaced && !result.privateFilesRepaired) {
       writeOut('The shared engine source for Flutter $version is healthy.');
     }
     return 0;
