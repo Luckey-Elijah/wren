@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 import 'package:wren/wren.dart';
 
@@ -1227,6 +1228,202 @@ exec '${child.path}' "\$@"
         2,
       );
     });
+  });
+
+  group('performance tracing', () {
+    late Directory temporaryDirectory;
+    late Directory dataDirectory;
+
+    setUp(() async {
+      temporaryDirectory = await Directory.systemTemp.createTemp('wren-trace-');
+      dataDirectory = Directory('${temporaryDirectory.path}/data')
+        ..createSync();
+    });
+
+    tearDown(() async {
+      await temporaryDirectory.delete(recursive: true);
+    });
+
+    Future<List<Map<String, Object?>>> readRecords(File file) async =>
+        (await file.readAsLines())
+            .where((line) => line.isNotEmpty)
+            .map((line) => jsonDecode(line) as Map<String, Object?>)
+            .toList();
+
+    test('tracing is disabled unless explicitly requested', () async {
+      final status = await runWren(
+        ['list'],
+        host: HostPlatform.linuxX64,
+        installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+        installedReleases: const [],
+        stdoutSink: StringBuffer(),
+        stderrSink: StringBuffer(),
+      );
+
+      expect(status, 0);
+      expect(Directory('${dataDirectory.path}/traces').existsSync(), isFalse);
+    });
+
+    test('default path is unique and contains a UTC timestamp', () async {
+      for (var index = 0; index < 2; index++) {
+        expect(
+          await runWren(
+            ['--trace', 'list'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: InstallEnvironment(
+              dataDirectory: dataDirectory,
+            ),
+            installedReleases: const [],
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+      }
+
+      final files = Directory('${dataDirectory.path}/traces')
+          .listSync()
+          .whereType<File>()
+          .toList();
+      expect(files, hasLength(2));
+      expect(
+        files.map((file) => p.basename(file.path)),
+        everyElement(
+          matches(RegExp(r'^wren-\d{8}T\d{9}Z-[0-9a-f]{16}\.jsonl$')),
+        ),
+      );
+      for (final file in files) {
+        final records = await readRecords(file);
+        expect(records.map((record) => record['recordType']), [
+          'span',
+          'span',
+          'span',
+          'run',
+        ]);
+        expect(records.map((record) => record['runId']).toSet(), hasLength(1));
+        expect(records.last['command'], 'list');
+        expect(records.last['host'], 'Linux x86_64');
+        expect(records.last['wrenVersion'], '1.0.0');
+        expect(records.last['exitStatus'], 0);
+        expect(records.last['startedAt'], isA<String>());
+        expect(records.last['durationMicros'], greaterThanOrEqualTo(0));
+        expect(records[0]['name'], 'cli.startup');
+        expect(records[1]['name'], 'release.list_installed');
+        expect(records[2]['name'], 'cli.dispatch');
+        expect(records[1]['parentSpanId'], records[2]['spanId']);
+      }
+      expect(files[0].path, isNot(files[1].path));
+    });
+
+    test('explicit relative path appends versioned JSONL runs', () async {
+      final traceFile = File('${temporaryDirectory.path}/nested/custom.data');
+      await traceFile.parent.create(recursive: true);
+      await traceFile.writeAsString('{"previous":true}\n');
+      final relativePath = p.relative(
+        traceFile.path,
+        from: Directory.current.path,
+      );
+
+      for (var index = 0; index < 2; index++) {
+        expect(
+          await runWren(
+            ['--trace=$relativePath', 'list'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: InstallEnvironment(
+              dataDirectory: dataDirectory,
+            ),
+            installedReleases: const [],
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+      }
+
+      final records = await readRecords(traceFile);
+      expect(records.first, {'previous': true});
+      expect(
+        records.where((record) => record['recordType'] == 'run'),
+        hasLength(2),
+      );
+      expect(
+        records
+            .where((record) => record['recordType'] == 'run')
+            .map((record) => record['runId'])
+            .toSet(),
+        hasLength(2),
+      );
+    });
+
+    test(
+      'child process timing and status are recorded without arguments',
+      () async {
+        final traceFile = File('${temporaryDirectory.path}/child.jsonl');
+        List<String>? childArguments;
+        final status = await runWren(
+          ['--trace=${traceFile.path}', 'flutter', '--password=sensitive'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+          flutterReleaseOverride: '3.47.8',
+          installedReleases: [_installed('3.47.8')],
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+          sdkLauncher:
+              ({
+                required release,
+                required executable,
+                required arguments,
+              }) async {
+                childArguments = arguments;
+                await Future<void>.delayed(const Duration(milliseconds: 20));
+                return 13;
+              },
+        );
+
+        expect(status, 13);
+        expect(childArguments, ['--password=sensitive']);
+        final contents = await traceFile.readAsString();
+        expect(contents, isNot(contains('sensitive')));
+        final records = await readRecords(traceFile);
+        final childSpan = records.singleWhere(
+          (record) => record['name'] == 'sdk.child_process',
+        );
+        expect(childSpan['durationMicros'], greaterThan(0));
+        expect(childSpan['result'], 'failure');
+        expect(records.last['exitStatus'], 13);
+        expect(records.last.keys, isNot(contains('arguments')));
+      },
+    );
+
+    test(
+      'unopenable trace destination prevents the command from running',
+      () async {
+        final parentFile = File('${temporaryDirectory.path}/not-a-directory')
+          ..writeAsStringSync('file');
+        var launched = false;
+        final errors = StringBuffer();
+        final status = await runWren(
+          ['--trace=${parentFile.path}/trace.jsonl', 'flutter'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+          stdoutSink: StringBuffer(),
+          stderrSink: errors,
+          sdkLauncher:
+              ({
+                required release,
+                required executable,
+                required arguments,
+              }) async {
+                launched = true;
+                return 0;
+              },
+        );
+
+        expect(status, 4);
+        expect(launched, isFalse);
+        expect(errors.toString(), contains('could not open trace file'));
+      },
+    );
   });
 }
 

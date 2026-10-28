@@ -5,6 +5,7 @@ import 'dart:io' as io;
 import 'package:args/command_runner.dart';
 import 'package:pub_semver/pub_semver.dart';
 import 'package:wren/src/installer.dart';
+import 'package:wren/src/tracing.dart';
 import 'package:yaml/yaml.dart';
 import 'package:yaml_edit/yaml_edit.dart';
 
@@ -54,11 +55,22 @@ class WrenContext {
     this.sdkLauncher,
     this.wrenExecutable,
     this.stdinStream,
+    DateTime? traceStartedAt,
+    Stopwatch? traceElapsed,
   }) : _stdoutSink = stdoutSink ?? io.stdout,
-       _stderrSink = stderrSink ?? io.stderr;
+       _stderrSink = stderrSink ?? io.stderr,
+       // These values are internal invocation state, not public settings.
+       // Keep the public constructor names while assigning private fields.
+       // ignore: prefer_initializing_formals
+       _traceStartedAt = traceStartedAt,
+       // Keep this invocation timer private to the context implementation.
+       // ignore: prefer_initializing_formals
+       _traceElapsed = traceElapsed;
 
   final StringSink _stdoutSink;
   final StringSink _stderrSink;
+  final DateTime? _traceStartedAt;
+  final Stopwatch? _traceElapsed;
 
   /// Optional serialized catalog for local fixture runs.
   final String? catalogJson;
@@ -98,6 +110,11 @@ class WrenContext {
   final Stream<List<int>>? stdinStream;
 
   List<String> _sdkArguments = const [];
+  TraceSession? _trace;
+
+  /// Runs [operation] under a named trace span when tracing is enabled.
+  Future<T> traceOperation<T>(String name, Future<T> Function() operation) =>
+      _trace?.span(name, operation) ?? operation();
 
   /// Byte-capable stdout sink when the caller supplied one.
   io.IOSink? get stdoutByteSink =>
@@ -127,32 +144,39 @@ class WrenContext {
   FlutterInstaller get installer => FlutterInstaller(
     installEnvironment,
     onProgress: (message) => stderrSink.writeln(message),
+    traceSpan: _trace?.span,
   );
 
   /// Loads eligible Flutter releases for [targetHost].
   Future<ReleaseCatalog> loadReleaseCatalog(HostPlatform targetHost) =>
-      catalogJson == null
-      ? ReleaseCatalog.fetch(targetHost.catalogUri, host: targetHost)
-      : Future.value(ReleaseCatalog.parse(catalogJson!, host: targetHost));
+      traceOperation(
+        'catalog.load',
+        () => catalogJson == null
+            ? ReleaseCatalog.fetch(targetHost.catalogUri, host: targetHost)
+            : Future.value(
+                ReleaseCatalog.parse(catalogJson!, host: targetHost),
+              ),
+      );
 
   /// Global fallback configured by `set -g`, if any.
-  Future<String?> get globalFallback async {
-    if (globalFallbackOverride != null) return globalFallbackOverride;
-    final config = io.File(
-      '${installEnvironment.dataDirectory.absolute.path}/config.json',
-    );
-    if (!config.existsSync()) return null;
-    try {
-      final decoded = jsonDecode(config.readAsStringSync());
-      if (decoded is Map<String, Object?> &&
-          decoded['globalFallback'] is String) {
-        return (decoded['globalFallback']! as String).trim();
-      }
-    } on Object {
-      // An unreadable preference is treated as unset; doctor diagnoses it.
-    }
-    return null;
-  }
+  Future<String?> get globalFallback =>
+      traceOperation('config.read_global_fallback', () async {
+        if (globalFallbackOverride != null) return globalFallbackOverride;
+        final config = io.File(
+          '${installEnvironment.dataDirectory.absolute.path}/config.json',
+        );
+        if (!config.existsSync()) return null;
+        try {
+          final decoded = jsonDecode(config.readAsStringSync());
+          if (decoded is Map<String, Object?> &&
+              decoded['globalFallback'] is String) {
+            return (decoded['globalFallback']! as String).trim();
+          }
+        } on Object {
+          // An unreadable preference is treated as unset; doctor diagnoses it.
+        }
+        return null;
+      });
 
   /// Prepares a global fallback update without writing the config file.
   _PreparedGlobalFallback _prepareGlobalFallback(String release) {
@@ -179,36 +203,41 @@ class WrenContext {
 
   /// Persists a prepared global fallback update.
   Future<void> _setGlobalFallback(_PreparedGlobalFallback update) async {
-    update.config.parent.createSync(recursive: true);
-    _replaceFileAtomically(
-      update.config,
-      update.contents,
-      temporarySuffix: '.tmp',
-    );
-    globalFallbackOverride = update.release;
+    await traceOperation('config.write_global_fallback', () async {
+      update.config.parent.createSync(recursive: true);
+      _replaceFileAtomically(
+        update.config,
+        update.contents,
+        temporarySuffix: '.tmp',
+      );
+      globalFallbackOverride = update.release;
+    });
   }
 
   Future<void> _clearGlobalFallback(String release) async {
-    if (globalFallbackOverride == release) globalFallbackOverride = null;
-    final config = io.File(
-      '${installEnvironment.dataDirectory.absolute.path}/config.json',
-    );
-    if (!config.existsSync()) return;
-    final decoded = jsonDecode(config.readAsStringSync());
-    if (decoded is! Map<String, Object?> ||
-        decoded['globalFallback'] != release) {
-      return;
-    }
-    final values = Map<String, Object?>.from(decoded)..remove('globalFallback');
-    if (values.isEmpty) {
-      await config.delete();
-    } else {
-      _replaceFileAtomically(
-        config,
-        '${const JsonEncoder.withIndent('  ').convert(values)}\n',
-        temporarySuffix: '.tmp',
+    await traceOperation('config.clear_global_fallback', () async {
+      if (globalFallbackOverride == release) globalFallbackOverride = null;
+      final config = io.File(
+        '${installEnvironment.dataDirectory.absolute.path}/config.json',
       );
-    }
+      if (!config.existsSync()) return;
+      final decoded = jsonDecode(config.readAsStringSync());
+      if (decoded is! Map<String, Object?> ||
+          decoded['globalFallback'] != release) {
+        return;
+      }
+      final values = Map<String, Object?>.from(decoded)
+        ..remove('globalFallback');
+      if (values.isEmpty) {
+        await config.delete();
+      } else {
+        _replaceFileAtomically(
+          config,
+          '${const JsonEncoder.withIndent('  ').convert(values)}\n',
+          temporarySuffix: '.tmp',
+        );
+      }
+    });
   }
 
   /// Asks the user to confirm a language-version change.
@@ -225,6 +254,14 @@ class WrenContext {
 
   /// Selects from only the current directory's pubspec and the global fallback.
   Future<String?> selectProjectRelease(
+    HostPlatform host,
+    List<InstalledRelease> installed,
+  ) => traceOperation(
+    'release.select',
+    () => _selectProjectRelease(host, installed),
+  );
+
+  Future<String?> _selectProjectRelease(
     HostPlatform host,
     List<InstalledRelease> installed,
   ) async {
@@ -285,23 +322,26 @@ class WrenContext {
     required HostPlatform host,
     required String executable,
     required List<String> arguments,
-  }) =>
-      sdkLauncher?.call(
-        release: release,
-        executable: executable,
-        arguments: arguments,
-      ) ??
-      installer.launch(
-        release,
-        host: host,
-        executable: executable,
-        arguments: arguments,
-        stdoutSink: stdoutSink,
-        stderrSink: stderrSink,
-        stdoutByteSink: stdoutByteSink,
-        stderrByteSink: stderrByteSink,
-        stdinStream: stdinStream ?? io.stdin,
-      );
+  }) => traceOperation(
+    'sdk.child_process',
+    () =>
+        sdkLauncher?.call(
+          release: release,
+          executable: executable,
+          arguments: arguments,
+        ) ??
+        installer.launch(
+          release,
+          host: host,
+          executable: executable,
+          arguments: arguments,
+          stdoutSink: stdoutSink,
+          stderrSink: stderrSink,
+          stdoutByteSink: stdoutByteSink,
+          stderrByteSink: stderrByteSink,
+          stdinStream: stdinStream ?? io.stdin,
+        ),
+  );
 }
 
 bool _explicitlyAllowsPrerelease(String constraint, Version version) {
@@ -366,7 +406,32 @@ class WrenCommandRunner {
   /// Runs [arguments] and returns Wren's exit status.
   Future<int> run(Iterable<String> arguments) async {
     var args = arguments.toList(growable: false);
+    String? explicitTracePath;
+    var traceEnabled = false;
     try {
+      final traceArguments = _extractTraceOption(args);
+      args = traceArguments.arguments;
+      traceEnabled = traceArguments.enabled;
+      explicitTracePath = traceArguments.path;
+      if (traceEnabled) {
+        try {
+          context._trace = await TraceSession.open(
+            explicitPath: explicitTracePath,
+            dataDirectory:
+                context.installEnvironment.dataDirectory.absolute.path,
+            startedAt: context._traceStartedAt,
+            elapsed: context._traceElapsed,
+          );
+          if (context._traceStartedAt != null) {
+            await context._trace!.recordStartup(
+              context._traceElapsed!.elapsedMicroseconds,
+            );
+          }
+        } on Object catch (error) {
+          context.stderrSink.writeln('wren: could not open trace file: $error');
+          return 4;
+        }
+      }
       final sdkCommandIndex = _sdkCommandIndex(args);
       if (sdkCommandIndex != null) {
         context._sdkArguments = args.skip(sdkCommandIndex + 1).toList();
@@ -376,9 +441,42 @@ class WrenCommandRunner {
         context.stderrSink
           ..writeln('wren: a command is required.')
           ..writeln(_runner.usage);
-        return 2;
+        return await _finishTrace(2, '');
       }
-      return await _runner.run(args) ?? 0;
+      final command = _commandName(args);
+      final status = context._trace == null
+          ? await _runCommand(args)
+          : await context.traceOperation<int>(
+              'cli.dispatch',
+              () => _runCommand(args),
+            );
+      return await _finishTrace(status, command);
+    } on UsageException catch (error) {
+      context.stderrSink
+        ..writeln('wren: ${error.message}')
+        ..writeln(error.usage);
+      return await _finishTrace(2, _commandName(args));
+    } on SdkLaunchException catch (error) {
+      context.stderrSink.writeln('wren: ${error.message}');
+      return await _finishTrace(error.status, _commandName(args));
+    } on ReleaseCatalogException catch (error) {
+      context.stderrSink.writeln('wren: ${error.message}');
+      return await _finishTrace(4, _commandName(args));
+    } on InstallException catch (error) {
+      context.stderrSink.writeln('wren: ${error.message}');
+      return await _finishTrace(4, _commandName(args));
+    } on InstallCancelledException catch (error) {
+      context.stderrSink.writeln('wren: ${error.message}');
+      return await _finishTrace(6, _commandName(args));
+    } on Object catch (error) {
+      context.stderrSink.writeln('wren: command failed: $error');
+      return await _finishTrace(4, _commandName(args));
+    }
+  }
+
+  Future<int> _runCommand(List<String> arguments) async {
+    try {
+      return await _runner.run(arguments) ?? 0;
     } on UsageException catch (error) {
       context.stderrSink
         ..writeln('wren: ${error.message}')
@@ -402,6 +500,82 @@ class WrenCommandRunner {
     }
   }
 
+  Future<int> _finishTrace(int status, String command) async {
+    final trace = context._trace;
+    if (trace == null) return status;
+    try {
+      await trace.finish(
+        command: command,
+        host: context.host?.label,
+        wrenVersion: '1.0.0',
+        exitStatus: status,
+      );
+      return status;
+    } on Object catch (error) {
+      context.stderrSink.writeln('wren: could not write trace file: $error');
+      return 4;
+    } finally {
+      context._trace = null;
+    }
+  }
+
+  _TraceOptionResult _extractTraceOption(List<String> arguments) {
+    final commandIndex = _firstCommandIndex(arguments);
+    final boundary = commandIndex ?? arguments.length;
+    final kept = <String>[];
+    var enabled = false;
+    String? path;
+    for (var index = 0; index < arguments.length; index++) {
+      final argument = arguments[index];
+      if (index >= boundary ||
+          (argument != '--trace' && !argument.startsWith('--trace='))) {
+        kept.add(argument);
+        continue;
+      }
+      if (enabled) {
+        throw UsageException(
+          'only one --trace option is allowed.',
+          _runner.usage,
+        );
+      }
+      enabled = true;
+      if (argument.startsWith('--trace=')) {
+        path = argument.substring('--trace='.length);
+        if (path.isEmpty) {
+          throw UsageException(
+            '--trace requires a non-empty path.',
+            _runner.usage,
+          );
+        }
+      }
+    }
+    return _TraceOptionResult(arguments: kept, enabled: enabled, path: path);
+  }
+
+  int? _firstCommandIndex(List<String> arguments) {
+    for (var index = 0; index < arguments.length; index++) {
+      final argument = arguments[index];
+      if (argument == '--release') {
+        if (index + 1 >= arguments.length) return null;
+        index++;
+      } else if (argument == '--verbose' ||
+          argument == '--help' ||
+          argument == '-h') {
+        continue;
+      } else if (argument.startsWith('-')) {
+        continue;
+      } else {
+        return index;
+      }
+    }
+    return null;
+  }
+
+  String _commandName(List<String> arguments) {
+    final index = _firstCommandIndex(arguments);
+    return index == null ? '' : arguments[index];
+  }
+
   int? _sdkCommandIndex(List<String> arguments) {
     for (var index = 0; index < arguments.length; index++) {
       final argument = arguments[index];
@@ -419,6 +593,14 @@ class WrenCommandRunner {
     }
     return null;
   }
+}
+
+class _TraceOptionResult {
+  const new({required this.arguments, required this.enabled, this.path});
+
+  final List<String> arguments;
+  final bool enabled;
+  final String? path;
 }
 
 class _WrenPackageCommandRunner extends CommandRunner<int> {
@@ -462,6 +644,9 @@ Future<int> runWren(
   String? wrenExecutable,
   Stream<List<int>>? stdinStream,
 }) async {
+  final tracingRequested = _traceOptionPresentBeforeCommand(arguments);
+  final traceStartedAt = tracingRequested ? DateTime.now().toUtc() : null;
+  final traceElapsed = tracingRequested ? (Stopwatch()..start()) : null;
   final context = WrenContext(
     stdoutSink: stdoutSink,
     stderrSink: stderrSink,
@@ -476,6 +661,8 @@ Future<int> runWren(
     sdkLauncher: sdkLauncher,
     wrenExecutable: wrenExecutable,
     stdinStream: stdinStream,
+    traceStartedAt: traceStartedAt,
+    traceElapsed: traceElapsed,
   );
   final runner = WrenCommandRunner(context)
     ..addCommand(_ReleasesCommand(context))
@@ -490,6 +677,21 @@ Future<int> runWren(
     ..addCommand(_FlutterCommand(context))
     ..addCommand(_DartCommand(context));
   return await runner.run(arguments);
+}
+
+bool _traceOptionPresentBeforeCommand(List<String> arguments) {
+  for (var index = 0; index < arguments.length; index++) {
+    final argument = arguments[index];
+    if (argument == '--trace' || argument.startsWith('--trace=')) return true;
+    if (argument == '--release') {
+      if (index + 1 < arguments.length) index++;
+    } else if (argument.startsWith('-')) {
+      continue;
+    } else {
+      return false;
+    }
+  }
+  return false;
 }
 
 class _RemoveCommand extends WrenCommand {
@@ -515,17 +717,21 @@ class _RemoveCommand extends WrenCommand {
     }
     final version = arguments.single;
     final fallback = await context.globalFallback;
-    await context.installer.remove(
-      version,
-      host: targetHost,
-      confirmExternalUse: context.confirm,
-      confirmSharedRepository: context.confirm,
-      onUnavailable: () async {
-        if (fallback == version) await context._clearGlobalFallback(version);
-      },
+    await context.traceOperation('release.remove', () async {
+      await context.installer.remove(
+        version,
+        host: targetHost,
+        confirmExternalUse: context.confirm,
+        confirmSharedRepository: context.confirm,
+        onUnavailable: () async {
+          if (fallback == version) await context._clearGlobalFallback(version);
+        },
+      );
+    });
+    final installed = await context.traceOperation(
+      'release.list_installed',
+      context.installer.listInstalled,
     );
-
-    final installed = await context.installer.listInstalled();
     final active = await context.selectProjectRelease(targetHost, installed);
     if (active == null || active.isEmpty) {
       writeOut('Removed Flutter $version. No release is active.');
@@ -556,8 +762,9 @@ class _CleanupCommand extends WrenCommand {
     if (argResults!.rest.isNotEmpty) {
       failUsage('cleanup does not accept positional arguments.');
     }
-    final result = await context.installer.cleanup(
-      dryRun: argResults!.flag('dry-run'),
+    final result = await context.traceOperation(
+      'cleanup.reclaim_orphans',
+      () => context.installer.cleanup(dryRun: argResults!.flag('dry-run')),
     );
     final dryRun = argResults!.flag('dry-run');
     if (result.stages.isEmpty && result.sources.isEmpty) {
@@ -705,7 +912,10 @@ class _InstallCommand extends WrenCommand {
       );
       return 4;
     }
-    final result = await context.installer.install(release, host: targetHost);
+    final result = await context.traceOperation(
+      'release.install',
+      () => context.installer.install(release, host: targetHost),
+    );
     writeOut(result.message);
     return 0;
   }
@@ -728,7 +938,10 @@ class _ListCommand extends WrenCommand {
     if (argResults!.rest.isNotEmpty) {
       failUsage('unexpected argument "${argResults!.rest.first}".');
     }
-    final releases = await context.installer.listInstalled();
+    final releases = await context.traceOperation(
+      'release.list_installed',
+      context.installer.listInstalled,
+    );
     if (releases.isEmpty) {
       writeOut('No Flutter releases are installed.');
       return 0;
@@ -816,7 +1029,12 @@ class _SetCommand extends WrenCommand {
       return 4;
     }
 
-    var content = pubspec.existsSync() ? pubspec.readAsStringSync() : null;
+    var content = pubspec.existsSync()
+        ? await context.traceOperation(
+            'pubspec.read',
+            () async => pubspec.readAsStringSync(),
+          )
+        : null;
     var edits = <String, (String, String)>{};
     var existingKeys = <String>{};
     if (content != null) {
@@ -851,8 +1069,16 @@ class _SetCommand extends WrenCommand {
     final fallbackUpdate = setGlobal
         ? context._prepareGlobalFallback(selected.version)
         : null;
-    if (content != null && content != pubspec.readAsStringSync()) {
-      _replaceFileAtomically(pubspec, content, temporarySuffix: '.wren.tmp');
+    final currentContent = content == null
+        ? null
+        : await context.traceOperation(
+            'pubspec.read_before_write',
+            () async => pubspec.readAsStringSync(),
+          );
+    if (content != null && content != currentContent) {
+      await context.traceOperation('pubspec.write', () async {
+        _replaceFileAtomically(pubspec, content!, temporarySuffix: '.wren.tmp');
+      });
     }
     if (fallbackUpdate != null) {
       await context._setGlobalFallback(fallbackUpdate);
@@ -1021,7 +1247,10 @@ class _SdkPathCommand extends WrenCommand {
             '`wren install <release>`.',
       );
     }
-    final path = await context.installer.sdkPath(release, host: targetHost);
+    final path = await context.traceOperation(
+      'sdk_path.record_external_use',
+      () => context.installer.sdkPath(release, host: targetHost),
+    );
     writeOut(path);
     return 0;
   }
@@ -1045,15 +1274,18 @@ class _SetupCommand extends WrenCommand {
     final binDirectory = io.Directory(
       '${context.installEnvironment.dataDirectory.absolute.path}/bin',
     );
-    await binDirectory.create(recursive: true);
-    final executable = context.wrenExecutable ?? io.Platform.resolvedExecutable;
-    for (final command in ['flutter', 'dart']) {
-      await _writeShim(
-        io.File('${binDirectory.path}/$command'),
-        executable: executable,
-        command: command,
-      );
-    }
+    await context.traceOperation('setup.write_shims', () async {
+      await binDirectory.create(recursive: true);
+      final executable =
+          context.wrenExecutable ?? io.Platform.resolvedExecutable;
+      for (final command in ['flutter', 'dart']) {
+        await _writeShim(
+          io.File('${binDirectory.path}/$command'),
+          executable: executable,
+          command: command,
+        );
+      }
+    });
 
     final binPath = binDirectory.absolute.path;
     writeOut('Installed Flutter and Dart shims in $binPath.');

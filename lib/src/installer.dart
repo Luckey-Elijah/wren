@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:pub_semver/pub_semver.dart';
+import 'package:wren/src/tracing.dart';
 
 import 'package:wren/wren.dart' show FlutterRelease, HostPlatform;
 
@@ -215,13 +216,28 @@ class SdkLaunchException implements Exception {
 /// Installs and inspects Wren-managed Flutter releases.
 class FlutterInstaller {
   /// Creates an installer backed by [environment].
-  new(this.environment, {this.onProgress});
+  new(this.environment, {this.onProgress, this.traceSpan});
 
   /// Storage and repository configuration used by this installer.
   final InstallEnvironment environment;
 
   /// Optional callback for progress messages.
   final void Function(String message)? onProgress;
+
+  /// Optional per-invocation trace callback.
+  final TraceSpanRunner? traceSpan;
+
+  Future<T> _traceOperation<T>(String name, Future<T> Function() operation) =>
+      traceSpan?.call<T>(name, operation) ?? operation();
+
+  Future<Directory> _acquireOperationLock(
+    Directory lock, {
+    void Function()? onWait,
+    Stream<void>? cancellation,
+  }) => _traceOperation(
+    'lock.wait',
+    () => _acquireLock(lock, onWait: onWait, cancellation: cancellation),
+  );
 
   /// Removes provable crash-orphaned stages and unreferenced shared sources.
   ///
@@ -251,7 +267,7 @@ class FlutterInstaller {
         if (lockPath == null) continue;
 
         _progress('Checking orphaned stage $name');
-        final lock = await _acquireLock(
+        final lock = await _acquireOperationLock(
           Directory(lockPath),
           cancellation: _waitCancellation,
           onWait: () => _progress('Waiting for active work on stage $name'),
@@ -278,7 +294,7 @@ class FlutterInstaller {
         }
         final sourceKey = p.basename(entry.path);
         _progress('Checking shared source $sourceKey');
-        final lock = await _acquireLock(
+        final lock = await _acquireOperationLock(
           Directory(p.join(root, 'locks', 'source-$sourceKey')),
           cancellation: _waitCancellation,
           onWait: () => _progress('Waiting for shared source $sourceKey'),
@@ -643,7 +659,7 @@ class FlutterInstaller {
     }
     final releaseKey = p.basename(candidate.path);
     // Lifecycle mutations use this lock while checking for active leases.
-    final lifecycleLock = await _acquireLock(
+    final lifecycleLock = await _acquireOperationLock(
       Directory(p.join(root, 'locks', 'lifecycle-$releaseKey')),
     );
     var lifecycleLockHeld = true;
@@ -773,7 +789,7 @@ class FlutterInstaller {
     }
 
     final releaseKey = p.basename(candidate.path);
-    final lifecycleLock = await _acquireLock(
+    final lifecycleLock = await _acquireOperationLock(
       Directory(p.join(root, 'locks', 'lifecycle-$releaseKey')),
     );
     try {
@@ -884,14 +900,14 @@ class FlutterInstaller {
     }
 
     final releaseKey = p.basename(target.path);
-    final releaseLock = await _acquireLock(
+    final releaseLock = await _acquireOperationLock(
       Directory(p.join(root, 'locks', 'install-$releaseKey')),
       cancellation: _waitCancellation,
       onWait: () =>
           _progress('Waiting for Flutter $releaseVersion install work'),
     );
     try {
-      final lifecycleLock = await _acquireLock(
+      final lifecycleLock = await _acquireOperationLock(
         Directory(p.join(root, 'locks', 'lifecycle-$releaseKey')),
         cancellation: _waitCancellation,
         onWait: () => _progress('Waiting for Flutter $releaseVersion users'),
@@ -928,7 +944,7 @@ class FlutterInstaller {
 
         final sourceKey = manifest['sourceKey'];
         final sourceLock = sourceKey is String
-            ? await _acquireLock(
+            ? await _acquireOperationLock(
                 Directory(p.join(root, 'locks', 'source-$sourceKey')),
                 cancellation: _waitCancellation,
                 onWait: () => _progress('Waiting for shared artifact users'),
@@ -971,7 +987,7 @@ class FlutterInstaller {
           'shared Flutter Git repository?',
         );
         if (confirmed == true) {
-          final repoLock = await _acquireLock(
+          final repoLock = await _acquireOperationLock(
             Directory(p.join(root, 'locks', 'flutter-git')),
             cancellation: _waitCancellation,
             onWait: () =>
@@ -1430,7 +1446,7 @@ class FlutterInstaller {
         '${release.channel}-${release.version}-${_archiveVariant(host)}';
     final releasePath = p.join(root.path, 'releases', releaseKey);
     final lockPath = p.join(root.path, 'locks', 'install-$releaseKey');
-    final releaseLock = await _acquireLock(
+    final releaseLock = await _acquireOperationLock(
       Directory(lockPath),
       cancellation: _waitCancellation,
       onWait: () => _progress(
@@ -1473,7 +1489,7 @@ class FlutterInstaller {
       try {
         _progress('Preparing Flutter ${release.version} for ${host.label}');
         await _requireGit();
-        final repoLock = await _acquireLock(
+        final repoLock = await _acquireOperationLock(
           Directory(p.join(root.path, 'locks', 'flutter-git')),
           cancellation: _waitCancellation,
           onWait: () => _progress('Waiting for the shared Flutter Git lock'),
@@ -1537,7 +1553,7 @@ class FlutterInstaller {
           resolvedSourceKey,
         );
 
-        heldSourceLock = await _acquireLock(
+        heldSourceLock = await _acquireOperationLock(
           Directory(p.join(root.path, 'locks', 'source-$resolvedSourceKey')),
           cancellation: _waitCancellation,
           onWait: () => _progress('Waiting for the shared engine source lock'),
@@ -1556,11 +1572,14 @@ class FlutterInstaller {
           // Flutter's artifact updater validates storage-provider transfer
           // checksums and rejects archives it cannot extract. Wren checks
           // the runtime identity and resulting host artifact layout.
-          await _runFlutter(
-            checkoutStage,
-            _precacheArguments(host),
-            userMessage:
-                'Flutter failed to download or extract required artifacts',
+          await _traceOperation(
+            'flutter.artifact_download_extract',
+            () => _runFlutter(
+              checkoutStage,
+              _precacheArguments(host),
+              userMessage:
+                  'Flutter failed to download or extract required artifacts',
+            ),
           );
           await _validateCheckout(
             checkoutStage,
@@ -1582,11 +1601,14 @@ class FlutterInstaller {
         }
         if (!artifactsPrepared) {
           _progress('Validating ${host.label} and web artifacts');
-          await _runFlutter(
-            checkoutStage,
-            _precacheArguments(host),
-            userMessage:
-                'Flutter failed to validate or prepare required artifacts',
+          await _traceOperation(
+            'flutter.artifact_validation',
+            () => _runFlutter(
+              checkoutStage,
+              _precacheArguments(host),
+              userMessage:
+                  'Flutter failed to validate or prepare required artifacts',
+            ),
           );
           await _validateCheckout(
             checkoutStage,
@@ -1600,7 +1622,7 @@ class FlutterInstaller {
 
         await checkoutStage.rename(releasePath);
         checkoutPublished = true;
-        final worktreeRepairLock = await _acquireLock(
+        final worktreeRepairLock = await _acquireOperationLock(
           Directory(p.join(root.path, 'locks', 'flutter-git')),
           cancellation: _waitCancellation,
         );
@@ -2037,7 +2059,7 @@ class FlutterInstaller {
   }
 
   Future<void> _discardWorktree(Directory root, String path) async {
-    final lock = await _acquireLock(
+    final lock = await _acquireOperationLock(
       Directory(p.join(root.path, 'locks', 'flutter-git')),
     );
     try {
