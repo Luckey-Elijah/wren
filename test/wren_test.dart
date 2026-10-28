@@ -705,6 +705,116 @@ environment:
       expect(result.reason, contains('no native Linux x86_64 artifact'));
     });
   });
+  group('wren setup', () {
+    late Directory temporaryDirectory;
+    late Directory dataDirectory;
+
+    setUp(() async {
+      temporaryDirectory = await Directory.systemTemp.createTemp('wren-setup-');
+      dataDirectory = Directory('${temporaryDirectory.path}/data')
+        ..createSync();
+    });
+
+    tearDown(() async {
+      await temporaryDirectory.delete(recursive: true);
+    });
+
+    test(
+      'installs executable forwarding shims and prints editor guidance',
+      () async {
+        final childArguments = File(
+          '${temporaryDirectory.path}/child-args.txt',
+        );
+        final child = File('${temporaryDirectory.path}/sdk-child');
+        await child.writeAsString('''
+#!/bin/sh
+printf '%s\\n' "\$@" > '${childArguments.path}'
+printf 'sdk stdout\n'
+printf 'sdk stderr\n' >&2
+exit 23
+''');
+        expect((await Process.run('chmod', ['+x', child.path])).exitCode, 0);
+
+        final wrenExecutable = File('${temporaryDirectory.path}/wren-fixture');
+        final selectedRelease = File(
+          '${temporaryDirectory.path}/selected-release.txt',
+        );
+        await wrenExecutable.writeAsString('''
+#!/bin/sh
+if [ "\$1" != flutter ] && [ "\$1" != dart ]; then exit 90; fi
+selected="\$WREN_FLUTTER_RELEASE"
+if [ -z "\$selected" ]; then selected=active; fi
+printf '%s\\n' "\$selected" > '${selectedRelease.path}'
+shift
+exec '${child.path}' "\$@"
+''');
+        expect(
+          (await Process.run('chmod', ['+x', wrenExecutable.path])).exitCode,
+          0,
+        );
+
+        final vscodeDirectory = Directory(
+          '${temporaryDirectory.path}/project/.vscode',
+        )..createSync(recursive: true);
+        final settings = File('${vscodeDirectory.path}/settings.json')
+          ..writeAsStringSync(r'{"existing": true}\n');
+        final output = StringBuffer();
+        final status = await runWren(
+          ['setup'],
+          installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+          wrenExecutable: wrenExecutable.path,
+          stdoutSink: output,
+          stderrSink: StringBuffer(),
+        );
+
+        expect(status, 0);
+        final flutterShim = File('${dataDirectory.path}/bin/flutter');
+        final dartShim = File('${dataDirectory.path}/bin/dart');
+        expect(flutterShim.existsSync(), isTrue);
+        expect(dartShim.existsSync(), isTrue);
+        expect(
+          await flutterShim.readAsString(),
+          contains("'${wrenExecutable.path}' flutter"),
+        );
+        expect(
+          await dartShim.readAsString(),
+          contains("'${wrenExecutable.path}' dart"),
+        );
+        expect(
+          (await Process.run('test', ['-x', flutterShim.path])).exitCode,
+          0,
+        );
+        expect(output.toString(), contains('PATH'));
+        expect(output.toString(), contains('dart.getFlutterSdkCommand'));
+        expect(output.toString(), contains('"executable": "wren"'));
+        expect(output.toString(), contains('"args": ["sdk-path"]'));
+        expect(output.toString(), contains('wren sdk-path <release>'));
+        expect(output.toString(), contains('Reload'));
+        expect(await settings.readAsString(), r'{"existing": true}\n');
+
+        final result = await Process.run(flutterShim.path, [
+          '--version',
+          'argument with spaces',
+        ]);
+        expect(result.exitCode, 23);
+        expect(result.stdout, 'sdk stdout\n');
+        expect(result.stderr, 'sdk stderr\n');
+        expect(await childArguments.readAsLines(), [
+          '--version',
+          'argument with spaces',
+        ]);
+        expect(await selectedRelease.readAsString(), 'active\n');
+
+        final exactResult = await Process.run(
+          dartShim.path,
+          ['--version'],
+          environment: {'WREN_FLUTTER_RELEASE': '3.47.8'},
+        );
+        expect(exactResult.exitCode, 23);
+        expect(await selectedRelease.readAsString(), '3.47.8\n');
+      },
+    );
+  });
 }
 
 List<Map<String, Object?>> _fixtureReleases() => [

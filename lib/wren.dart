@@ -50,6 +50,7 @@ class WrenContext {
     this.projectDirectory,
     this.installedReleasesOverride,
     this.sdkLauncher,
+    this.wrenExecutable,
     this.stdinStream,
   }) : _stdoutSink = stdoutSink ?? io.stdout,
        _stderrSink = stderrSink ?? io.stderr;
@@ -84,6 +85,12 @@ class WrenContext {
 
   /// Optional SDK process launcher for local CLI fixture runs.
   final SdkLauncher? sdkLauncher;
+
+  /// Executable used by generated PATH shims.
+  ///
+  /// Production setup uses the running Wren executable. The override allows
+  /// CLI tests to run generated shims against a controlled child process.
+  final String? wrenExecutable;
 
   /// Input forwarded to SDK processes; defaults to the current process stdin.
   final Stream<List<int>>? stdinStream;
@@ -427,6 +434,7 @@ Future<int> runWren(
   io.Directory? projectDirectory,
   List<InstalledRelease>? installedReleases,
   SdkLauncher? sdkLauncher,
+  String? wrenExecutable,
   Stream<List<int>>? stdinStream,
 }) async {
   final context = WrenContext(
@@ -441,6 +449,7 @@ Future<int> runWren(
     projectDirectory: projectDirectory,
     installedReleasesOverride: installedReleases,
     sdkLauncher: sdkLauncher,
+    wrenExecutable: wrenExecutable,
     stdinStream: stdinStream,
   );
   final runner = WrenCommandRunner(context)
@@ -449,6 +458,7 @@ Future<int> runWren(
     ..addCommand(_ListCommand(context))
     ..addCommand(_SetCommand(context))
     ..addCommand(_SdkPathCommand(context))
+    ..addCommand(_SetupCommand(context))
     ..addCommand(_FlutterCommand(context))
     ..addCommand(_DartCommand(context));
   return await runner.run(arguments);
@@ -867,6 +877,86 @@ class _SdkPathCommand extends WrenCommand {
     return 0;
   }
 }
+
+class _SetupCommand extends WrenCommand {
+  new(super.context);
+
+  @override
+  String get name => 'setup';
+
+  @override
+  String get description =>
+      'Install optional Flutter and Dart PATH shims and show editor setup.';
+
+  @override
+  Future<int> run() async {
+    if (argResults!.rest.isNotEmpty) {
+      failUsage('setup does not accept arguments.');
+    }
+    final binDirectory = io.Directory(
+      '${context.installEnvironment.dataDirectory.absolute.path}/bin',
+    );
+    await binDirectory.create(recursive: true);
+    final executable = context.wrenExecutable ?? io.Platform.resolvedExecutable;
+    for (final command in ['flutter', 'dart']) {
+      await _writeShim(
+        io.File('${binDirectory.path}/$command'),
+        executable: executable,
+        command: command,
+      );
+    }
+
+    final binPath = binDirectory.absolute.path;
+    writeOut('Installed Flutter and Dart shims in $binPath.');
+    writeOut('Add this directory to PATH in your shell:');
+    writeOut('  export PATH=${_shellQuote(binPath)}:"\$PATH"');
+    writeOut('Open a new terminal or run that export in the current shell.');
+    writeOut('');
+    writeOut('VS Code Dart extension (user or workspace settings):');
+    writeOut(
+      '''  "dart.getFlutterSdkCommand": {"executable": "wren", "args": ["sdk-path"]}''',
+    );
+    writeOut(
+      'The command resolves the workspace selection when VS Code discovers '
+      'the project. Reload the window after changing the active release.',
+    );
+    writeOut('');
+    writeOut(
+      'JetBrains Flutter SDK path: run wren sdk-path <release> and '
+      'copy the printed SDK root into the IDE.',
+    );
+    writeOut(
+      'JetBrains keeps that fixed path on the selected release; update it '
+      'manually after switching releases.',
+    );
+    return 0;
+  }
+
+  Future<void> _writeShim(
+    io.File destination, {
+    required String executable,
+    required String command,
+  }) async {
+    final temporary = io.File('${destination.path}.tmp');
+    await temporary.writeAsString(
+      '#!/bin/sh\nexec ${_shellQuote(executable)} $command "\$@"\n',
+      flush: true,
+    );
+    final chmod = await io.Process.run('chmod', [
+      'u=rwx,go=rx',
+      temporary.path,
+    ]);
+    if (chmod.exitCode != 0) {
+      await temporary.delete();
+      throw InstallException(
+        'could not make the $command shim executable: ${chmod.stderr}',
+      );
+    }
+    await temporary.rename(destination.path);
+  }
+}
+
+String _shellQuote(String value) => "'${value.replaceAll("'", "'\"'\"'")}'";
 
 abstract class _SdkCommand extends WrenCommand {
   new(super.context, this.name) : super(sdkCommand: true);
