@@ -1,5 +1,7 @@
-import 'package:wren/wren.dart' as wren;
+import 'dart:io';
 
-void main(List<String> arguments) {
-  print('Hello world: ${wren.calculate()}!');
+import 'package:wren/wren.dart' show runWren;
+
+Future<void> main(List<String> arguments) async {
+  exit(await runWren(arguments));
 }
