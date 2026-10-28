@@ -123,6 +123,101 @@ void main() {
       expect(secondRun, 0);
     });
 
+    test('list and ls show readiness and hide incomplete stages', () async {
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      final installStatus = await runWren(
+        ['install', _version],
+        catalogJson: _catalog(frameworkRevision),
+        host: HostPlatform.linuxX64,
+        installEnvironment: environment,
+        stdoutSink: StringBuffer(),
+        stderrSink: StringBuffer(),
+      );
+      expect(installStatus, 0);
+
+      final installed = Directory(
+        p.join(dataDirectory.path, 'releases', 'stable-$_version-linux-x64'),
+      );
+      await Directory(p.join(dataDirectory.path, 'staging', 'interrupted'))
+          .create(recursive: true);
+      final listOutput = StringBuffer();
+      final listStatus = await runWren(
+        ['list'],
+        host: HostPlatform.linuxX64,
+        installEnvironment: environment,
+        stdoutSink: listOutput,
+        stderrSink: StringBuffer(),
+      );
+      final aliasOutput = StringBuffer();
+      final aliasStatus = await runWren(
+        ['ls'],
+        host: HostPlatform.linuxX64,
+        installEnvironment: environment,
+        stdoutSink: aliasOutput,
+        stderrSink: StringBuffer(),
+      );
+
+      expect(listStatus, 0);
+      expect(aliasStatus, 0);
+      expect(aliasOutput.toString(), listOutput.toString());
+      expect(
+        listOutput.toString(),
+        contains('$_version  stable  linux  ready'),
+      );
+      expect(listOutput.toString(), isNot(contains('interrupted')));
+
+      await File(p.join(installed.path, 'bin/cache/linux-sdk.stamp')).delete();
+      final damagedOutput = StringBuffer();
+      expect(
+        await runWren(
+          ['list'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: damagedOutput,
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+      expect(damagedOutput.toString(), contains('needs repair'));
+      final releaseMarker = jsonDecode(
+        await File(p.join(installed.path, '.wren-release.json')).readAsString(),
+      ) as Map<String, Object?>;
+      expect(releaseMarker['readiness'], 'needs-repair');
+
+      await File(p.join(installed.path, 'bin/cache/linux-sdk.stamp'))
+          .writeAsString('$_engineRevision\n');
+      final actualSourceDart = File(
+        p.join(
+          dataDirectory.path,
+          'sources',
+          '$_engineRevision-linux-x64',
+          'bin/cache/dart-sdk/bin/dart',
+        ),
+      );
+      expect(actualSourceDart.existsSync(), isTrue);
+      final chmod = await Process.run('chmod', ['-x', actualSourceDart.path]);
+      expect(chmod.exitCode, 0);
+      final sourceDamageOutput = StringBuffer();
+      expect(
+        await runWren(
+          ['list'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: sourceDamageOutput,
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+      expect(sourceDamageOutput.toString(), contains('needs repair'));
+      expect(
+        sourceDamageOutput.toString(),
+        contains('shared artifact source executable is not runnable'),
+      );
+    });
+
     test('seeds a second release from the retained engine source', () async {
       final environment = InstallEnvironment(
         dataDirectory: dataDirectory,

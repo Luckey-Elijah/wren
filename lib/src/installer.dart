@@ -57,6 +57,22 @@ class InstallResult {
   final bool alreadyInstalled;
 }
 
+class InstalledRelease {
+  const InstalledRelease({
+    required this.channel,
+    required this.version,
+    required this.host,
+    required this.needsRepair,
+    this.repairReason,
+  });
+
+  final String channel;
+  final String version;
+  final String host;
+  final bool needsRepair;
+  final String? repairReason;
+}
+
 class InstallException implements Exception {
   const InstallException(this.message);
 
@@ -68,6 +84,398 @@ class FlutterInstaller {
 
   final InstallEnvironment environment;
   final void Function(String message)? onProgress;
+
+  /// Lists published releases and performs the inexpensive launch-readiness
+  /// checks used by Wren before selecting an SDK.
+  Future<List<InstalledRelease>> listInstalled() async {
+    final releasesDirectory = Directory(
+      p.join(environment.dataDirectory.absolute.path, 'releases'),
+    );
+    if (!await releasesDirectory.exists()) return const [];
+
+    final installed = <InstalledRelease>[];
+    await for (final entity in releasesDirectory.list(followLinks: false)) {
+      if (entity is! Directory ||
+          FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+              FileSystemEntityType.directory) {
+        continue;
+      }
+      final marker = File(p.join(entity.path, '.wren-release.json'));
+      if (!await marker.exists()) continue;
+      final result = await _readiness(entity, releasesDirectory.parent);
+      if (result == null) continue;
+      installed.add(result);
+    }
+    installed.sort((left, right) {
+      final channelOrder = _readinessChannelOrder(left.channel)
+          .compareTo(_readinessChannelOrder(right.channel));
+      if (channelOrder != 0) return channelOrder;
+      try {
+        return Version.parse(right.version)
+            .compareTo(Version.parse(left.version));
+      } on FormatException {
+        return right.version.compareTo(left.version);
+      }
+    });
+    return List.unmodifiable(installed);
+  }
+
+  Future<InstalledRelease?> _readiness(
+    Directory release,
+    Directory root,
+  ) async {
+    final marker = File(p.join(release.path, '.wren-release.json'));
+    String? channel;
+    String? version;
+    String? hostName;
+    Map<String, Object?>? releaseData;
+    var reason = 'release metadata is invalid';
+    try {
+      final data = jsonDecode(await marker.readAsString());
+      if (data is! Map<String, Object?>) {
+        return _invalidRelease(release, 'release metadata is invalid');
+      }
+      releaseData = data;
+      channel = data['channel'] as String?;
+      version = data['version'] as String?;
+      hostName = data['host'] as String?;
+      final architecture = data['architecture'] as String?;
+      final host = _hostFromIdentity(hostName, architecture);
+      if (channel == null ||
+          version == null ||
+          host == null ||
+          data['state'] != 'ready' ||
+          p.basename(release.path) !=
+              '$channel-$version-${_readinessVariant(host)}') {
+        reason = 'recorded release identity does not match its installation';
+      } else {
+        final frameworkRevision = data['frameworkRevision'];
+        final engineRevision = data['engineRevision'];
+        final sourceKey = data['sourceKey'];
+        if (frameworkRevision is! String ||
+            !RegExp(r'^[a-fA-F0-9]{40}$').hasMatch(frameworkRevision)) {
+          reason = 'recorded framework identity is invalid';
+        } else if (engineRevision is! String ||
+            !RegExp(_engineRevisionPattern).hasMatch(engineRevision)) {
+          reason = 'recorded engine identity is invalid';
+        } else if (sourceKey !=
+            '$engineRevision-${host.catalogOs}-${host.catalogArchitecture}') {
+          reason = 'recorded shared source identity is invalid';
+        } else {
+          final actualFramework = await _gitText(release.path, [
+            'rev-parse',
+            'HEAD',
+          ], userMessage: 'could not read framework identity');
+          if (actualFramework.toLowerCase() !=
+              frameworkRevision.toLowerCase()) {
+            reason = 'framework checkout does not match its recorded identity';
+          } else {
+            final actualEngine = (await File(
+              p.join(release.path, 'bin/internal/engine.version'),
+            ).readAsString()).trim();
+            if (actualEngine.toLowerCase() != engineRevision.toLowerCase()) {
+              reason = 'engine revision does not match its recorded identity';
+            } else {
+              final source = Directory(
+                p.join(root.path, 'sources', sourceKey as String),
+              );
+              reason =
+                  await _quickReadinessReason(
+                    release,
+                    source,
+                    data,
+                    engineRevision,
+                    host,
+                  ) ??
+                  '';
+            }
+          }
+        }
+      }
+    } on Object catch (error) {
+      reason = 'could not validate installed release: $error';
+    }
+
+    final current = releaseData;
+    if (current == null) {
+      return _invalidRelease(release, reason);
+    }
+    final needsRepair = reason.isNotEmpty;
+    final updated = Map<String, Object?>.from(current);
+    if (needsRepair) {
+      updated['readiness'] = 'needs-repair';
+      updated['readinessReason'] = reason;
+    } else {
+      updated.remove('readiness');
+      updated.remove('readinessReason');
+    }
+    if (jsonEncode(updated) != jsonEncode(current)) {
+      await _publishManifest(release.path, updated);
+    }
+    if (channel == null || version == null || hostName == null) {
+      return _invalidRelease(release, reason);
+    }
+    return InstalledRelease(
+      channel: channel,
+      version: version,
+      host: hostName,
+      needsRepair: needsRepair,
+      repairReason: needsRepair ? reason : null,
+    );
+  }
+
+  InstalledRelease _invalidRelease(Directory release, String reason) =>
+      InstalledRelease(
+        channel: 'unknown',
+        version: p.basename(release.path),
+        host: 'unknown',
+        needsRepair: true,
+        repairReason: reason,
+      );
+
+  Future<String?> _quickReadinessReason(
+    Directory release,
+    Directory source,
+    Map<String, Object?> releaseData,
+    String engineRevision,
+    HostPlatform host,
+  ) async {
+    final missing = _readinessMissingArtifact(release.path, host);
+    if (missing != null) return 'required artifact is missing: $missing';
+    for (final executable in [
+      'bin/flutter',
+      _dartExecutable,
+      ..._readinessHostExecutables(host),
+    ]) {
+      final file = File(p.join(release.path, executable));
+      if ((file.statSync().mode & 0x49) == 0) {
+        return 'required executable is not runnable: $executable';
+      }
+    }
+    final stampReason = _stampReadinessReason(release, engineRevision, host);
+    if (stampReason != null) return stampReason;
+    final cache = Directory(p.join(release.path, 'bin/cache'));
+    final sourcesPath = p.join(
+      environment.dataDirectory.absolute.path,
+      'sources',
+    );
+    for (final entity in cache.listSync(recursive: true, followLinks: false)) {
+      if (FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+          FileSystemEntityType.link) {
+        continue;
+      }
+      try {
+        if (p.isWithin(
+          sourcesPath,
+          Link(entity.path).resolveSymbolicLinksSync(),
+        )) {
+          return 'private cache links into the shared artifact source';
+        }
+      } on FileSystemException {
+        return 'private cache contains a broken symbolic link';
+      }
+    }
+    final sourceMarker = File(p.join(source.path, '.wren-source.json'));
+    if (!await sourceMarker.exists()) {
+      return 'shared artifact source is missing';
+    }
+    try {
+      final metadata = jsonDecode(await sourceMarker.readAsString());
+      if (metadata is! Map<String, Object?> ||
+          metadata['state'] != 'ready' ||
+          metadata['engineRevision'] != engineRevision ||
+          metadata['host'] != host.catalogOs ||
+          metadata['architecture'] != host.catalogArchitecture ||
+          metadata['archiveVariant'] != _readinessVariant(host) ||
+          jsonEncode(metadata['artifacts']) !=
+              jsonEncode(_readinessSourceArtifacts(host)) ||
+          !_hasValidSourceInventory(metadata['inventory'])) {
+        return 'shared artifact source metadata is incoherent';
+      }
+      for (final path in _readinessSourceArtifacts(host)) {
+        if (!await Directory(p.join(source.path, path)).exists()) {
+          return 'shared artifact source is missing: $path';
+        }
+      }
+      final sourceMissing = _readinessMissingArtifact(source.path, host);
+      if (sourceMissing != null) {
+        return 'shared artifact source is missing: $sourceMissing';
+      }
+      for (final executable in [
+        _dartExecutable,
+        ..._readinessHostExecutables(host),
+      ]) {
+        final file = File(p.join(source.path, executable));
+        if ((file.statSync().mode & 0x49) == 0) {
+          return 'shared artifact source executable is not runnable: $executable';
+        }
+      }
+      final stamps = metadata['stamps'];
+      final stampFiles = _readinessStampFiles(host);
+      if (stamps is! Map<String, Object?> ||
+          stampFiles
+              .where((path) => path != 'engine.realm')
+              .any((path) => '${stamps[path]}'.trim() != engineRevision) ||
+          stamps['engine.realm'] == null) {
+        return 'shared artifact source stamps are incoherent';
+      }
+      for (final stamp in stampFiles) {
+        if (File(p.join(release.path, 'bin/cache', stamp)).readAsStringSync() !=
+            stamps[stamp]) {
+          return 'release cache stamps do not match shared source metadata';
+        }
+      }
+    } on Object {
+      return 'shared artifact source metadata is invalid';
+    }
+    final dartVersion = releaseData['canonicalDartVersion'];
+    if (dartVersion is! String || !_readinessIsSemVersion(dartVersion)) {
+      return 'recorded Dart identity is missing';
+    }
+    return null;
+  }
+
+  String? _stampReadinessReason(
+    Directory release,
+    String engineRevision,
+    HostPlatform host,
+  ) {
+    for (final stamp in _readinessStampFiles(host)) {
+      final file = File(p.join(release.path, 'bin/cache', stamp));
+      if (!file.existsSync()) return 'Flutter cache stamp is missing: $stamp';
+      if (stamp != 'engine.realm' &&
+          file.readAsStringSync().trim() != engineRevision) {
+        return 'Flutter cache stamp does not match engine revision: $stamp';
+      }
+    }
+    return null;
+  }
+
+  HostPlatform? _hostFromIdentity(String? host, String? architecture) {
+    if (host == 'linux' && architecture == 'x64') return HostPlatform.linuxX64;
+    if (host == 'macos' && architecture == 'arm64') {
+      return HostPlatform.macosArm64;
+    }
+    return null;
+  }
+
+  int _readinessChannelOrder(String channel) => channel == 'stable' ? 0 : 1;
+
+  String _readinessVariant(HostPlatform host) =>
+      host == HostPlatform.linuxX64 ? 'linux-x64' : 'darwin-arm64';
+
+  List<String> _readinessStampFiles(HostPlatform host) => [
+    'engine-dart-sdk.stamp',
+    'engine.stamp',
+    'flutter_sdk.stamp',
+    if (host == HostPlatform.linuxX64) 'linux-sdk.stamp',
+    if (host == HostPlatform.macosArm64) 'macos-sdk.stamp',
+    'flutter_web_sdk.stamp',
+    'engine.realm',
+  ];
+
+  List<String> _readinessSourceArtifacts(HostPlatform host) => [
+    'bin/cache/dart-sdk',
+    'bin/cache/artifacts/engine/common',
+    if (host == HostPlatform.linuxX64) ...[
+      'bin/cache/artifacts/engine/linux-x64',
+      'bin/cache/artifacts/engine/linux-x64-profile',
+      'bin/cache/artifacts/engine/linux-x64-release',
+    ],
+    if (host == HostPlatform.macosArm64) ...[
+      'bin/cache/artifacts/engine/darwin-arm64',
+      'bin/cache/artifacts/engine/darwin-arm64-profile',
+      'bin/cache/artifacts/engine/darwin-arm64-release',
+    ],
+    'bin/cache/flutter_web_sdk',
+    'bin/cache/pkg/sky_engine',
+    'bin/cache/pkg/flutter_gpu',
+  ];
+
+  List<String> _readinessHostExecutables(HostPlatform host) =>
+      host == HostPlatform.linuxX64
+      ? const [
+          'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
+          'bin/cache/artifacts/engine/linux-x64/flutter_tester',
+        ]
+      : const ['bin/cache/artifacts/engine/darwin-arm64/gen_snapshot'];
+
+  String? _readinessMissingArtifact(String rootPath, HostPlatform host) {
+    final directories = <String>[
+      'bin/cache/artifacts/engine/common/flutter_patched_sdk',
+      'bin/cache/artifacts/engine/common/flutter_patched_sdk_product',
+      'bin/cache/flutter_web_sdk',
+      'bin/cache/pkg/sky_engine',
+      'bin/cache/pkg/flutter_gpu',
+      if (host == HostPlatform.linuxX64)
+        'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux',
+      if (host == HostPlatform.linuxX64)
+        'bin/cache/artifacts/engine/linux-x64-release/flutter_linux',
+      if (host == HostPlatform.macosArm64)
+        'bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework',
+      if (host == HostPlatform.macosArm64) 'bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework',
+      if (host == HostPlatform.macosArm64) 'bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework',
+    ];
+    final files = <String>[
+      _dartExecutable,
+      if (host == HostPlatform.linuxX64) ...[
+        'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
+        'bin/cache/artifacts/engine/linux-x64/flutter_tester',
+        'bin/cache/artifacts/engine/linux-x64/libflutter_linux_gtk.so',
+        'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux/libflutter_linux_gtk.so',
+        'bin/cache/artifacts/engine/linux-x64-release/flutter_linux/libflutter_linux_gtk.so',
+      ],
+      if (host == HostPlatform.macosArm64) ...[
+        'bin/cache/artifacts/engine/darwin-arm64/gen_snapshot',
+        'bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework/Info.plist',
+        'bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework/Info.plist',
+        'bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework/Info.plist',
+      ],
+    ];
+    for (final path in directories) {
+      if (FileSystemEntity.typeSync(
+            p.join(rootPath, path),
+            followLinks: true,
+          ) !=
+          FileSystemEntityType.directory) {
+        return path;
+      }
+    }
+    for (final path in files) {
+      if (FileSystemEntity.typeSync(
+            p.join(rootPath, path),
+            followLinks: true,
+          ) !=
+          FileSystemEntityType.file) {
+        return path;
+      }
+    }
+    return null;
+  }
+
+  bool _hasValidSourceInventory(Object? value) {
+    if (value is! List<Object?>) return false;
+    for (final entry in value) {
+      if (entry is! Map<String, Object?> ||
+          entry['path'] is! String ||
+          entry['sha256'] is! String ||
+          !RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(entry['sha256']! as String)) {
+        return false;
+      }
+      final path = p.normalize(entry['path']! as String);
+      if (p.isAbsolute(path) || p.split(path).contains('..')) return false;
+    }
+    return true;
+  }
+
+  bool _readinessIsSemVersion(String value) {
+    try {
+      Version.parse(value);
+      return true;
+    } on FormatException {
+      return false;
+    }
+  }
 
   Future<InstallResult> install(
     FlutterRelease release, {

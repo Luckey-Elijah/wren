@@ -151,7 +151,8 @@ Future<int> runWren(
   );
   final runner = WrenCommandRunner(context)
     ..addCommand(_ReleasesCommand(context))
-    ..addCommand(_InstallCommand(context));
+    ..addCommand(_InstallCommand(context))
+    ..addCommand(_ListCommand(context));
   return runner.run(arguments);
 }
 
@@ -246,6 +247,42 @@ class _InstallCommand extends WrenCommand {
     }
     final result = await context.installer.install(release, host: targetHost);
     writeOut(result.message);
+    return 0;
+  }
+}
+
+class _ListCommand extends WrenCommand {
+  _ListCommand(super.context);
+
+  @override
+  String get name => 'list';
+
+  @override
+  List<String> get aliases => const ['ls'];
+
+  @override
+  String get description => 'List installed Flutter releases and readiness.';
+
+  @override
+  Future<int> run() async {
+    if (argResults!.rest.isNotEmpty) {
+      failUsage('unexpected argument "${argResults!.rest.first}".');
+    }
+    final releases = await context.installer.listInstalled();
+    if (releases.isEmpty) {
+      writeOut('No Flutter releases are installed.');
+      return 0;
+    }
+    writeOut('Installed Flutter releases:');
+    for (final release in releases) {
+      final readiness = release.needsRepair ? 'needs repair' : 'ready';
+      final reason = release.repairReason == null
+          ? ''
+          : ' — ${release.repairReason}';
+      writeOut(
+        '${release.version}  ${release.channel}  ${release.host}  $readiness$reason',
+      );
+    }
     return 0;
   }
 }
