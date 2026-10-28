@@ -169,6 +169,197 @@ environment:
     });
   });
 
+  group('set and use', () {
+    late Directory temporaryDirectory;
+    late Directory projectDirectory;
+    late Directory dataDirectory;
+
+    setUp(() async {
+      temporaryDirectory = await Directory.systemTemp.createTemp('wren-set-');
+      projectDirectory = Directory('${temporaryDirectory.path}/project')
+        ..createSync();
+      dataDirectory = Directory('${temporaryDirectory.path}/data')
+        ..createSync();
+    });
+
+    tearDown(() async {
+      await temporaryDirectory.delete(recursive: true);
+    });
+
+    Future<int> runSet(
+      List<String> arguments, {
+      StringSink? stdout,
+      StringSink? stderr,
+      List<InstalledRelease>? installed,
+      WrenConfirmation? confirmation,
+      String? fallback,
+    }) => runWren(
+      arguments,
+      host: HostPlatform.linuxX64,
+      installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+      projectDirectory: projectDirectory,
+      installedReleases: installed ?? [_installed('3.47.8')],
+      confirmation: confirmation,
+      globalFallback: fallback,
+      stdoutSink: stdout ?? StringBuffer(),
+      stderrSink: stderr ?? StringBuffer(),
+    );
+
+    test(
+      'rewrites existing keys, preserves other YAML and reports active pick',
+      () async {
+        final pubspec = File('${projectDirectory.path}/pubspec.yaml');
+        await pubspec.writeAsString('''
+name: example
+environment:
+  flutter: ">=3.0.0 <4.0.0" # old Flutter range
+  sdk: ">=3.13.0 <4.0.0"
+dependencies:
+  path: ^1.9.0
+''');
+        final output = StringBuffer();
+
+        final status = await runSet(
+          ['set', '3.47.8'],
+          stdout: output,
+          installed: [
+            _installed('3.47.8'),
+            _installed('3.48.0', dartVersion: '3.13.8'),
+          ],
+        );
+
+        expect(status, 0);
+        final updated = await pubspec.readAsString();
+        expect(updated, contains('flutter: "^3.47.8" # old Flutter range'));
+        expect(updated, contains('sdk: "^3.13.7"'));
+        expect(updated, contains('dependencies:\n  path: ^1.9.0'));
+        expect(output.toString(), contains('>=3.0.0 <4.0.0 → ^3.47.8'));
+        expect(
+          output.toString(),
+          contains('Active Flutter release under normal selection: 3.48.0.'),
+        );
+        expect(File('${dataDirectory.path}/config.json').existsSync(), isFalse);
+      },
+    );
+
+    test(
+      'use alias updates only present keys and normalizes prerelease Dart',
+      () async {
+        final pubspec = File('${projectDirectory.path}/pubspec.yaml');
+        await pubspec.writeAsString('''
+environment:
+  sdk: ">=3.14.0 <4.0.0"
+''');
+        final output = StringBuffer();
+
+        final status = await runSet(
+          ['use', '3.50.0-0.2.pre'],
+          stdout: output,
+          installed: [
+            _installed(
+              '3.50.0-0.2.pre',
+              channel: 'beta',
+              dartVersion: '3.14.0-315.3.beta',
+            ),
+          ],
+        );
+
+        expect(status, 0);
+        final updated = await pubspec.readAsString();
+        expect(updated, isNot(contains('flutter:')));
+        expect(updated, contains('sdk: "^3.14.0-315.3.beta"'));
+        expect(output.toString(), contains('Updated environment.sdk'));
+      },
+    );
+
+    test(
+      'declining a Dart language change leaves pubspec and fallback alone',
+      () async {
+        final pubspec = File('${projectDirectory.path}/pubspec.yaml')
+          ..writeAsStringSync('''
+environment:
+  flutter: ^3.0.0
+  sdk: ^2.19.0
+''');
+        final original = pubspec.readAsStringSync();
+        final stderr = StringBuffer();
+
+        final status = await runSet(
+          ['set', '-g', '3.47.8'],
+          stderr: stderr,
+          confirmation: (_) async => false,
+        );
+
+        expect(status, 6);
+        expect(pubspec.readAsStringSync(), original);
+        expect(File('${dataDirectory.path}/config.json').existsSync(), isFalse);
+        expect(stderr.toString(), contains('cancelled; no changes were made'));
+      },
+    );
+
+    test('unavailable confirmation leaves both scopes unchanged', () async {
+      final pubspec = File('${projectDirectory.path}/pubspec.yaml')
+        ..writeAsStringSync('environment:\n  sdk: ^2.19.0\n');
+      final original = pubspec.readAsStringSync();
+      final stderr = StringBuffer();
+
+      final status = await runSet(
+        ['set', '-g', '3.47.8'],
+        stderr: stderr,
+        confirmation: (_) async => null,
+      );
+
+      expect(status, 6);
+      expect(pubspec.readAsStringSync(), original);
+      expect(File('${dataDirectory.path}/config.json').existsSync(), isFalse);
+      expect(stderr.toString(), contains('confirmation is unavailable'));
+    });
+
+    test('confirmed global set changes both pubspec and fallback', () async {
+      final pubspec = File('${projectDirectory.path}/pubspec.yaml')
+        ..writeAsStringSync('environment:\n  sdk: ^2.19.0\n');
+      File('${dataDirectory.path}/config.json')
+          .writeAsStringSync('{"someOtherPreference":true}');
+
+      final status = await runSet([
+        'set',
+        '-g',
+        '3.47.8',
+      ], confirmation: (_) async => true);
+
+      expect(status, 0);
+      expect(pubspec.readAsStringSync(), contains('sdk: "^3.13.7"'));
+      expect(
+        jsonDecode(
+          File('${dataDirectory.path}/config.json').readAsStringSync(),
+        ),
+        {'someOtherPreference': true, 'globalFallback': '3.47.8'},
+      );
+    });
+
+    test('global fallback can be set without a pubspec', () async {
+      final status = await runSet(['use', '-g', '3.47.8']);
+
+      expect(status, 0);
+      expect(
+        jsonDecode(
+          File('${dataDirectory.path}/config.json').readAsStringSync(),
+        ),
+        {'globalFallback': '3.47.8'},
+      );
+    });
+
+    test('ordinary set requires a current-directory pubspec', () async {
+      final stderr = StringBuffer();
+
+      final status = await runSet(['set', '3.47.8'], stderr: stderr);
+
+      expect(status, 4);
+      expect(stderr.toString(), contains('no pubspec.yaml'));
+      expect(File('${dataDirectory.path}/config.json').existsSync(), isFalse);
+    });
+  });
+
   group('wren releases', () {
     test(
       'SDK commands suggest set or install when no release is selected',

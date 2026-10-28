@@ -17,6 +17,9 @@ typedef SdkLauncher = Future<int> Function({
   required List<String> arguments,
 });
 
+/// Confirms a change that may alter the Dart language version.
+typedef WrenConfirmation = Future<bool?> Function(String message);
+
 const _minimumDartVersion = '2.19.0';
 const _linuxCatalog =
     'https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json';
@@ -37,6 +40,7 @@ class WrenContext {
     this.configuredInstallEnvironment,
     this.flutterReleaseOverride,
     this.globalFallbackOverride,
+    this.confirmation,
     this.projectDirectory,
     this.installedReleasesOverride,
     this.sdkLauncher,
@@ -60,7 +64,11 @@ class WrenContext {
   final String? flutterReleaseOverride;
 
   /// Optional global fallback override for local CLI fixture runs.
-  final String? globalFallbackOverride;
+  String? globalFallbackOverride;
+
+  /// Optional confirmation handler. A null result means confirmation is
+  /// unavailable, such as when the process is running without a terminal.
+  final WrenConfirmation? confirmation;
 
   /// Optional current directory for local CLI fixture runs.
   final io.Directory? projectDirectory;
@@ -129,6 +137,43 @@ class WrenContext {
       // An unreadable preference is treated as unset; doctor diagnoses it.
     }
     return null;
+  }
+
+  /// Persists [release] as the global fallback.
+  Future<void> setGlobalFallback(String release) async {
+    final config = io.File(
+      '${installEnvironment.dataDirectory.absolute.path}/config.json',
+    );
+    var values = <String, Object?>{};
+    if (config.existsSync()) {
+      final decoded = jsonDecode(config.readAsStringSync());
+      if (decoded is! Map<String, Object?>) {
+        throw const InstallException(
+          'Wren config.json must contain an object.',
+        );
+      }
+      values = Map<String, Object?>.from(decoded);
+    }
+    values['globalFallback'] = release;
+    config.parent.createSync(recursive: true);
+    _replaceFileAtomically(
+      config,
+      '${const JsonEncoder.withIndent('  ').convert(values)}\n',
+      temporarySuffix: '.tmp',
+    );
+    globalFallbackOverride = release;
+  }
+
+  /// Asks the user to confirm a language-version change.
+  Future<bool?> confirm(String message) async {
+    if (confirmation != null) return await confirmation!(message);
+    if (!io.stdin.hasTerminal) return null;
+    stderrSink
+      ..writeln(message)
+      ..write('Continue? [y/N] ');
+    final answer = io.stdin.readLineSync();
+    return answer != null &&
+        const {'y', 'yes'}.contains(answer.trim().toLowerCase());
   }
 
   /// Selects from only the current directory's pubspec and the global fallback.
@@ -360,6 +405,7 @@ Future<int> runWren(
   InstallEnvironment? installEnvironment,
   String? flutterReleaseOverride,
   String? globalFallback,
+  WrenConfirmation? confirmation,
   io.Directory? projectDirectory,
   List<InstalledRelease>? installedReleases,
   SdkLauncher? sdkLauncher,
@@ -373,6 +419,7 @@ Future<int> runWren(
     configuredInstallEnvironment: installEnvironment,
     flutterReleaseOverride: flutterReleaseOverride,
     globalFallbackOverride: globalFallback,
+    confirmation: confirmation,
     projectDirectory: projectDirectory,
     installedReleasesOverride: installedReleases,
     sdkLauncher: sdkLauncher,
@@ -382,6 +429,7 @@ Future<int> runWren(
     ..addCommand(_ReleasesCommand(context))
     ..addCommand(_InstallCommand(context))
     ..addCommand(_ListCommand(context))
+    ..addCommand(_SetCommand(context))
     ..addCommand(_FlutterCommand(context))
     ..addCommand(_DartCommand(context));
   return await runner.run(arguments);
@@ -518,6 +566,213 @@ class _ListCommand extends WrenCommand {
       );
     }
     return 0;
+  }
+}
+
+class _SetCommand extends WrenCommand {
+  new(super.context) {
+    argParser.addFlag(
+      'global',
+      abbr: 'g',
+      negatable: false,
+      help: 'Also set the global fallback.',
+    );
+  }
+
+  @override
+  String get name => 'set';
+
+  @override
+  List<String> get aliases => const ['use'];
+
+  @override
+  String get description =>
+      'Set project Flutter and Dart constraints and optionally the fallback.';
+
+  @override
+  Future<int> run() async {
+    if (argResults!.rest.length != 1) {
+      failUsage(
+        argResults!.rest.isEmpty
+            ? '`set` requires a Flutter release version.'
+            : 'unexpected argument "${argResults!.rest[1]}".',
+      );
+    }
+
+    final targetHost = context.host;
+    if (targetHost == null) {
+      writeError(
+        'wren: this host is unsupported. Wren supports Linux x86_64 and '
+        'macOS arm64.',
+      );
+      return 4;
+    }
+    final releaseVersion = argResults!.rest.single;
+    final installed =
+        context.installedReleasesOverride ??
+        await context.installer.listInstalled();
+    InstalledRelease? selected;
+    for (final release in installed) {
+      if (release.version == releaseVersion &&
+          release.host == targetHost.catalogOs &&
+          !release.needsRepair &&
+          release.dartVersion != null) {
+        selected = release;
+        break;
+      }
+    }
+    if (selected == null) {
+      writeError(
+        'wren: Flutter $releaseVersion is not an installed, ready release. '
+        'Run `wren install $releaseVersion` or `wren repair $releaseVersion`.',
+      );
+      return 4;
+    }
+
+    final projectDirectory = context.projectDirectory ?? io.Directory.current;
+    final pubspec = io.File('${projectDirectory.path}/pubspec.yaml');
+    final setGlobal = argResults!.flag('global');
+    if (!pubspec.existsSync() && !setGlobal) {
+      writeError('wren: no pubspec.yaml exists in the current directory.');
+      return 4;
+    }
+
+    var content = pubspec.existsSync() ? pubspec.readAsStringSync() : null;
+    var edits = <String, (String, String)>{};
+    var existingKeys = <String>{};
+    if (content != null) {
+      try {
+        final rewrite = _rewriteProjectConstraints(content, selected);
+        content = rewrite.content;
+        edits = rewrite.edits;
+        existingKeys = rewrite.existingKeys;
+      } on FormatException catch (error) {
+        writeError('wren: cannot update pubspec.yaml: ${error.message}');
+        return 4;
+      }
+    }
+
+    final sdkEdit = edits['sdk'];
+    if (sdkEdit != null &&
+        _changesDartLanguageVersion(sdkEdit.$1, selected.dartVersion!)) {
+      final confirmation = await context.confirm(
+        'Changing the Dart SDK lower bound from ${sdkEdit.$1} to ${sdkEdit.$2} '
+        'changes the Dart language version.',
+      );
+      if (confirmation != true) {
+        writeError(
+          confirmation == null
+              ? 'wren: confirmation is unavailable; no changes were made.'
+              : 'wren: cancelled; no changes were made.',
+        );
+        return 6;
+      }
+    }
+
+    if (content != null && content != pubspec.readAsStringSync()) {
+      _replaceFileAtomically(pubspec, content, temporarySuffix: '.wren.tmp');
+    }
+    if (setGlobal) await context.setGlobalFallback(selected.version);
+
+    for (final entry in edits.entries) {
+      writeOut(
+        'Updated environment.${entry.key}: ${entry.value.$1} '
+        '→ ${entry.value.$2}',
+      );
+    }
+    if (edits.isEmpty && pubspec.existsSync()) {
+      writeOut(
+        existingKeys.isEmpty
+            ? 'No existing environment.flutter or environment.sdk keys '
+                  'to update.'
+            : 'Existing Flutter and Dart constraints already match '
+                  'this release.',
+      );
+    }
+    if (setGlobal) {
+      writeOut('Global fallback set to Flutter ${selected.version}.');
+    }
+
+    final activeRelease = await context.selectProjectRelease(
+      targetHost,
+      installed,
+    );
+    writeOut(
+      activeRelease == null
+          ? 'No Flutter release is active under normal selection.'
+          : 'Active Flutter release under normal selection: $activeRelease.',
+    );
+    return 0;
+  }
+}
+
+void _replaceFileAtomically(
+  io.File destination,
+  String contents, {
+  required String temporarySuffix,
+}) {
+  io.File('${destination.path}$temporarySuffix')
+    ..writeAsStringSync(contents)
+    ..renameSync(destination.path);
+}
+
+({
+  String content,
+  Map<String, (String, String)> edits,
+  Set<String> existingKeys,
+})
+_rewriteProjectConstraints(String content, InstalledRelease release) {
+  final root = loadYamlNode(content);
+  if (root is! YamlMap) {
+    throw const FormatException('the document root must be a mapping');
+  }
+  final environment = root.nodes['environment'];
+  if (environment is! YamlMap) {
+    return (content: content, edits: {}, existingKeys: <String>{});
+  }
+
+  final versions = <String, String>{
+    'flutter': release.version,
+    'sdk': release.dartVersion!,
+  };
+  final replacements = <(int, int, String)>[];
+  final edits = <String, (String, String)>{};
+  final existingKeys = <String>{};
+  for (final entry in versions.entries) {
+    final node = environment.nodes[entry.key];
+    if (node == null) continue;
+    existingKeys.add(entry.key);
+    final oldValue = node.value.toString();
+    final newValue = '^${entry.value}';
+    if (oldValue == newValue) continue;
+    final start = node.span.start.offset;
+    final end = node.span.end.offset;
+    if (start < 0 || end < start || end > content.length) {
+      throw const FormatException('constraint source location is unavailable');
+    }
+    replacements.add((start, end, jsonEncode(newValue)));
+    edits[entry.key] = (oldValue, newValue);
+  }
+  replacements.sort((left, right) => right.$1.compareTo(left.$1));
+  var rewritten = content;
+  for (final (start, end, replacement) in replacements) {
+    rewritten = rewritten.replaceRange(start, end, replacement);
+  }
+  return (content: rewritten, edits: edits, existingKeys: existingKeys);
+}
+
+bool _changesDartLanguageVersion(String oldConstraint, String newVersion) {
+  final next = Version.parse(newVersion);
+  try {
+    final constraint = VersionConstraint.parse(oldConstraint);
+    final lowerBound = constraint is VersionRange ? constraint.min : null;
+    return lowerBound == null ||
+        lowerBound.major != next.major ||
+        lowerBound.minor != next.minor;
+  } on FormatException {
+    // An invalid existing lower bound cannot prove that the language version
+    // will remain stable, so require confirmation before replacing it.
+    return true;
   }
 }
 
