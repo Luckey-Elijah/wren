@@ -10,7 +10,11 @@ When a user invokes `to-spec`, synthesize the supplied decisions into `.scratch/
 
 ## Code task completion
 
-For tasks that change code, run `dart analyze` and `dart test` before reporting completion. If an environment issue prevents either check, report it and state that verification is incomplete.
+For tasks that change code, run `tool/verify.sh` before reporting completion. It checks formatting, analysis, and tests. If an environment issue prevents a check, report it and state that verification is incomplete.
+
+For independent Wren tickets worked in parallel, use a separate Git worktree for each task so edits, staging, and commits stay isolated.
+
+When searching bundled SDK or toolchain directories, restrict searches to relevant source extensions and exclude generated source maps.
 
 After completing and committing a Wren implementation ticket, verify each acceptance criterion, check off the criteria met, and change its status to `complete`. Leave unmet criteria unchecked and describe the remaining work.
 
