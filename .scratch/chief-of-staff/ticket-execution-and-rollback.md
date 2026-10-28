@@ -10,3 +10,6 @@
 - As of `wren@170729b`, ticket 04 was marked complete in its local issue file.
 - As of `wren@8695f60`, the typed CLI architecture ticket was marked complete in its local issue file.
 - As of `wren@d7cf34c`, `tool/verify.sh` runs formatting, analysis, and tests, and the checked-in Dart workflow invokes that script.
+- As of `wren@924f12a`, ticket 13 (“Repair a damaged retained source”) was complete with all five criteria checked.
+- As of `wren@28d8b6b`, ticket 25 (“Capture opt-in CLI performance traces”) was complete with all nine criteria checked.
+- The combined local branch passed `tool/verify.sh` on 2026-10-28 with 68 tests passing, no analyzer issues, and no formatting changes.
