@@ -6,7 +6,7 @@ import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:pub_semver/pub_semver.dart';
 
-import '../wren.dart' show FlutterRelease, HostPlatform;
+import 'package:wren/wren.dart' show FlutterRelease, HostPlatform;
 
 const _flutterGitUrl = 'https://github.com/flutter/flutter.git';
 const _engineRevisionPattern = r'^[a-fA-F0-9]{40}$';
@@ -61,7 +61,7 @@ List<String> _requiredFiles(HostPlatform host) => [
 
 List<String> _sourceStampFiles(HostPlatform host) => [
   ..._commonSourceStampFiles,
-  host == HostPlatform.linuxX64 ? 'linux-sdk.stamp' : 'macos-sdk.stamp',
+  if (host == HostPlatform.linuxX64) 'linux-sdk.stamp' else 'macos-sdk.stamp',
 ];
 
 List<String> _sourceArtifactPaths(HostPlatform host) => [
@@ -87,7 +87,7 @@ String _archiveVariant(HostPlatform host) =>
 
 List<String> _precacheArguments(HostPlatform host) => [
   'precache',
-  host == HostPlatform.linuxX64 ? '--linux' : '--macos',
+  if (host == HostPlatform.linuxX64) '--linux' else '--macos',
   '--web',
 ];
 
@@ -95,28 +95,41 @@ List<String> _precacheArguments(HostPlatform host) => [
 ///
 /// The optional values are also useful for exercising installs against a
 /// temporary Git repository without contacting GitHub.
+/// Provides the data directory and Flutter source repository for Wren.
 class InstallEnvironment {
-  InstallEnvironment({Directory? dataDirectory, Uri? flutterRepository})
+  /// Creates an environment with optional directory and repository overrides.
+  new({Directory? dataDirectory, Uri? flutterRepository})
     : dataDirectory = dataDirectory ?? _defaultDataDirectory(),
       flutterRepository = flutterRepository ?? Uri.parse(_flutterGitUrl);
 
+  /// Root directory for Wren-managed data.
   final Directory dataDirectory;
+
+  /// Git repository used to create Flutter release checkouts.
   final Uri flutterRepository;
 }
 
+/// Describes the result of a Flutter release installation.
 class InstallResult {
-  const InstallResult({required this.message, required this.alreadyInstalled});
+  /// Creates an installation result.
+  const new({required this.message, required this.alreadyInstalled});
 
+  /// User-facing result message.
   final String message;
+
+  /// Whether Wren reused an installation that was already ready.
   final bool alreadyInstalled;
 }
 
+/// Describes an installed Flutter release and its readiness.
 class InstalledRelease {
-  const InstalledRelease({
+  /// Creates a summary of an installed release.
+  const new({
     required this.channel,
     required this.version,
     required this.host,
     required this.needsRepair,
+    this.dartVersion,
     this.repairReason,
   });
 
@@ -128,6 +141,9 @@ class InstalledRelease {
 
   /// Host operating system associated with this installation.
   final String host;
+
+  /// Canonical bundled Dart version recorded at installation time.
+  final String? dartVersion;
 
   /// Whether a required file or identity check failed.
   final bool needsRepair;
@@ -185,7 +201,7 @@ class FlutterInstaller {
         continue;
       }
       final marker = File(p.join(entity.path, '.wren-release.json'));
-      if (!await marker.exists()) continue;
+      if (!marker.existsSync()) continue;
       final result = await _readiness(entity, releasesDirectory.parent);
       if (result == null) continue;
       installed.add(result);
@@ -402,7 +418,7 @@ class FlutterInstaller {
               reason = 'engine revision does not match its recorded identity';
             } else {
               final source = Directory(
-                p.join(root.path, 'sources', sourceKey as String),
+                p.join(root.path, 'sources', sourceKey! as String),
               );
               reason =
                   await _quickReadinessReason(
@@ -426,13 +442,12 @@ class FlutterInstaller {
       return _invalidRelease(release, reason);
     }
     final needsRepair = reason.isNotEmpty;
-    final updated = Map<String, Object?>.from(current);
+    final updated = Map<String, Object?>.from(current)
+      ..remove('readiness')
+      ..remove('readinessReason');
     if (needsRepair) {
       updated['readiness'] = 'needs-repair';
       updated['readinessReason'] = reason;
-    } else {
-      updated.remove('readiness');
-      updated.remove('readinessReason');
     }
     if (jsonEncode(updated) != jsonEncode(current)) {
       await _publishManifest(release.path, updated);
@@ -445,6 +460,7 @@ class FlutterInstaller {
       version: version,
       host: hostName,
       needsRepair: needsRepair,
+      dartVersion: current['canonicalDartVersion'] as String?,
       repairReason: needsRepair ? reason : null,
     );
   }
@@ -501,7 +517,7 @@ class FlutterInstaller {
       }
     }
     final sourceMarker = File(p.join(source.path, '.wren-source.json'));
-    if (!await sourceMarker.exists()) {
+    if (!sourceMarker.existsSync()) {
       return 'shared artifact source is missing';
     }
     try {
@@ -518,7 +534,7 @@ class FlutterInstaller {
         return 'shared artifact source metadata is incoherent';
       }
       for (final path in _readinessSourceArtifacts(host)) {
-        if (!await Directory(p.join(source.path, path)).exists()) {
+        if (!Directory(p.join(source.path, path)).existsSync()) {
           return 'shared artifact source is missing: $path';
         }
       }
@@ -532,7 +548,8 @@ class FlutterInstaller {
       ]) {
         final file = File(p.join(source.path, executable));
         if ((file.statSync().mode & 0x49) == 0) {
-          return 'shared artifact source executable is not runnable: $executable';
+          return 'shared artifact source executable is not runnable: '
+              '$executable';
         }
       }
       final stamps = metadata['stamps'];
@@ -658,19 +675,13 @@ class FlutterInstaller {
       ],
     ];
     for (final path in directories) {
-      if (FileSystemEntity.typeSync(
-            p.join(rootPath, path),
-            followLinks: true,
-          ) !=
+      if (FileSystemEntity.typeSync(p.join(rootPath, path)) !=
           FileSystemEntityType.directory) {
         return path;
       }
     }
     for (final path in files) {
-      if (FileSystemEntity.typeSync(
-            p.join(rootPath, path),
-            followLinks: true,
-          ) !=
+      if (FileSystemEntity.typeSync(p.join(rootPath, path)) !=
           FileSystemEntityType.file) {
         return path;
       }
@@ -702,6 +713,7 @@ class FlutterInstaller {
     }
   }
 
+  /// Installs [release] for [host] and returns its published result.
   Future<InstallResult> install(
     FlutterRelease release, {
     required HostPlatform host,
@@ -742,7 +754,7 @@ class FlutterInstaller {
         );
       }
 
-      if (await Directory(releasePath).exists()) {
+      if (Directory(releasePath).existsSync()) {
         await _removeIncompleteWorktree(releasePath, root);
       }
       await Directory(releasePath).parent.create(recursive: true);
@@ -754,8 +766,8 @@ class FlutterInstaller {
       var sourceCreated = false;
       var checkoutPublished = false;
       var worktreeCreated = false;
-      if (await stagingRoot.exists()) {
-        if (await Directory(p.join(root.path, 'flutter.git')).exists()) {
+      if (stagingRoot.existsSync()) {
+        if (Directory(p.join(root.path, 'flutter.git')).existsSync()) {
           await _discardWorktree(root, checkoutStage.path);
         }
         await stagingRoot.delete(recursive: true);
@@ -807,7 +819,8 @@ class FlutterInstaller {
         ], userMessage: 'could not verify the Flutter release tag');
         if (releaseTag != release.version) {
           throw InstallException(
-            'Flutter revision $checkoutRevision is not tagged as ${release.version}.',
+            'Flutter revision $checkoutRevision is not tagged as '
+            '${release.version}.',
           );
         }
         final engineRevision = (await File(
@@ -815,7 +828,8 @@ class FlutterInstaller {
         ).readAsString()).trim();
         if (!RegExp(_engineRevisionPattern).hasMatch(engineRevision)) {
           throw const InstallException(
-            'the selected Flutter checkout has a missing or invalid engine revision.',
+            'the selected Flutter checkout has a missing or invalid engine '
+            'revision.',
           );
         }
         final resolvedSourceKey = _sourceKey(engineRevision, host);
@@ -833,7 +847,7 @@ class FlutterInstaller {
         try {
           var artifactsPrepared = false;
           final sourceDirectory = Directory(resolvedSourcePath);
-          if (await sourceDirectory.exists()) {
+          if (sourceDirectory.existsSync()) {
             await _validateSource(
               sourceDirectory,
               engineRevision: engineRevision,
@@ -939,7 +953,7 @@ class FlutterInstaller {
         if (!ready) {
           if (checkoutPublished) {
             await _discardWorktree(root, releasePath);
-            if (await Directory(releasePath).exists()) {
+            if (Directory(releasePath).existsSync()) {
               await Directory(releasePath).delete(recursive: true);
             }
           } else if (worktreeCreated) {
@@ -947,11 +961,11 @@ class FlutterInstaller {
           }
           if (sourceCreated &&
               sourcePath != null &&
-              await Directory(sourcePath).exists()) {
+              Directory(sourcePath).existsSync()) {
             await Directory(sourcePath).delete(recursive: true);
           }
         }
-        if (await stagingRoot.exists()) {
+        if (stagingRoot.existsSync()) {
           await stagingRoot.delete(recursive: true);
         }
       }
@@ -977,13 +991,13 @@ class FlutterInstaller {
 
   Future<void> _ensureSharedRepository(Directory root) async {
     final repository = Directory(p.join(root.path, 'flutter.git'));
-    if (await repository.exists()) return;
+    if (repository.existsSync()) return;
     await repository.parent.create(recursive: true);
     final stagingRepository = Directory(
       p.join(root.path, 'staging', 'flutter-repo'),
     );
     await stagingRepository.parent.create(recursive: true);
-    if (await stagingRepository.exists()) {
+    if (stagingRepository.existsSync()) {
       await stagingRepository.delete(recursive: true);
     }
     await _runGit(root, [
@@ -1002,7 +1016,7 @@ class FlutterInstaller {
     try {
       await stagingRepository.rename(repository.path);
     } catch (_) {
-      if (await repository.exists()) {
+      if (repository.existsSync()) {
         await stagingRepository.delete(recursive: true);
       } else {
         rethrow;
@@ -1055,7 +1069,7 @@ class FlutterInstaller {
       workingDirectory: checkout.path,
       userMessage: 'the installed Flutter tool did not run',
     );
-    final versionData = _decodeVersionOutput(flutter.stdout);
+    final versionData = _decodeVersionOutput('${flutter.stdout}');
     // Flutter reports [user-branch] for a detached worktree. Its framework
     // revision and release tag are still checked against the catalog below.
     final reportedChannel = versionData['channel'];
@@ -1098,7 +1112,7 @@ class FlutterInstaller {
         'the release catalog specifies ${release.dartVersion}.',
       );
     }
-    final reportedDartHost = RegExp(r'on "([^"]+)"')
+    final reportedDartHost = RegExp('on "([^"]+)"')
         .firstMatch(dartOutput)
         ?.group(1);
     final expectedDartHost = host == HostPlatform.linuxX64
@@ -1118,7 +1132,7 @@ class FlutterInstaller {
     HostPlatform host,
   ) async {
     final marker = File(p.join(releasePath, '.wren-release.json'));
-    if (!await marker.exists()) return _ExistingInstall.incomplete;
+    if (!marker.existsSync()) return _ExistingInstall.incomplete;
     try {
       final data =
           jsonDecode(await marker.readAsString()) as Map<String, Object?>;
@@ -1152,7 +1166,7 @@ class FlutterInstaller {
     final stampFiles = _sourceStampFiles(host);
     for (final relativePath in artifactPaths) {
       final source = Directory(p.join(checkout.path, relativePath));
-      if (!await source.exists()) {
+      if (!source.existsSync()) {
         throw InstallException(
           'cannot retain missing shared artifact $relativePath.',
         );
@@ -1163,7 +1177,7 @@ class FlutterInstaller {
       );
     }
     for (final relativePath in artifactPaths) {
-      if (!await Directory(p.join(sourceStage.path, relativePath)).exists()) {
+      if (!Directory(p.join(sourceStage.path, relativePath)).existsSync()) {
         throw InstallException(
           'shared artifact source is incomplete at $relativePath.',
         );
@@ -1172,7 +1186,7 @@ class FlutterInstaller {
     final stamps = <String, String>{};
     for (final relativePath in stampFiles) {
       final stamp = File(p.join(checkout.path, 'bin/cache', relativePath));
-      if (await stamp.exists()) {
+      if (stamp.existsSync()) {
         stamps[relativePath] = await stamp.readAsString();
       }
     }
@@ -1208,7 +1222,7 @@ class FlutterInstaller {
     required HostPlatform host,
   }) async {
     final marker = File(p.join(source.path, '.wren-source.json'));
-    if (!await marker.exists()) {
+    if (!marker.existsSync()) {
       throw const InstallException(
         'the retained host artifact source is damaged.',
       );
@@ -1229,7 +1243,7 @@ class FlutterInstaller {
         );
       }
       for (final relativePath in artifactPaths) {
-        if (!await Directory(p.join(source.path, relativePath)).exists()) {
+        if (!Directory(p.join(source.path, relativePath)).existsSync()) {
           throw const InstallException(
             'the retained host artifact source is damaged.',
           );
@@ -1244,10 +1258,9 @@ class FlutterInstaller {
       final stamps = data['stamps'];
       if (stamps is! Map<String, Object?> ||
           stamps.keys.toSet().difference(stampFiles.toSet()).isNotEmpty ||
-          stamps.keys.toSet().containsAll(
-                stampFiles.where((path) => path != 'engine.realm'),
-              ) ==
-              false ||
+          !stamps.keys.toSet().containsAll(
+            stampFiles.where((path) => path != 'engine.realm'),
+          ) ||
           stampFiles
               .where((path) => path != 'engine.realm')
               .any((path) => '${stamps[path]}'.trim() != engineRevision) ||
@@ -1275,16 +1288,16 @@ class FlutterInstaller {
     ) as Map<String, Object?>;
     for (final relativePath in _sourceArtifactPaths(host)) {
       final destination = Directory(p.join(checkout.path, relativePath));
-      if (await destination.exists()) await destination.delete(recursive: true);
+      if (destination.existsSync()) await destination.delete(recursive: true);
       await _copyTree(
         Directory(p.join(source.path, relativePath)),
         destination,
       );
     }
-    final stamps = data['stamps'] as Map<String, Object?>;
+    final stamps = data['stamps']! as Map<String, Object?>;
     for (final entry in stamps.entries) {
       await File(p.join(checkout.path, 'bin/cache', entry.key))
-          .writeAsString(entry.value as String, flush: true);
+          .writeAsString(entry.value! as String, flush: true);
     }
   }
 
@@ -1300,10 +1313,10 @@ class FlutterInstaller {
   }
 
   Future<void> _removeIncompleteWorktree(String path, Directory root) async {
-    if (await Directory(p.join(root.path, 'flutter.git')).exists()) {
+    if (Directory(p.join(root.path, 'flutter.git')).existsSync()) {
       await _discardWorktree(root, path);
     }
-    if (await Directory(path).exists()) {
+    if (Directory(path).existsSync()) {
       await Directory(path).delete(recursive: true);
     }
   }
@@ -1321,7 +1334,7 @@ class FlutterInstaller {
         '--force',
         path,
       ]);
-      if (result.exitCode != 0 && await Directory(path).exists()) {
+      if (result.exitCode != 0 && Directory(path).existsSync()) {
         await Directory(path).delete(recursive: true);
       }
       await Process.run('git', [
@@ -1427,19 +1440,13 @@ List<String> _hostExecutables(HostPlatform host) =>
 
 String? _missingRequiredArtifact(String rootPath, HostPlatform host) {
   for (final relativePath in _requiredDirectories(host)) {
-    if (FileSystemEntity.typeSync(
-          p.join(rootPath, relativePath),
-          followLinks: true,
-        ) !=
+    if (FileSystemEntity.typeSync(p.join(rootPath, relativePath)) !=
         FileSystemEntityType.directory) {
       return relativePath;
     }
   }
   for (final relativePath in _requiredFiles(host)) {
-    if (FileSystemEntity.typeSync(
-          p.join(rootPath, relativePath),
-          followLinks: true,
-        ) !=
+    if (FileSystemEntity.typeSync(p.join(rootPath, relativePath)) !=
         FileSystemEntityType.file) {
       return relativePath;
     }
@@ -1503,7 +1510,7 @@ Future<Directory> _acquireLock(
       await File(p.join(lock.path, 'owner')).writeAsString('$pid\n');
       return lock;
     } on FileSystemException {
-      if (!await lock.exists()) rethrow;
+      if (!lock.existsSync()) rethrow;
       if (await _isStaleLock(lock)) {
         try {
           await lock.delete(recursive: true);
@@ -1526,9 +1533,9 @@ Future<Directory> _acquireLock(
 
 Future<bool> _isStaleLock(Directory lock) async {
   final ownerFile = File(p.join(lock.path, 'owner'));
-  final modified = (await lock.stat()).modified;
+  final modified = lock.statSync().modified;
   final age = DateTime.now().difference(modified);
-  if (!await ownerFile.exists()) return age > const Duration(seconds: 3);
+  if (!ownerFile.existsSync()) return age > const Duration(seconds: 3);
   final ownerPid = int.tryParse((await ownerFile.readAsString()).trim());
   if (ownerPid == null) return age > const Duration(seconds: 3);
   final probe = await Process.run('kill', ['-0', '$ownerPid']);
@@ -1536,7 +1543,7 @@ Future<bool> _isStaleLock(Directory lock) async {
 }
 
 Future<void> _releaseLock(Directory lock) async {
-  if (await lock.exists()) await lock.delete(recursive: true);
+  if (lock.existsSync()) await lock.delete(recursive: true);
 }
 
 Future<void> _copyTree(
@@ -1572,10 +1579,7 @@ Future<void> _copyTree(
         case FileSystemEntityType.link:
           final link = Link(entity.path);
           final resolvedTarget = await link.resolveSymbolicLinks();
-          switch (FileSystemEntity.typeSync(
-            resolvedTarget,
-            followLinks: true,
-          )) {
+          switch (FileSystemEntity.typeSync(resolvedTarget)) {
             case FileSystemEntityType.directory:
               await _copyTree(
                 Directory(resolvedTarget),
@@ -1584,20 +1588,20 @@ Future<void> _copyTree(
               );
             case FileSystemEntityType.file:
               await File(resolvedTarget).copy(targetPath);
-            default:
+            case FileSystemEntityType.notFound:
+            case FileSystemEntityType.link:
+            case FileSystemEntityType.pipe:
+            case FileSystemEntityType.unixDomainSock:
               throw FileSystemException(
                 'artifact link target is not a file or directory',
                 entity.path,
               );
           }
         case FileSystemEntityType.notFound:
+        case FileSystemEntityType.pipe:
+        case FileSystemEntityType.unixDomainSock:
           throw FileSystemException(
             'artifact disappeared while copying',
-            entity.path,
-          );
-        default:
-          throw FileSystemException(
-            'unsupported artifact file type',
             entity.path,
           );
       }
@@ -1627,7 +1631,7 @@ Future<bool> _copyWithReflink(Directory source, Directory destination) async {
     return false;
   }
   if (result.exitCode == 0) return true;
-  if (await destination.exists()) await destination.delete(recursive: true);
+  if (destination.existsSync()) await destination.delete(recursive: true);
   return false;
 }
 
@@ -1644,7 +1648,8 @@ void _validatePrivateCacheBoundary(Directory checkout, Directory root) {
     );
     if (p.isWithin(sharedSources, resolved)) {
       throw InstallException(
-        'private Flutter cache path ${entity.path} links into the shared artifact source.',
+        'private Flutter cache path ${entity.path} links into the shared '
+        'artifact source.',
       );
     }
   }

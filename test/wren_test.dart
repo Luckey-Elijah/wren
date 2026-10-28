@@ -1,24 +1,196 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:test/test.dart';
 import 'package:wren/wren.dart';
 
 void main() {
-  group('wren releases', () {
-    test('SDK commands require an exact installed release', () async {
-      final stderr = StringBuffer();
+  group('release selection', () {
+    late Directory temporaryDirectory;
+    late Directory projectDirectory;
+    late Directory dataDirectory;
 
+    setUp(() async {
+      temporaryDirectory = await Directory.systemTemp.createTemp(
+        'wren-select-',
+      );
+      projectDirectory = Directory('${temporaryDirectory.path}/project')
+        ..createSync();
+      dataDirectory = Directory('${temporaryDirectory.path}/data')
+        ..createSync();
+    });
+
+    tearDown(() async {
+      await temporaryDirectory.delete(recursive: true);
+    });
+
+    Future<(int, String?)> runFlutter({
+      required List<InstalledRelease> installed,
+      String? fallback,
+    }) async {
+      String? selected;
       final status = await runWren(
-        ['flutter', '--version'],
+        ['flutter'],
         host: HostPlatform.linuxX64,
+        installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+        projectDirectory: projectDirectory,
+        installedReleases: installed,
+        globalFallback: fallback,
         stdoutSink: StringBuffer(),
-        stderrSink: stderr,
+        stderrSink: StringBuffer(),
+        sdkLauncher:
+            ({
+              required release,
+              required executable,
+              required arguments,
+            }) async {
+              selected = release;
+              return 0;
+            },
+      );
+      return (status, selected);
+    }
+
+    test('chooses newest stable release satisfying both constraints', () async {
+      await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: ">=3.45.0 <3.50.0"
+  sdk: ">=3.12.0 <3.14.0"
+''');
+
+      final (status, selected) = await runFlutter(
+        installed: [
+          _installed('3.47.8'),
+          _installed('3.49.0', dartVersion: '3.14.0'),
+          _installed('3.46.0', dartVersion: '3.12.0'),
+        ],
       );
 
-      expect(status, 3);
-      expect(stderr.toString(), contains('No Flutter release is selected'));
-      expect(stderr.toString(), contains('wren install'));
+      expect(status, 0);
+      expect(selected, '3.47.8');
     });
+
+    test('beta needs prerelease constraints for Flutter and Dart', () async {
+      await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: "^3.50.0-0.2.pre"
+  sdk: "^3.14.0-315.3.beta"
+''');
+
+      final (betaStatus, selected) = await runFlutter(
+        installed: [
+          _installed(
+            '3.50.0-0.2.pre',
+            channel: 'beta',
+            dartVersion: '3.14.0-315.3.beta',
+          ),
+        ],
+      );
+      expect(betaStatus, 0);
+      expect(selected, '3.50.0-0.2.pre');
+
+      await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: ">=3.50.0"
+  sdk: ">=3.14.0"
+''');
+      final (stableStatus, stableSelected) = await runFlutter(
+        fallback: '3.47.8',
+        installed: [
+          _installed(
+            '3.50.0-0.2.pre',
+            channel: 'beta',
+            dartVersion: '3.14.0-315.3.beta',
+          ),
+        ],
+      );
+      expect(stableStatus, 0);
+      expect(stableSelected, '3.47.8');
+    });
+
+    test('missing or malformed constraints use the global fallback', () async {
+      final installed = [_installed('3.47.8')];
+      expect(
+        (await runFlutter(fallback: '3.46.0', installed: installed)).$2,
+        '3.46.0',
+      );
+
+      await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment: [malformed
+''');
+      expect(
+        (await runFlutter(fallback: '3.46.0', installed: installed)).$2,
+        '3.46.0',
+      );
+
+      await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: ">=3.0.0"
+''');
+      expect(
+        (await runFlutter(fallback: '3.46.0', installed: installed)).$2,
+        '3.46.0',
+      );
+    });
+
+    test(
+      'reads the persisted global fallback after project mismatch',
+      () async {
+        await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: "^3.50.0"
+  sdk: "^3.14.0"
+''');
+        await File('${dataDirectory.path}/config.json')
+            .writeAsString(jsonEncode({'globalFallback': '3.47.8'}));
+
+        final (status, selected) = await runFlutter(
+          installed: [_installed('3.47.8')],
+        );
+        expect(status, 0);
+        expect(selected, '3.47.8');
+      },
+    );
+
+    test('does not discover a parent directory pubspec', () async {
+      final parent = projectDirectory.parent;
+      await File('${parent.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: "^3.47.0"
+  sdk: "^3.13.0"
+''');
+
+      final (status, selected) = await runFlutter(
+        fallback: '3.46.0',
+        installed: [_installed('3.47.8')],
+      );
+      expect(status, 0);
+      expect(selected, '3.46.0');
+    });
+  });
+
+  group('wren releases', () {
+    test(
+      'SDK commands suggest set or install when no release is selected',
+      () async {
+        final stderr = StringBuffer();
+
+        final status = await runWren(
+          ['flutter', '--version'],
+          host: HostPlatform.linuxX64,
+          stdoutSink: StringBuffer(),
+          stderrSink: stderr,
+        );
+
+        expect(status, 3);
+        expect(
+          stderr.toString(),
+          contains('No installed Flutter release matches this project'),
+        );
+        expect(stderr.toString(), contains('wren set <release>'));
+        expect(stderr.toString(), contains('wren install'));
+      },
+    );
 
     test(
       'missing exact CLI selection does not fall back to environment',
@@ -300,7 +472,6 @@ void main() {
         final result = ReleaseCatalog.eligibilityFor(
           _release(
             archive: 'stable/macos/flutter_macos_arm64_3.47.8-stable.zip',
-            dartArchitecture: 'x64',
           ),
           host: HostPlatform.macosArm64,
         );
@@ -346,6 +517,20 @@ List<Map<String, Object?>> _fixtureReleases() => [
     dartArchitecture: 'arm64',
   ),
 ];
+
+InstalledRelease _installed(
+  String version, {
+  String channel = 'stable',
+  String dartVersion = '3.13.7',
+  String host = 'linux',
+  bool needsRepair = false,
+}) => InstalledRelease(
+  channel: channel,
+  version: version,
+  host: host,
+  dartVersion: dartVersion,
+  needsRepair: needsRepair,
+);
 
 Map<String, Object?> _release({
   String channel = 'stable',

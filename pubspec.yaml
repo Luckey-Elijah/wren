@@ -12,7 +12,8 @@ dependencies:
   crypto: ^3.0.8
   path: ^1.9.0
   pub_semver: ^2.2.0
+  yaml: ^3.1.4
 
 dev_dependencies:
-  lints: ^6.0.0
   test: ^1.25.6
+  very_good_analysis: ^11.0.0

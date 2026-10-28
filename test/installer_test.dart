@@ -7,8 +7,8 @@ import 'package:wren/wren.dart';
 
 const _version = '3.47.8';
 const _dartVersion = '3.13.7';
-final _engineRevision = List<String>.filled(40, 'e').join();
-final _archiveDigest = List<String>.filled(64, 'a').join();
+final String _engineRevision = List<String>.filled(40, 'e').join();
+final String _archiveDigest = List<String>.filled(64, 'a').join();
 
 void main() {
   group('wren install', () {
@@ -779,7 +779,7 @@ printf '\376\000\n' >&2
 
       expect(status, 4);
       expect(stderr.toString(), contains('bundled Dart version is missing'));
-      expect(await dataDirectory.exists(), isFalse);
+      expect(dataDirectory.existsSync(), isFalse);
     });
   });
 }
@@ -836,14 +836,16 @@ Future<void> _writeFixtureSdk(
   final frameworkArtifact = isLinux
       ? 'bin/cache/artifacts/engine/$hostArtifactRoot/libflutter_linux_gtk.so'
       : 'bin/cache/artifacts/engine/$hostArtifactRoot/FlutterMacOS.xcframework/Info.plist';
-  if (await Directory(p.join(root.path, 'bin/cache')).exists()) {
+  if (Directory(p.join(root.path, 'bin/cache')).existsSync()) {
     await Directory(p.join(root.path, 'bin/cache')).delete(recursive: true);
   }
   await Directory(p.join(root.path, 'bin/internal')).create(recursive: true);
   await File(p.join(root.path, 'bin/internal/engine.version'))
       .writeAsString('$_engineRevision\n');
   final flutter = File(p.join(root.path, 'bin/flutter'));
-  await flutter.writeAsString('''#!/bin/sh
+  await flutter.writeAsString(
+    '''
+#!/bin/sh
 set -eu
 if [ "\$1" = "precache" ]; then
   if [ "\$2" != "$precacheFlag" ] || [ "\$3" != "--web" ]; then
@@ -907,7 +909,9 @@ if [ "\$1" = "--version" ]; then
 fi
 echo "unexpected fake Flutter arguments" >&2
 exit 19
-''');
+'''
+        .trimLeft(),
+  );
   await Process.run('chmod', ['+x', flutter.path]);
 }
 

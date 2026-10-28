@@ -4,11 +4,18 @@ import 'dart:io' as io;
 
 import 'package:args/command_runner.dart';
 import 'package:pub_semver/pub_semver.dart';
-
-import 'src/installer.dart';
+import 'package:wren/src/installer.dart';
+import 'package:yaml/yaml.dart';
 
 export 'src/installer.dart'
-    show InstallEnvironment, InstallException, InstallResult;
+    show InstallEnvironment, InstallException, InstallResult, InstalledRelease;
+
+/// Testable SDK launch boundary used by [WrenContext].
+typedef SdkLauncher = Future<int> Function({
+  required String release,
+  required String executable,
+  required List<String> arguments,
+});
 
 const _minimumDartVersion = '2.19.0';
 const _linuxCatalog =
@@ -29,6 +36,10 @@ class WrenContext {
     this.hostOverride,
     this.configuredInstallEnvironment,
     this.flutterReleaseOverride,
+    this.globalFallbackOverride,
+    this.projectDirectory,
+    this.installedReleasesOverride,
+    this.sdkLauncher,
     this.stdinStream,
   }) : _stdoutSink = stdoutSink ?? io.stdout,
        _stderrSink = stderrSink ?? io.stderr;
@@ -47,6 +58,18 @@ class WrenContext {
 
   /// Optional environment override for selecting a Flutter release.
   final String? flutterReleaseOverride;
+
+  /// Optional global fallback override for local CLI fixture runs.
+  final String? globalFallbackOverride;
+
+  /// Optional current directory for local CLI fixture runs.
+  final io.Directory? projectDirectory;
+
+  /// Optional installed-release list for local CLI fixture runs.
+  final List<InstalledRelease>? installedReleasesOverride;
+
+  /// Optional SDK process launcher for local CLI fixture runs.
+  final SdkLauncher? sdkLauncher;
 
   /// Input forwarded to SDK processes; defaults to the current process stdin.
   final Stream<List<int>>? stdinStream;
@@ -88,6 +111,121 @@ class WrenContext {
       catalogJson == null
       ? ReleaseCatalog.fetch(targetHost.catalogUri, host: targetHost)
       : Future.value(ReleaseCatalog.parse(catalogJson!, host: targetHost));
+
+  /// Global fallback configured by `set -g`, if any.
+  Future<String?> get globalFallback async {
+    if (globalFallbackOverride != null) return globalFallbackOverride;
+    final config = io.File(
+      '${installEnvironment.dataDirectory.absolute.path}/config.json',
+    );
+    if (!config.existsSync()) return null;
+    try {
+      final decoded = jsonDecode(config.readAsStringSync());
+      if (decoded is Map<String, Object?> &&
+          decoded['globalFallback'] is String) {
+        return (decoded['globalFallback']! as String).trim();
+      }
+    } on Object {
+      // An unreadable preference is treated as unset; doctor diagnoses it.
+    }
+    return null;
+  }
+
+  /// Selects from only the current directory's pubspec and the global fallback.
+  Future<String?> selectProjectRelease(
+    HostPlatform host,
+    List<InstalledRelease> installed,
+  ) async {
+    final project = projectDirectory ?? io.Directory.current;
+    final pubspec = io.File('${project.path}/pubspec.yaml');
+    if (pubspec.existsSync()) {
+      try {
+        final yaml = loadYaml(pubspec.readAsStringSync());
+        final environment = yaml is YamlMap ? yaml['environment'] : null;
+        final flutterText = environment is YamlMap
+            ? environment['flutter']
+            : null;
+        final dartText = environment is YamlMap ? environment['sdk'] : null;
+        if (flutterText is String && dartText is String) {
+          final flutterConstraint = VersionConstraint.parse(flutterText);
+          final dartConstraint = VersionConstraint.parse(dartText);
+          final matching =
+              installed.where((release) {
+                if (release.host != host.catalogOs ||
+                    release.dartVersion == null) {
+                  return false;
+                }
+                try {
+                  final flutterVersion = Version.parse(release.version);
+                  final dartVersion = Version.parse(release.dartVersion!);
+                  final constraintsMatch =
+                      flutterConstraint.allows(flutterVersion) &&
+                      dartConstraint.allows(dartVersion);
+                  final betaExplicitlyAllowed =
+                      release.channel != 'beta' ||
+                      (_explicitlyAllowsPrerelease(
+                            flutterText,
+                            flutterVersion,
+                          ) &&
+                          _explicitlyAllowsPrerelease(dartText, dartVersion));
+                  return constraintsMatch && betaExplicitlyAllowed;
+                } on FormatException {
+                  return false;
+                }
+              }).toList()..sort(
+                (left, right) =>
+                    Version.parse(right.version)
+                        .compareTo(Version.parse(left.version)),
+              );
+          if (matching.isNotEmpty) return matching.first.version;
+        }
+      } on Object {
+        // Missing, malformed, or invalid constraints leave fallback eligible.
+      }
+    }
+    final fallback = await globalFallback;
+    return fallback == null || fallback.isEmpty ? null : fallback;
+  }
+
+  /// Starts the selected SDK command.
+  Future<int> launchSdk(
+    String release, {
+    required HostPlatform host,
+    required String executable,
+    required List<String> arguments,
+  }) =>
+      sdkLauncher?.call(
+        release: release,
+        executable: executable,
+        arguments: arguments,
+      ) ??
+      installer.launch(
+        release,
+        host: host,
+        executable: executable,
+        arguments: arguments,
+        stdoutSink: stdoutSink,
+        stderrSink: stderrSink,
+        stdoutByteSink: stdoutByteSink,
+        stderrByteSink: stderrByteSink,
+        stdinStream: stdinStream ?? io.stdin,
+      );
+}
+
+bool _explicitlyAllowsPrerelease(String constraint, Version version) {
+  if (!version.isPreRelease) return true;
+  final prereleaseVersion = RegExp(r'\d+\.\d+\.\d+-[0-9A-Za-z.-]+')
+      .allMatches(constraint);
+  return prereleaseVersion.any((match) {
+    try {
+      final bound = Version.parse(match.group(0)!);
+      return bound.major == version.major &&
+          bound.minor == version.minor &&
+          bound.patch == version.patch;
+    } on FormatException {
+      return false;
+    }
+  });
 }
 
 /// Wren-specific command base with shared output, verbosity and context.
@@ -221,6 +359,10 @@ Future<int> runWren(
   HostPlatform? host,
   InstallEnvironment? installEnvironment,
   String? flutterReleaseOverride,
+  String? globalFallback,
+  io.Directory? projectDirectory,
+  List<InstalledRelease>? installedReleases,
+  SdkLauncher? sdkLauncher,
   Stream<List<int>>? stdinStream,
 }) async {
   final context = WrenContext(
@@ -230,6 +372,10 @@ Future<int> runWren(
     hostOverride: host,
     configuredInstallEnvironment: installEnvironment,
     flutterReleaseOverride: flutterReleaseOverride,
+    globalFallbackOverride: globalFallback,
+    projectDirectory: projectDirectory,
+    installedReleasesOverride: installedReleases,
+    sdkLauncher: sdkLauncher,
     stdinStream: stdinStream,
   );
   final runner = WrenCommandRunner(context)
@@ -260,7 +406,8 @@ class _ReleasesCommand extends WrenCommand {
     final targetHost = context.host;
     if (targetHost == null) {
       writeError(
-        'wren: this host is unsupported. Wren supports Linux x86_64 and macOS arm64.',
+        'wren: this host is unsupported. Wren supports Linux x86_64 and '
+        'macOS arm64.',
       );
       return 4;
     }
@@ -296,7 +443,7 @@ class _ReleasesCommand extends WrenCommand {
 }
 
 class _InstallCommand extends WrenCommand {
-  _InstallCommand(super.context);
+  new(super.context);
 
   @override
   String get name => 'install';
@@ -316,7 +463,8 @@ class _InstallCommand extends WrenCommand {
     final targetHost = context.host;
     if (targetHost == null) {
       writeError(
-        'wren: this host is unsupported. Wren supports Linux x86_64 and macOS arm64.',
+        'wren: this host is unsupported. Wren supports Linux x86_64 and '
+        'macOS arm64.',
       );
       return 4;
     }
@@ -337,7 +485,7 @@ class _InstallCommand extends WrenCommand {
 }
 
 class _ListCommand extends WrenCommand {
-  _ListCommand(super.context);
+  new(super.context);
 
   @override
   String get name => 'list';
@@ -365,7 +513,8 @@ class _ListCommand extends WrenCommand {
           ? ''
           : ' — ${release.repairReason}';
       writeOut(
-        '${release.version}  ${release.channel}  ${release.host}  $readiness$reason',
+        '${release.version}  ${release.channel}  ${release.host}  '
+        '$readiness$reason',
       );
     }
     return 0;
@@ -390,7 +539,7 @@ abstract class _SdkCommand extends WrenCommand {
   String get description => 'Run the selected Flutter SDK $name executable.';
 
   @override
-  Future<int> run() {
+  Future<int> run() async {
     final targetHost = context.host;
     if (targetHost == null) {
       throw const SdkLaunchException(
@@ -407,36 +556,44 @@ abstract class _SdkCommand extends WrenCommand {
     final release = cliRelease != null
         ? cliRelease.trim()
         : environmentRelease?.trim();
-    if (release == null || release.isEmpty) {
+    final hasExactOverride =
+        cliRelease != null || (environmentRelease?.trim().isNotEmpty ?? false);
+    final selectedRelease = !hasExactOverride
+        ? await context.selectProjectRelease(
+            targetHost,
+            context.installedReleasesOverride ??
+                await context.installer.listInstalled(),
+          )
+        : release;
+    if (selectedRelease == null || selectedRelease.isEmpty) {
       throw const SdkLaunchException(
         status: 3,
         message:
-            'No Flutter release is selected. Install one with '
-            '`wren install <release>` or pass `--release <release>`.',
+            'No installed Flutter release matches this project and no global '
+            'fallback is configured. Run `wren set <release>` or '
+            '`wren install <release>`.',
       );
     }
-    return context.installer.launch(
-      release,
+    return await context.launchSdk(
+      selectedRelease,
       host: targetHost,
       executable: name,
       arguments: context._sdkArguments,
-      stdoutSink: context.stdoutSink,
-      stderrSink: context.stderrSink,
-      stdoutByteSink: context.stdoutByteSink,
-      stderrByteSink: context.stderrByteSink,
-      stdinStream: context.stdinStream ?? io.stdin,
     );
   }
 }
 
 /// A supported host and its release catalog identifiers.
 enum HostPlatform {
+  /// Linux on x86_64.
   linuxX64(
     label: 'Linux x86_64',
     catalogUrl: _linuxCatalog,
     catalogOs: 'linux',
     catalogArchitecture: 'x64',
   ),
+
+  /// macOS on Apple Silicon.
   macosArm64(
     label: 'macOS arm64',
     catalogUrl: _macosCatalog,
@@ -444,18 +601,27 @@ enum HostPlatform {
     catalogArchitecture: 'arm64',
   );
 
-  const HostPlatform({
+  /// Creates a host platform from catalog identifiers.
+  new({
     required this.label,
     required this.catalogUrl,
     required this.catalogOs,
     required this.catalogArchitecture,
   });
 
+  /// User-facing host name.
   final String label;
+
+  /// Release catalog URL for this host.
   final String catalogUrl;
+
+  /// Operating system identifier used by the catalog.
   final String catalogOs;
+
+  /// Architecture identifier used by the catalog.
   final String catalogArchitecture;
 
+  /// Detects the current supported host.
   static HostPlatform? get current {
     final abi = Abi.current();
     if (io.Platform.isLinux && abi == Abi.linuxX64) return linuxX64;
@@ -463,11 +629,14 @@ enum HostPlatform {
     return null;
   }
 
+  /// Catalog URL as a URI.
   Uri get catalogUri => Uri.parse(catalogUrl);
 }
 
+/// A Flutter release and its catalog identities.
 class FlutterRelease {
-  const FlutterRelease({
+  /// Creates a Flutter release record.
+  const new({
     required this.version,
     required this.channel,
     required this.frameworkRevision,
@@ -477,62 +646,35 @@ class FlutterRelease {
     required this.archiveSha256,
   });
 
+  /// Flutter version.
   final String version;
+
+  /// Release channel.
   final String channel;
+
+  /// Framework commit.
   final String frameworkRevision;
+
+  /// Canonical bundled Dart version.
   final String dartVersion;
+
+  /// Parsed bundled Dart version.
   final Version dartSemVersion;
+
+  /// Host-specific release archive path.
   final String archive;
+
+  /// SHA-256 digest of the release archive.
   final String archiveSha256;
 }
 
+/// Eligible releases and reasons known releases were excluded.
 class ReleaseCatalog {
-  const ReleaseCatalog(this.releases, [this._eligibilityByVersion = const {}]);
+  /// Creates a catalog containing [releases].
+  const new(this.releases, [this._eligibilityByVersion = const {}]);
 
-  final List<FlutterRelease> releases;
-  final Map<String, ReleaseEligibility> _eligibilityByVersion;
-
-  /// Resolves an explicitly requested Flutter version, including a reason if
-  /// the catalog knows the release but Wren cannot install it on this host.
-  ReleaseEligibility eligibilityForVersion(String version) =>
-      _eligibilityByVersion[version] ??
-      ReleaseEligibility.ineligible(
-        'Flutter release $version is not present in the host catalog.',
-      );
-
-  static Future<ReleaseCatalog> fetch(
-    Uri uri, {
-    required HostPlatform host,
-    io.HttpClient? client,
-  }) async {
-    final http = client ?? io.HttpClient();
-    final ownsClient = client == null;
-    try {
-      final request = await http
-          .getUrl(uri)
-          .timeout(const Duration(seconds: 20));
-      final response = await request.close().timeout(
-        const Duration(seconds: 20),
-      );
-      if (response.statusCode != io.HttpStatus.ok) {
-        throw ReleaseCatalogException(
-          'could not read the Flutter release catalog (HTTP ${response.statusCode}).',
-        );
-      }
-      final body = await utf8.decoder.bind(response).join();
-      return parse(body, host: host);
-    } on ReleaseCatalogException {
-      rethrow;
-    } on Object catch (error) {
-      throw ReleaseCatalogException(
-        'could not read the Flutter release catalog: $error',
-      );
-    } finally {
-      if (ownsClient) http.close();
-    }
-  }
-
-  static ReleaseCatalog parse(String json, {required HostPlatform host}) {
+  /// Parses a catalog and records eligibility for every known version.
+  factory parse(String json, {required HostPlatform host}) {
     Object? decoded;
     try {
       decoded = jsonDecode(json);
@@ -568,18 +710,74 @@ class ReleaseCatalog {
     );
   }
 
+  /// Eligible releases in catalog order.
+  final List<FlutterRelease> releases;
+  final Map<String, ReleaseEligibility> _eligibilityByVersion;
+
+  /// Resolves an explicitly requested Flutter version, including a reason if
+  /// the catalog knows the release but Wren cannot install it on this host.
+  ReleaseEligibility eligibilityForVersion(String version) =>
+      _eligibilityByVersion[version] ??
+      ReleaseEligibility.ineligible(
+        'Flutter release $version is not present in the host catalog.',
+      );
+
+  /// Fetches and parses a release catalog from [uri].
+  static Future<ReleaseCatalog> fetch(
+    Uri uri, {
+    required HostPlatform host,
+    io.HttpClient? client,
+  }) async {
+    final http = client ?? io.HttpClient();
+    final ownsClient = client == null;
+    try {
+      final request = await http
+          .getUrl(uri)
+          .timeout(const Duration(seconds: 20));
+      final response = await request.close().timeout(
+        const Duration(seconds: 20),
+      );
+      if (response.statusCode != io.HttpStatus.ok) {
+        throw ReleaseCatalogException(
+          'could not read the Flutter release catalog (HTTP '
+          '${response.statusCode}).',
+        );
+      }
+      final body = await utf8.decoder.bind(response).join();
+      return ReleaseCatalog.parse(body, host: host);
+    } on ReleaseCatalogException {
+      rethrow;
+    } on Object catch (error) {
+      throw ReleaseCatalogException(
+        'could not read the Flutter release catalog: $error',
+      );
+    } finally {
+      if (ownsClient) http.close();
+    }
+  }
+
+  /// Checks one catalog [entry] for eligibility on [host].
   static ReleaseEligibility eligibilityFor(
     Map<String, Object?> entry, {
     required HostPlatform host,
   }) => _eligibility(entry, host);
 }
 
+/// The eligible release or exclusion reason for a catalog entry.
 class ReleaseEligibility {
-  const ReleaseEligibility.eligible(this.release) : reason = null;
-  const ReleaseEligibility.ineligible(this.reason) : release = null;
+  /// Creates an eligible result for [release].
+  const new eligible(this.release) : reason = null;
 
+  /// Creates an ineligible result with [reason].
+  const new ineligible(this.reason) : release = null;
+
+  /// The release when eligible.
   final FlutterRelease? release;
+
+  /// Explanation when the entry is ineligible.
   final String? reason;
+
+  /// Whether the entry can be installed.
   bool get isEligible => release != null;
 }
 
@@ -591,7 +789,7 @@ ReleaseEligibility _eligibility(Map<String, Object?> entry, HostPlatform host) {
       'channel is not supported (stable or beta).',
     );
   }
-  final channelName = channel as String;
+  final channelName = channel! as String;
   if (version is! String || !_isSemVersion(version)) {
     return const ReleaseEligibility.ineligible(
       'Flutter version is missing or invalid.',
@@ -668,7 +866,7 @@ bool _isSemVersion(String value) {
 }
 
 bool _hasNativeArchive(String archive, HostPlatform host) {
-  final normalized = archive.toLowerCase().replaceAll('\\', '/');
+  final normalized = archive.toLowerCase().replaceAll(r'\', '/');
   final segments = normalized.split('/');
   if (host == HostPlatform.linuxX64) {
     return segments.contains('linux') &&
@@ -682,8 +880,11 @@ bool _hasNativeArchive(String archive, HostPlatform host) {
 
 int _channelOrder(String channel) => channel == 'stable' ? 0 : 1;
 
+/// An error while fetching or parsing a Flutter release catalog.
 class ReleaseCatalogException implements Exception {
-  const ReleaseCatalogException(this.message);
+  /// Creates a catalog exception with [message].
+  const new(this.message);
 
+  /// Explanation of the catalog failure.
   final String message;
 }
