@@ -170,13 +170,14 @@ void main() {
         );
         expect(installBeta, 0);
 
+        final canonicalDataPath = dataDirectory.resolveSymbolicLinksSync();
         final stableRoot = p.join(
-          dataDirectory.path,
+          canonicalDataPath,
           'releases',
           'stable-$_version-linux-x64',
         );
         final betaRoot = p.join(
-          dataDirectory.path,
+          canonicalDataPath,
           'releases',
           'beta-$_betaVersion-linux-x64',
         );
@@ -1131,6 +1132,33 @@ printf '\376\000\n' >&2
         );
       },
     );
+
+    test('rejects an Intel-only macOS catalog entry before staging', () async {
+      final intelCatalog = jsonDecode(
+        _catalog(frameworkRevision, host: HostPlatform.macosArm64),
+      ) as Map<String, Object?>;
+      final release =
+          (intelCatalog['releases']! as List<Object?>).single!
+              as Map<String, Object?>;
+      release['archive'] =
+          'stable/macos/flutter_macos_x64_$_version-stable.zip';
+      final stderr = StringBuffer();
+
+      final status = await runWren(
+        ['install', _version],
+        catalogJson: jsonEncode(intelCatalog),
+        host: HostPlatform.macosArm64,
+        installEnvironment: InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        ),
+        stderrSink: stderr,
+      );
+
+      expect(status, 4);
+      expect(stderr.toString(), contains('no native macOS arm64 artifact'));
+      expect(dataDirectory.existsSync(), isFalse);
+    });
 
     test('rejects an Intel Dart runtime for a macOS arm64 release', () async {
       await _writeFixtureSdk(
