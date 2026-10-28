@@ -841,46 +841,6 @@ printf '\376\000\n' >&2
           isEmpty,
         );
 
-        const retryVersion = '3.47.10';
-        await _writeFixtureSdk(repositoryWorktree, version: retryVersion);
-        await _git(repositoryWorktree.path, ['add', '.']);
-        await _git(repositoryWorktree.path, ['commit', '-m', 'retry fixture']);
-        await _git(repositoryWorktree.path, ['tag', retryVersion]);
-        final retryRevision = await _git(repositoryWorktree.path, [
-          'rev-parse',
-          'HEAD',
-        ]);
-        await File(p.join(dataDirectory.path, 'fail-precache')).create();
-        await File(p.join(dataDirectory.path, 'hold-failure')).create();
-        final failing = await _startInstallWorker(
-          dataDirectory,
-          repositoryWorktree,
-          retryVersion,
-          retryRevision,
-        );
-        await _waitForFile(File(p.join(dataDirectory.path, 'failure-started')));
-        final retry = await _startInstallWorker(
-          dataDirectory,
-          repositoryWorktree,
-          retryVersion,
-          retryRevision,
-        );
-        await _waitForText(
-          retry.stderr,
-          'Waiting for another install of Flutter',
-        );
-        await File(p.join(dataDirectory.path, 'continue-failure')).create();
-        expect(await failing.process.exitCode, 4);
-        expect(await retry.process.exitCode, 0);
-        expect(
-          File(
-            p.join(
-              dataDirectory.path,
-              'releases/stable-$retryVersion-linux-x64/.wren-release.json',
-            ),
-          ).existsSync(),
-          isTrue,
-        );
       },
     );
 
@@ -1154,6 +1114,47 @@ printf '\376\000\n' >&2
         expect(
           Directory(p.join(dataDirectory.path, 'staging')).listSync(),
           isEmpty,
+        );
+
+        const retryVersion = '3.47.10';
+        await _writeFixtureSdk(repositoryWorktree, version: retryVersion);
+        await _git(repositoryWorktree.path, ['add', '.']);
+        await _git(repositoryWorktree.path, ['commit', '-m', 'retry fixture']);
+        await _git(repositoryWorktree.path, ['tag', retryVersion]);
+        final retryRevision = await _git(repositoryWorktree.path, [
+          'rev-parse',
+          'HEAD',
+        ]);
+        await File(p.join(dataDirectory.path, 'fail-precache')).create();
+        await File(p.join(dataDirectory.path, 'hold-failure')).create();
+        final failing = await _startInstallWorker(
+          dataDirectory,
+          repositoryWorktree,
+          retryVersion,
+          retryRevision,
+        );
+        await _waitForFile(File(p.join(dataDirectory.path, 'failure-started')));
+        final retry = await _startInstallWorker(
+          dataDirectory,
+          repositoryWorktree,
+          retryVersion,
+          retryRevision,
+        );
+        await _waitForText(
+          retry.stderr,
+          'Waiting for another install of Flutter',
+        );
+        await File(p.join(dataDirectory.path, 'continue-failure')).create();
+        expect(await failing.process.exitCode, 4);
+        expect(await retry.process.exitCode, 0);
+        expect(
+          File(
+            p.join(
+              dataDirectory.path,
+              'releases/stable-$retryVersion-linux-x64/.wren-release.json',
+            ),
+          ).existsSync(),
+          isTrue,
         );
       },
     );
