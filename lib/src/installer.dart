@@ -762,9 +762,6 @@ class FlutterInstaller {
         p.join(root.path, 'staging', 'install-$releaseKey'),
       );
       final checkoutStage = Directory(p.join(stagingRoot.path, 'checkout'));
-      String? sourcePath;
-      String? resolvedSourceKey;
-      var sourceCreated = false;
       var checkoutPublished = false;
       var worktreeCreated = false;
       if (stagingRoot.existsSync()) {
@@ -833,13 +830,12 @@ class FlutterInstaller {
             'revision.',
           );
         }
-        resolvedSourceKey = _sourceKey(engineRevision, host);
+        final resolvedSourceKey = _sourceKey(engineRevision, host);
         final resolvedSourcePath = p.join(
           root.path,
           'sources',
           resolvedSourceKey,
         );
-        sourcePath = resolvedSourcePath;
 
         final sourceLock = await _acquireLock(
           Directory(p.join(root.path, 'locks', 'source-$resolvedSourceKey')),
@@ -883,7 +879,6 @@ class FlutterInstaller {
             );
             await sourceDirectory.parent.create(recursive: true);
             await sourceStage.rename(sourceDirectory.path);
-            sourceCreated = true;
           }
           if (!artifactsPrepared) {
             _progress('Validating ${host.label} and web artifacts');
@@ -959,26 +954,6 @@ class FlutterInstaller {
             }
           } else if (worktreeCreated) {
             await _discardWorktree(root, checkoutStage.path);
-          }
-          if (sourceCreated &&
-              sourcePath != null &&
-              resolvedSourceKey != null &&
-              Directory(sourcePath).existsSync()) {
-            final sourceLock = await _acquireLock(
-              Directory(
-                p.join(root.path, 'locks', 'source-$resolvedSourceKey'),
-              ),
-            );
-            try {
-              if (!await _hasInstalledSourceReference(
-                root,
-                resolvedSourceKey,
-              )) {
-                await Directory(sourcePath).delete(recursive: true);
-              }
-            } finally {
-              await _releaseLock(sourceLock);
-            }
           }
         }
         if (stagingRoot.existsSync()) {
@@ -1335,26 +1310,6 @@ class FlutterInstaller {
     if (Directory(path).existsSync()) {
       await Directory(path).delete(recursive: true);
     }
-  }
-
-  Future<bool> _hasInstalledSourceReference(Directory root, String sourceKey) async {
-    final releases = Directory(p.join(root.path, 'releases'));
-    if (!releases.existsSync()) return false;
-    await for (final entity in releases.list(followLinks: false)) {
-      if (entity is! Directory) continue;
-      final marker = File(p.join(entity.path, '.wren-release.json'));
-      if (!marker.existsSync()) continue;
-      try {
-        final data = jsonDecode(await marker.readAsString());
-        if (data is Map<String, Object?> && data['sourceKey'] == sourceKey) {
-          return true;
-        }
-      } on Object {
-        // An unreadable release record may reference this source. Preserve it.
-        return true;
-      }
-    }
-    return false;
   }
 
   Future<void> _discardWorktree(Directory root, String path) async {
