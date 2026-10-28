@@ -127,6 +127,18 @@ class InstallResult {
   final bool alreadyInstalled;
 }
 
+/// Files reclaimed or previewed by a cleanup invocation.
+class CleanupResult {
+  /// Creates a cleanup result.
+  const new({required this.stages, required this.sources});
+
+  /// Orphaned staging directories reclaimed or selected for reclamation.
+  final List<String> stages;
+
+  /// Unreferenced shared sources reclaimed or selected for reclamation.
+  final List<String> sources;
+}
+
 /// Describes an installed Flutter release and its readiness.
 class InstalledRelease {
   /// Creates a summary of an installed release.
@@ -198,6 +210,84 @@ class FlutterInstaller {
 
   /// Optional callback for progress messages.
   final void Function(String message)? onProgress;
+
+  /// Removes provable crash-orphaned stages and unreferenced shared sources.
+  ///
+  /// Relevant operation locks are held while candidates are rechecked and,
+  /// unless [dryRun] is true, removed. The shared Flutter repository and
+  /// Wren executable backups are outside the candidate set.
+  Future<CleanupResult> cleanup({bool dryRun = false}) async {
+    final root = environment.dataDirectory.absolute.path;
+    final stages = <String>[];
+    final sources = <String>[];
+    final staging = Directory(p.join(root, 'staging'));
+
+    if (staging.existsSync()) {
+      final entries = staging.listSync(followLinks: false);
+      for (final entry in entries) {
+        if (FileSystemEntity.typeSync(entry.path, followLinks: false) !=
+            FileSystemEntityType.directory) {
+          continue;
+        }
+        final name = p.basename(entry.path);
+        final releaseMatch = RegExp(r'^install-(.+)$').firstMatch(name);
+        final lockPath = name == 'flutter-repo'
+            ? p.join(root, 'locks', 'flutter-git')
+            : releaseMatch == null
+            ? null
+            : p.join(root, 'locks', 'install-${releaseMatch.group(1)}');
+        if (lockPath == null) continue;
+
+        _progress('Checking orphaned stage $name');
+        final lock = await _acquireLock(
+          Directory(lockPath),
+          cancellation: _waitCancellation,
+          onWait: () => _progress('Waiting for active work on stage $name'),
+        );
+        try {
+          if (!Directory(entry.path).existsSync()) continue;
+          stages.add(name);
+          if (!dryRun) {
+            await Directory(entry.path).delete(recursive: true);
+          }
+        } finally {
+          await _releaseLock(lock);
+        }
+      }
+    }
+
+    final sourcesDirectory = Directory(p.join(root, 'sources'));
+    if (sourcesDirectory.existsSync()) {
+      final entries = sourcesDirectory.listSync(followLinks: false);
+      for (final entry in entries) {
+        if (FileSystemEntity.typeSync(entry.path, followLinks: false) !=
+            FileSystemEntityType.directory) {
+          continue;
+        }
+        final sourceKey = p.basename(entry.path);
+        _progress('Checking shared source $sourceKey');
+        final lock = await _acquireLock(
+          Directory(p.join(root, 'locks', 'source-$sourceKey')),
+          cancellation: _waitCancellation,
+          onWait: () => _progress('Waiting for shared source $sourceKey'),
+        );
+        try {
+          if (!Directory(entry.path).existsSync() ||
+              _sourceIsRetained(root, sourceKey)) {
+            continue;
+          }
+          sources.add(sourceKey);
+          if (!dryRun) {
+            await Directory(entry.path).delete(recursive: true);
+          }
+        } finally {
+          await _releaseLock(lock);
+        }
+      }
+    }
+
+    return CleanupResult(stages: stages, sources: sources);
+  }
 
   /// Lists published releases and performs the inexpensive launch-readiness
   /// checks used by Wren before selecting an SDK.
@@ -672,6 +762,32 @@ class FlutterInstaller {
         }
       } on Object {
         // An unreadable record is not a provable reference.
+      }
+    }
+    return false;
+  }
+
+  bool _sourceIsRetained(String root, String sourceKey) {
+    for (final directoryName in ['releases', 'removals']) {
+      final directory = Directory(p.join(root, directoryName));
+      if (!directory.existsSync()) continue;
+      for (final entity in directory.listSync(followLinks: false)) {
+        if (entity is! File && entity is! Directory) continue;
+        final marker = entity is File
+            ? entity
+            : File(p.join(entity.path, '.wren-release.json'));
+        if (entity is File && !entity.path.endsWith('.json')) continue;
+        if (!marker.existsSync()) continue;
+        try {
+          final data = jsonDecode(marker.readAsStringSync());
+          if (data is! Map<String, Object?> || data['sourceKey'] is! String) {
+            return true;
+          }
+          if (data['sourceKey'] == sourceKey) return true;
+        } on Object {
+          // Unreadable records prevent proving that this source is orphaned.
+          return true;
+        }
       }
     }
     return false;

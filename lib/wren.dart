@@ -10,6 +10,7 @@ import 'package:yaml_edit/yaml_edit.dart';
 
 export 'src/installer.dart'
     show
+        CleanupResult,
         InstallCancelledException,
         InstallEnvironment,
         InstallException,
@@ -479,6 +480,7 @@ Future<int> runWren(
     ..addCommand(_ReleasesCommand(context))
     ..addCommand(_InstallCommand(context))
     ..addCommand(_RemoveCommand(context))
+    ..addCommand(_CleanupCommand(context))
     ..addCommand(_ListCommand(context))
     ..addCommand(_SetCommand(context))
     ..addCommand(_SdkPathCommand(context))
@@ -527,6 +529,51 @@ class _RemoveCommand extends WrenCommand {
       writeOut('Removed Flutter $version. No release is active.');
     } else {
       writeOut('Removed Flutter $version. Active release: Flutter $active.');
+    }
+    return 0;
+  }
+}
+
+class _CleanupCommand extends WrenCommand {
+  new(super.context) {
+    argParser.addFlag(
+      'dry-run',
+      negatable: false,
+      help: 'Show orphaned storage that would be reclaimed.',
+    );
+  }
+
+  @override
+  String get name => 'cleanup';
+
+  @override
+  String get description => 'Reclaim orphaned stages and shared sources.';
+
+  @override
+  Future<int> run() async {
+    if (argResults!.rest.isNotEmpty) {
+      failUsage('cleanup does not accept positional arguments.');
+    }
+    final result = await context.installer.cleanup(
+      dryRun: argResults!.flag('dry-run'),
+    );
+    final dryRun = argResults!.flag('dry-run');
+    if (result.stages.isEmpty && result.sources.isEmpty) {
+      writeOut(
+        dryRun ? 'No orphaned stages or sources found.' : 'Nothing to clean.',
+      );
+      return 0;
+    }
+    for (final stage in result.stages) {
+      writeOut(
+        '${dryRun ? 'Would reclaim' : 'Reclaimed'} orphaned stage: $stage',
+      );
+    }
+    for (final source in result.sources) {
+      writeOut(
+        '${dryRun ? 'Would reclaim' : 'Reclaimed'} unreferenced shared '
+        'source: $source',
+      );
     }
     return 0;
   }

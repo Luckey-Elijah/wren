@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -1041,6 +1042,185 @@ exec '${child.path}' "\$@"
       expect(
         await runWren(
           ['remove'],
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        ),
+        2,
+      );
+    });
+  });
+
+  group('cleanup', () {
+    late Directory temporaryDirectory;
+    late Directory dataDirectory;
+
+    setUp(() async {
+      temporaryDirectory = await Directory.systemTemp.createTemp(
+        'wren-cleanup-',
+      );
+      dataDirectory = Directory('${temporaryDirectory.path}/data')
+        ..createSync();
+    });
+
+    tearDown(() async {
+      await temporaryDirectory.delete(recursive: true);
+    });
+
+    test('dry-run previews only orphaned stages and sources', () async {
+      const stageName = 'install-stable-3.47.8-linux-x64';
+      final stage = Directory('${dataDirectory.path}/staging/$stageName')
+        ..createSync(recursive: true);
+      final source = Directory('${dataDirectory.path}/sources/orphan-engine')
+        ..createSync(recursive: true);
+      final retained = Directory(
+        '${dataDirectory.path}/sources/retained-engine',
+      )..createSync(recursive: true);
+      final release = Directory(
+        '${dataDirectory.path}/releases/stable-3.47.8-linux-x64',
+      )..createSync(recursive: true);
+      await File('${release.path}/.wren-release.json').writeAsString(
+        jsonEncode({'state': 'needsRepair', 'sourceKey': 'retained-engine'}),
+      );
+      final repository = Directory('${dataDirectory.path}/flutter.git')
+        ..createSync();
+      final rollback = File('${dataDirectory.path}/wren.previous')
+        ..writeAsStringSync('rollback');
+      final output = StringBuffer();
+      final status = await runWren(
+        ['cleanup', '--dry-run'],
+        installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+        stdoutSink: output,
+        stderrSink: StringBuffer(),
+      );
+
+      expect(status, 0);
+      expect(stage.existsSync(), isTrue);
+      expect(source.existsSync(), isTrue);
+      expect(retained.existsSync(), isTrue);
+      expect(repository.existsSync(), isTrue);
+      expect(rollback.readAsStringSync(), 'rollback');
+      expect(
+        output.toString(),
+        contains('Would reclaim orphaned stage: $stageName'),
+      );
+      expect(
+        output.toString(),
+        contains('Would reclaim unreferenced shared source: orphan-engine'),
+      );
+      expect(output.toString(), isNot(contains('retained-engine')));
+    });
+
+    test(
+      'reclaims crash orphans and preserves referenced recovery data',
+      () async {
+        const stageName = 'install-stable-3.47.8-linux-x64';
+        final stage = Directory('${dataDirectory.path}/staging/$stageName')
+          ..createSync(recursive: true);
+        final source = Directory('${dataDirectory.path}/sources/orphan-engine')
+          ..createSync(recursive: true);
+        final retained = Directory(
+          '${dataDirectory.path}/sources/recovery-engine',
+        )..createSync(recursive: true);
+        final journal = File('${dataDirectory.path}/removals/release.json')
+          ..createSync(recursive: true);
+        await journal.writeAsString(
+          jsonEncode({'sourceKey': 'recovery-engine'}),
+        );
+        final repository = Directory('${dataDirectory.path}/flutter.git')
+          ..createSync();
+        final rollback = File('${dataDirectory.path}/wren.previous')
+          ..writeAsStringSync('rollback');
+        final output = StringBuffer();
+        final status = await runWren(
+          ['cleanup'],
+          installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+          stdoutSink: output,
+          stderrSink: StringBuffer(),
+        );
+
+        expect(status, 0);
+        expect(stage.existsSync(), isFalse);
+        expect(source.existsSync(), isFalse);
+        expect(retained.existsSync(), isTrue);
+        expect(repository.existsSync(), isTrue);
+        expect(rollback.readAsStringSync(), 'rollback');
+        expect(
+          output.toString(),
+          contains('Reclaimed orphaned stage: $stageName'),
+        );
+        expect(
+          output.toString(),
+          contains('Reclaimed unreferenced shared source: orphan-engine'),
+        );
+      },
+    );
+
+    test(
+      'cancelling a required wait returns 6 and leaves the stage intact',
+      () async {
+        const stageName = 'install-stable-3.47.8-linux-x64';
+        final stage = Directory('${dataDirectory.path}/staging/$stageName')
+          ..createSync(recursive: true);
+        final releaseKey = stageName.substring('install-'.length);
+        final lock = Directory(
+          '${dataDirectory.path}/locks/install-$releaseKey',
+        )..createSync(recursive: true);
+        File('${lock.path}/owner').writeAsStringSync('$pid\n');
+        final cancellation = StreamController<void>();
+        final errors = StringBuffer();
+        final cleanup = runWren(
+          ['cleanup'],
+          installEnvironment: InstallEnvironment(
+            dataDirectory: dataDirectory,
+            waitCancellation: cancellation.stream,
+          ),
+          stdoutSink: StringBuffer(),
+          stderrSink: errors,
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+        cancellation.add(null);
+
+        expect(await cleanup, 6);
+        expect(stage.existsSync(), isTrue);
+        expect(errors.toString(), contains('cancelled while waiting'));
+        await cancellation.close();
+      },
+    );
+
+    test('waits for an active source operation before reclaiming it', () async {
+      const sourceKey = 'active-engine';
+      final source = Directory('${dataDirectory.path}/sources/$sourceKey')
+        ..createSync(recursive: true);
+      final lock = Directory('${dataDirectory.path}/locks/source-$sourceKey')
+        ..createSync(recursive: true);
+      File('${lock.path}/owner').writeAsStringSync('$pid\n');
+      final cancellation = StreamController<void>();
+      final errors = StringBuffer();
+      final cleanup = runWren(
+        ['cleanup'],
+        installEnvironment: InstallEnvironment(
+          dataDirectory: dataDirectory,
+          waitCancellation: cancellation.stream,
+        ),
+        stdoutSink: StringBuffer(),
+        stderrSink: errors,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      cancellation.add(null);
+
+      expect(await cleanup, 6);
+      expect(source.existsSync(), isTrue);
+      expect(
+        errors.toString(),
+        contains('Waiting for shared source $sourceKey'),
+      );
+      await cancellation.close();
+    });
+
+    test('rejects positional arguments', () async {
+      expect(
+        await runWren(
+          ['cleanup', 'extra'],
           stdoutSink: StringBuffer(),
           stderrSink: StringBuffer(),
         ),
