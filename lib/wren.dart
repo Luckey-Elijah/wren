@@ -140,8 +140,8 @@ class WrenContext {
     return null;
   }
 
-  /// Persists [release] as the global fallback.
-  Future<void> setGlobalFallback(String release) async {
+  /// Prepares a global fallback update without writing the config file.
+  _PreparedGlobalFallback _prepareGlobalFallback(String release) {
     final config = io.File(
       '${installEnvironment.dataDirectory.absolute.path}/config.json',
     );
@@ -156,13 +156,22 @@ class WrenContext {
       values = Map<String, Object?>.from(decoded);
     }
     values['globalFallback'] = release;
-    config.parent.createSync(recursive: true);
+    return _PreparedGlobalFallback(
+      config: config,
+      release: release,
+      contents: '${const JsonEncoder.withIndent('  ').convert(values)}\n',
+    );
+  }
+
+  /// Persists a prepared global fallback update.
+  Future<void> _setGlobalFallback(_PreparedGlobalFallback update) async {
+    update.config.parent.createSync(recursive: true);
     _replaceFileAtomically(
-      config,
-      '${const JsonEncoder.withIndent('  ').convert(values)}\n',
+      update.config,
+      update.contents,
       temporarySuffix: '.tmp',
     );
-    globalFallbackOverride = release;
+    globalFallbackOverride = update.release;
   }
 
   /// Asks the user to confirm a language-version change.
@@ -670,10 +679,15 @@ class _SetCommand extends WrenCommand {
       }
     }
 
+    final fallbackUpdate = setGlobal
+        ? context._prepareGlobalFallback(selected.version)
+        : null;
     if (content != null && content != pubspec.readAsStringSync()) {
       _replaceFileAtomically(pubspec, content, temporarySuffix: '.wren.tmp');
     }
-    if (setGlobal) await context.setGlobalFallback(selected.version);
+    if (fallbackUpdate != null) {
+      await context._setGlobalFallback(fallbackUpdate);
+    }
 
     for (final entry in edits.entries) {
       writeOut(
@@ -705,6 +719,18 @@ class _SetCommand extends WrenCommand {
     );
     return 0;
   }
+}
+
+class _PreparedGlobalFallback {
+  const new({
+    required this.config,
+    required this.release,
+    required this.contents,
+  });
+
+  final io.File config;
+  final String release;
+  final String contents;
 }
 
 void _replaceFileAtomically(

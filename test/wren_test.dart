@@ -337,6 +337,26 @@ environment:
       );
     });
 
+    test('invalid global config leaves the pubspec unchanged', () async {
+      final pubspec = File('${projectDirectory.path}/pubspec.yaml')
+        ..writeAsStringSync('environment:\n  sdk: ^2.19.0\n');
+      final originalPubspec = pubspec.readAsStringSync();
+      final config = File('${dataDirectory.path}/config.json')
+        ..writeAsStringSync('{invalid json');
+      final stderr = StringBuffer();
+
+      final status = await runSet(
+        ['set', '-g', '3.47.8'],
+        confirmation: (_) async => true,
+        stderr: stderr,
+      );
+
+      expect(status, 4);
+      expect(pubspec.readAsStringSync(), originalPubspec);
+      expect(config.readAsStringSync(), '{invalid json');
+      expect(stderr.toString(), contains('command failed'));
+    });
+
     test('global fallback can be set without a pubspec', () async {
       final status = await runSet(['use', '-g', '3.47.8']);
 
