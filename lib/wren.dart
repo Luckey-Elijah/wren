@@ -4,6 +4,7 @@ import 'dart:io' as io;
 
 import 'package:args/command_runner.dart';
 import 'package:pub_semver/pub_semver.dart';
+import 'package:wren/src/doctor_setup.dart';
 import 'package:wren/src/installer.dart';
 import 'package:wren/src/self_upgrade.dart';
 import 'package:wren/src/tracing.dart';
@@ -60,6 +61,7 @@ class WrenContext {
     this.sdkLauncher,
     this.wrenExecutable,
     this.runningExecutablePath,
+    Map<String, String>? processEnvironment,
     this.upgradeReleaseApiUri,
     this.wrenVersionOverride,
     this.stdinStream,
@@ -73,7 +75,10 @@ class WrenContext {
        _traceStartedAt = traceStartedAt,
        // Keep this invocation timer private to the context implementation.
        // ignore: prefer_initializing_formals
-       _traceElapsed = traceElapsed;
+       _traceElapsed = traceElapsed,
+       processEnvironmentOverride = processEnvironment == null
+           ? null
+           : Map.unmodifiable(processEnvironment);
 
   final StringSink _stdoutSink;
   final StringSink _stderrSink;
@@ -117,6 +122,12 @@ class WrenContext {
   /// Current executable used by upgrade-wren; injectable for CLI fixtures.
   final String? runningExecutablePath;
 
+  /// Process environment used by this invocation.
+  ///
+  /// Production runs inherit the process environment. The override lets CLI
+  /// fixtures inspect PATH and system Git without changing the test process.
+  final Map<String, String>? processEnvironmentOverride;
+
   /// Release API endpoint used by upgrade-wren; injectable for fixtures.
   final Uri? upgradeReleaseApiUri;
 
@@ -125,6 +136,10 @@ class WrenContext {
 
   /// Input forwarded to SDK processes; defaults to the current process stdin.
   final Stream<List<int>>? stdinStream;
+
+  /// Environment visible to Wren setup diagnostics.
+  Map<String, String> get processEnvironment =>
+      processEnvironmentOverride ?? io.Platform.environment;
 
   List<String> _sdkArguments = const [];
   TraceSession? _trace;
@@ -746,6 +761,7 @@ Future<int> runWren(
   String? runningExecutablePath,
   Uri? upgradeReleaseApiUri,
   String? wrenVersion,
+  Map<String, String>? processEnvironment,
 }) async {
   final tracingRequested = _traceOptionPresentBeforeCommand(arguments);
   final traceStartedAt = tracingRequested ? DateTime.now().toUtc() : null;
@@ -764,6 +780,7 @@ Future<int> runWren(
     sdkLauncher: sdkLauncher,
     wrenExecutable: wrenExecutable,
     runningExecutablePath: runningExecutablePath,
+    processEnvironment: processEnvironment,
     upgradeReleaseApiUri: upgradeReleaseApiUri,
     wrenVersionOverride: wrenVersion,
     stdinStream: stdinStream,
@@ -1118,7 +1135,7 @@ class _DoctorCommand extends WrenCommand {
 
   @override
   String get description =>
-      'Quickly check installed releases and current project selection.';
+      'Check Wren setup, installed releases, and current project selection.';
 
   @override
   Future<int> run() async {
@@ -1132,12 +1149,36 @@ class _DoctorCommand extends WrenCommand {
       );
     }
 
-    final installed =
-        context.installedReleasesOverride ??
-        await context.traceOperation<List<InstalledRelease>>(
-          'release.list_installed',
-          context.installer.listInstalled,
+    late final List<InstalledRelease> installed;
+    Object? releaseEnumerationError;
+    try {
+      installed =
+          context.installedReleasesOverride ??
+          await context.traceOperation<List<InstalledRelease>>(
+            'release.list_installed',
+            context.installer.listInstalled,
+          );
+    } on Object catch (error) {
+      installed = const [];
+      releaseEnumerationError = error;
+    }
+    final setup =
+        await DoctorSetupInspector(
+          dataDirectory: context.installEnvironment.dataDirectory,
+          executablePath:
+              context.runningExecutablePath ?? io.Platform.resolvedExecutable,
+          processEnvironment: context.processEnvironment,
+          processEnvironmentOverride: context.processEnvironmentOverride,
+          globalFallbackOverride: context.globalFallbackOverride,
+        ).inspect(
+          installedReleases: installed,
+          releaseEnumerationError: releaseEnumerationError,
         );
+    final exitStatus = setup.isIncomplete
+        ? 4
+        : setup.hasCritical || installed.any((release) => release.needsRepair)
+        ? 1
+        : 0;
     final project = context._projectReleaseConstraints();
     final compatibleProjectRelease = project.selectRelease(
       targetHost,
@@ -1148,7 +1189,12 @@ class _DoctorCommand extends WrenCommand {
         context.flutterReleaseOverride ??
         io.Platform.environment['WREN_FLUTTER_RELEASE'];
     final normalizedEnvironmentRelease = environmentRelease?.trim();
-    final fallback = await context.globalFallback;
+    String? fallback;
+    try {
+      fallback = await context.globalFallback;
+    } on Object {
+      // Setup diagnostics report an uninspectable config as incomplete below.
+    }
 
     late final String? selectedRelease;
     late final String selectionSource;
@@ -1171,6 +1217,23 @@ class _DoctorCommand extends WrenCommand {
     }
 
     writeOut('Wren quick diagnosis (offline).');
+    writeOut('Setup:');
+    for (final check in setup.checks) {
+      final severity = switch (check.severity) {
+        DoctorCheckSeverity.ok => 'ok',
+        DoctorCheckSeverity.informational => 'informational',
+        DoctorCheckSeverity.critical => 'critical',
+        DoctorCheckSeverity.incomplete => 'incomplete',
+      };
+      writeOut('  ${check.component}: $severity — ${check.summary}');
+      if (check.nextStep != null) {
+        writeOut('    Next step: ${check.nextStep}');
+      }
+    }
+    writeOut(
+      '  Persistent shell startup and editor settings were not inspected or '
+      'changed.',
+    );
     if (installed.isEmpty) {
       writeOut('No Flutter releases are installed.');
     } else {
@@ -1232,7 +1295,7 @@ class _DoctorCommand extends WrenCommand {
         'Effective selection: none. Run `wren install <release>` and '
         '`wren set <release>` to choose a release.',
       );
-      return 0;
+      return exitStatus;
     }
     writeOut(
       'Effective selection: Flutter $selectedRelease '
@@ -1272,7 +1335,7 @@ class _DoctorCommand extends WrenCommand {
         'matches the current project (informational).',
       );
     }
-    return 0;
+    return exitStatus;
   }
 }
 

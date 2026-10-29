@@ -404,10 +404,13 @@ environment:
     Future<int> runDoctor(
       List<String> arguments, {
       required StringSink output,
-      required List<InstalledRelease> installed,
+      required List<InstalledRelease>? installed,
       StringSink? errors,
       String? fallback,
       String? environmentRelease,
+      String? wrenExecutable,
+      String? runningExecutablePath,
+      Map<String, String>? processEnvironment,
     }) => runWren(
       arguments,
       host: HostPlatform.linuxX64,
@@ -416,6 +419,9 @@ environment:
       installedReleases: installed,
       globalFallback: fallback,
       flutterReleaseOverride: environmentRelease,
+      wrenExecutable: wrenExecutable,
+      runningExecutablePath: runningExecutablePath,
+      processEnvironment: processEnvironment,
       stdoutSink: output,
       stderrSink: errors ?? StringBuffer(),
     );
@@ -440,7 +446,7 @@ environment:
           ],
         );
 
-        expect(status, 0);
+        expect(status, 1);
         expect(output.toString(), contains('Flutter 3.47.8  stable  linux'));
         expect(output.toString(), contains('Flutter 3.48.0  stable  linux'));
         expect(output.toString(), contains('Flutter 3.45.0  stable  linux'));
@@ -563,6 +569,296 @@ environment:
           ),
         );
         expect(output.toString(), contains('is not installed'));
+      },
+    );
+
+    test('reports broken storage and release registry as critical', () async {
+      await dataDirectory.delete(recursive: true);
+      await File(dataDirectory.path).writeAsString('not a directory');
+      final storageOutput = StringBuffer();
+      final storageStatus = await runDoctor(
+        ['doctor'],
+        output: storageOutput,
+        installed: const [],
+      );
+
+      expect(storageStatus, 1);
+      expect(storageOutput.toString(), contains('Storage: critical'));
+      expect(storageOutput.toString(), contains('not a directory'));
+
+      await File(dataDirectory.path).delete();
+      await dataDirectory.create();
+      await File('${dataDirectory.path}/releases')
+          .writeAsString('not a registry');
+      final registryOutput = StringBuffer();
+      final registryStatus = await runDoctor(
+        ['doctor'],
+        output: registryOutput,
+        installed: const [],
+      );
+
+      expect(registryStatus, 1);
+      expect(registryOutput.toString(), contains('Release registry: critical'));
+      expect(registryOutput.toString(), contains('not a directory'));
+    });
+
+    test(
+      'reports an unreadable release registry and continues setup checks',
+      () async {
+        final releasesDirectory = Directory('${dataDirectory.path}/releases')
+          ..createSync();
+        await Process.run('chmod', ['000', releasesDirectory.path]);
+        final output = StringBuffer();
+        late final int status;
+        try {
+          status = await runDoctor(['doctor'], output: output, installed: null);
+        } finally {
+          await Process.run('chmod', ['u=rwx,go=rx', releasesDirectory.path]);
+        }
+
+        expect(status, 4);
+        expect(output.toString(), contains('Release registry: incomplete'));
+        expect(output.toString(), contains('Storage: ok'));
+        expect(output.toString(), contains('System Git: ok'));
+        expect(
+          output.toString(),
+          contains('No Flutter releases are installed.'),
+        );
+      },
+    );
+
+    test('rejects a parseable release record with invalid identity', () async {
+      final releaseDirectory = Directory(
+        '${dataDirectory.path}/releases/stable-3.47.8-linux-x64',
+      )..createSync(recursive: true);
+      final engineRevision = 'a' * 40;
+      await File('${releaseDirectory.path}/.wren-release.json').writeAsString(
+        jsonEncode({
+          'channel': 'stable',
+          'version': '3.47.8',
+          'host': 'linux',
+          'architecture': 'x64',
+          'state': 'ready',
+          'frameworkRevision': 'invalid-framework-revision',
+          'engineRevision': engineRevision,
+          'sourceKey': '$engineRevision-linux-x64',
+          'canonicalDartVersion': '3.13.7',
+        }),
+      );
+      final output = StringBuffer();
+
+      final status = await runDoctor(
+        ['doctor'],
+        output: output,
+        installed: null,
+      );
+
+      expect(status, 1);
+      expect(output.toString(), contains('Release registry: critical'));
+      expect(output.toString(), contains('invalid identity or state'));
+      expect(output.toString(), contains('Flutter 3.47.8'));
+    });
+
+    test(
+      'reports a read-only storage directory without writing a probe file',
+      () async {
+        final mode = dataDirectory.statSync().mode;
+        await Process.run('chmod', ['a-w', dataDirectory.path]);
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: const [],
+        );
+
+        await Process.run('chmod', ['u+w', dataDirectory.path]);
+        expect(status, 1);
+        expect(output.toString(), contains('Storage: critical'));
+        expect(output.toString(), contains('no write permission bits'));
+        expect(Directory('${dataDirectory.path}/probe').existsSync(), isFalse);
+        expect(mode & 0x92, isNot(0));
+      },
+    );
+
+    test('reports an unavailable Wren executable as critical', () async {
+      final output = StringBuffer();
+
+      final status = await runDoctor(
+        ['doctor'],
+        output: output,
+        installed: const [],
+        runningExecutablePath: '${temporaryDirectory.path}/missing-wren',
+      );
+
+      expect(status, 1);
+      expect(output.toString(), contains('Executable: critical'));
+      expect(output.toString(), contains('missing or is not a regular file'));
+    });
+
+    test(
+      'reports an invalid global fallback configuration as critical',
+      () async {
+        await File('${dataDirectory.path}/config.json')
+            .writeAsString('{broken');
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: const [],
+        );
+
+        expect(status, 1);
+        expect(output.toString(), contains('Global fallback: critical'));
+        expect(output.toString(), contains('not valid JSON'));
+      },
+    );
+
+    test(
+      'reports missing system Git as critical and PATH as informational',
+      () async {
+        final emptyPath = Directory('${temporaryDirectory.path}/empty-path')
+          ..createSync();
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: const [],
+          processEnvironment: {'PATH': emptyPath.path},
+        );
+
+        expect(status, 1);
+        expect(output.toString(), contains('System Git: critical'));
+        expect(
+          output.toString(),
+          contains('not available on the current-process PATH'),
+        );
+        expect(
+          output.toString(),
+          contains('Current process PATH: informational'),
+        );
+        expect(
+          output.toString(),
+          contains('does not include the Wren shim directory'),
+        );
+      },
+    );
+
+    test(
+      'reports absent shims informational and installed shims on current PATH',
+      () async {
+        final absentOutput = StringBuffer();
+        expect(
+          await runDoctor(
+            ['doctor'],
+            output: absentOutput,
+            installed: const [],
+          ),
+          0,
+        );
+        expect(absentOutput.toString(), contains('PATH shims: informational'));
+        expect(absentOutput.toString(), contains('shims are not installed'));
+        expect(absentOutput.toString(), contains('wren setup'));
+
+        final inheritedPath = Platform.environment['PATH'] ?? '';
+        final wrongCasePath = [
+          '${dataDirectory.path.toUpperCase()}/bin',
+          if (inheritedPath.isNotEmpty) inheritedPath,
+        ].join(Platform.isWindows ? ';' : ':');
+        final pathOutput = StringBuffer();
+        expect(
+          await runDoctor(
+            ['doctor'],
+            output: pathOutput,
+            installed: const [],
+            processEnvironment: {
+              ...Platform.environment,
+              'PATH': wrongCasePath,
+            },
+          ),
+          0,
+        );
+        expect(
+          pathOutput.toString(),
+          contains('Current process PATH: informational'),
+        );
+
+        final wrenExecutable = File('${temporaryDirectory.path}/wren-fixture');
+        await wrenExecutable.writeAsString('#!/bin/sh\nexit 0\n');
+        await Process.run('chmod', ['u=rwx,go=rx', wrenExecutable.path]);
+        expect(
+          await runWren(
+            ['setup'],
+            installEnvironment: InstallEnvironment(
+              dataDirectory: dataDirectory,
+            ),
+            wrenExecutable: wrenExecutable.path,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        final path = [
+          '${dataDirectory.path}/bin',
+          if (inheritedPath.isNotEmpty) inheritedPath,
+        ].join(Platform.isWindows ? ';' : ':');
+        final installedOutput = StringBuffer();
+
+        final installedStatus = await runDoctor(
+          ['doctor'],
+          output: installedOutput,
+          installed: const [],
+          runningExecutablePath: wrenExecutable.path,
+          processEnvironment: {...Platform.environment, 'PATH': path},
+        );
+
+        expect(installedStatus, 0);
+        expect(installedOutput.toString(), contains('PATH shims: ok'));
+        expect(installedOutput.toString(), contains('shims are installed'));
+        expect(
+          installedOutput.toString(),
+          contains('Current process PATH: ok'),
+        );
+        expect(
+          installedOutput.toString(),
+          contains('includes the Wren shim directory'),
+        );
+        expect(
+          installedOutput.toString(),
+          contains(
+            'Persistent shell startup and editor settings were not inspected '
+            'or changed.',
+          ),
+        );
+      },
+    );
+
+    test(
+      'times out a stalled Git check and retains other setup findings',
+      () async {
+        final fakePath = Directory('${temporaryDirectory.path}/slow-git')
+          ..createSync();
+        final fakeGit = File('${fakePath.path}/git');
+        await fakeGit.writeAsString('#!/bin/sh\nexec /bin/sleep 10\n');
+        await Process.run('chmod', ['u=rwx,go=rx', fakeGit.path]);
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: [_installed('3.45.0', needsRepair: true)],
+          processEnvironment: {'PATH': fakePath.path},
+        );
+
+        expect(status, 4);
+        expect(output.toString(), contains('System Git: incomplete'));
+        expect(output.toString(), contains('quick check timed out'));
+        expect(output.toString(), contains('Storage: ok'));
+        expect(output.toString(), contains('Release registry: informational'));
+        expect(output.toString(), contains('Flutter 3.45.0'));
+        expect(output.toString(), contains('needs repair'));
       },
     );
 

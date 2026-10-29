@@ -649,7 +649,7 @@ printf '\376\000\n' >&2
               return 0;
             },
       );
-      expect(doctorStatus, 0);
+      expect(doctorStatus, 1);
       expect(doctorOutput.toString(), contains('needs repair'));
       expect(doctorOutput.toString(), contains('wren repair $_version'));
       expect(sdkLaunched, isFalse);
