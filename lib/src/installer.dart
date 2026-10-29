@@ -49,8 +49,11 @@ const _macosOptionalArtifactGroups = <_OptionalArtifactGroup>[
     precacheFlag: '--ios',
     stampFiles: ['ios-sdk.stamp'],
     pathPrefixes: [
+      'bin/cache/artifacts/engine/ios/',
       'bin/cache/artifacts/engine/ios-',
       'bin/cache/artifacts/ios/',
+      'bin/cache/artifacts/libimobiledevice/',
+      'bin/cache/artifacts/usbmuxd/',
     ],
   ),
   _OptionalArtifactGroup(
@@ -58,6 +61,7 @@ const _macosOptionalArtifactGroups = <_OptionalArtifactGroup>[
     precacheFlag: '--android',
     stampFiles: ['android-sdk.stamp'],
     pathPrefixes: [
+      'bin/cache/artifacts/engine/android/',
       'bin/cache/artifacts/engine/android-',
       'bin/cache/artifacts/android/',
     ],
@@ -67,6 +71,7 @@ const _macosOptionalArtifactGroups = <_OptionalArtifactGroup>[
     precacheFlag: '--linux',
     stampFiles: ['linux-sdk.stamp'],
     pathPrefixes: [
+      'bin/cache/artifacts/engine/linux/',
       'bin/cache/artifacts/engine/linux-',
       'bin/cache/artifacts/linux/',
     ],
@@ -76,6 +81,7 @@ const _macosOptionalArtifactGroups = <_OptionalArtifactGroup>[
     precacheFlag: '--windows',
     stampFiles: ['windows-sdk.stamp'],
     pathPrefixes: [
+      'bin/cache/artifacts/engine/windows/',
       'bin/cache/artifacts/engine/windows-',
       'bin/cache/artifacts/windows/',
     ],
@@ -85,6 +91,7 @@ const _macosOptionalArtifactGroups = <_OptionalArtifactGroup>[
     precacheFlag: '--fuchsia',
     stampFiles: ['fuchsia-sdk.stamp'],
     pathPrefixes: [
+      'bin/cache/artifacts/engine/fuchsia/',
       'bin/cache/artifacts/engine/fuchsia-',
       'bin/cache/artifacts/fuchsia/',
     ],
@@ -2395,6 +2402,11 @@ class FlutterInstaller {
   }) async {
     if (host != HostPlatform.macosArm64) return false;
     final saved = releaseManifest['optionalArtifactInventories'];
+    if (saved != null && saved is! Map<String, Object?>) {
+      throw const InstallException(
+        'installed optional artifact inventory metadata is invalid.',
+      );
+    }
     final inventories = saved is Map<String, Object?>
         ? Map<String, Object?>.from(saved)
         : <String, Object?>{};
@@ -2404,8 +2416,14 @@ class FlutterInstaller {
     for (final group in _macosOptionalArtifactGroups) {
       final previous = _decodeOptionalArtifactInventory(
         inventories[group.name],
+        group,
       );
       final current = await _optionalArtifactInventory(release, group);
+      if (inventories.containsKey(group.name) && previous == null) {
+        throw const InstallException(
+          'installed optional artifact inventory metadata is invalid.',
+        );
+      }
       if (previous == null && current.isEmpty) continue;
 
       final trustedCurrent =
@@ -2548,9 +2566,13 @@ class FlutterInstaller {
       ..sort((a, b) => '${a['path']}'.compareTo('${b['path']}'));
   }
 
-  List<Map<String, Object?>>? _decodeOptionalArtifactInventory(Object? value) {
+  List<Map<String, Object?>>? _decodeOptionalArtifactInventory(
+    Object? value,
+    _OptionalArtifactGroup group,
+  ) {
     if (value is! List<Object?>) return null;
     final records = <Map<String, Object?>>[];
+    final seenPaths = <String>{};
     for (final item in value) {
       if (item is! Map<String, Object?> ||
           item['path'] is! String ||
@@ -2559,7 +2581,19 @@ class FlutterInstaller {
         return null;
       }
       final path = p.normalize(item['path']! as String);
-      if (p.isAbsolute(path) || p.split(path).contains('..')) return null;
+      final isStamp = group.stampFiles.any(
+        (name) => path == p.join('bin/cache', name),
+      );
+      final isGroupPath = group.pathPrefixes.any(path.startsWith);
+      if (p.isAbsolute(path) ||
+          p.split(path).contains('..') ||
+          (!isStamp && !isGroupPath) ||
+          !RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(item['sha256']! as String) ||
+          (item['mode']! as int) < 0 ||
+          (item['mode']! as int) > 0x1ff ||
+          !seenPaths.add(path)) {
+        return null;
+      }
       records.add(item);
     }
     return records;
@@ -2573,11 +2607,16 @@ class FlutterInstaller {
       final file = File(p.join(root.path, record['path']! as String));
       if (FileSystemEntity.typeSync(file.path, followLinks: false) !=
           FileSystemEntityType.file) {
+        _progress('Optional artifact is missing: ${record['path']}');
         return false;
       }
       final digest = await sha256.bind(file.openRead()).first;
-      if (digest.toString() != record['sha256'] ||
-          file.statSync().mode & 0x1ff != record['mode']) {
+      if (digest.toString() != record['sha256']) {
+        _progress('Optional artifact changed: ${record['path']}');
+        return false;
+      }
+      if (file.statSync().mode & 0x1ff != record['mode']) {
+        _progress('Optional artifact mode changed: ${record['path']}');
         return false;
       }
     }
@@ -2631,6 +2670,7 @@ class FlutterInstaller {
       for (final relative in replacements) {
         final destination = p.join(release.path, relative);
         final backup = p.join(stageRoot.path, 'backups', relative);
+        await Directory(p.dirname(destination)).create(recursive: true);
         if (FileSystemEntity.typeSync(destination, followLinks: false) !=
             FileSystemEntityType.notFound) {
           await Directory(p.dirname(backup)).create(recursive: true);
