@@ -4,6 +4,7 @@ import 'dart:io' as io;
 
 import 'package:args/command_runner.dart';
 import 'package:pub_semver/pub_semver.dart';
+import 'package:wren/src/doctor_integrity.dart';
 import 'package:wren/src/doctor_setup.dart';
 import 'package:wren/src/installer.dart';
 import 'package:wren/src/self_upgrade.dart';
@@ -11,6 +12,14 @@ import 'package:wren/src/tracing.dart';
 import 'package:yaml/yaml.dart';
 import 'package:yaml_edit/yaml_edit.dart';
 
+export 'src/doctor_integrity.dart'
+    show
+        DoctorCheckStatus,
+        DoctorFullIntegrityReport,
+        DoctorIntegrityCheck,
+        DoctorIntegrityStatus,
+        DoctorReleaseIntegrity,
+        DoctorScanCompletion;
 export 'src/installer.dart'
     show
         CleanupResult,
@@ -65,6 +74,7 @@ class WrenContext {
     this.upgradeReleaseApiUri,
     this.wrenVersionOverride,
     this.stdinStream,
+    this.fullDoctorCheckTimeout = const Duration(seconds: 30),
     DateTime? traceStartedAt,
     Stopwatch? traceElapsed,
   }) : _stdoutSink = stdoutSink ?? io.stdout,
@@ -136,6 +146,9 @@ class WrenContext {
 
   /// Input forwarded to SDK processes; defaults to the current process stdin.
   final Stream<List<int>>? stdinStream;
+
+  /// Per-operation timeout for a full doctor scan, configurable in CLI tests.
+  final Duration fullDoctorCheckTimeout;
 
   /// Environment visible to Wren setup diagnostics.
   Map<String, String> get processEnvironment =>
@@ -762,6 +775,7 @@ Future<int> runWren(
   Uri? upgradeReleaseApiUri,
   String? wrenVersion,
   Map<String, String>? processEnvironment,
+  Duration fullDoctorCheckTimeout = const Duration(seconds: 30),
 }) async {
   final tracingRequested = _traceOptionPresentBeforeCommand(arguments);
   final traceStartedAt = tracingRequested ? DateTime.now().toUtc() : null;
@@ -784,6 +798,7 @@ Future<int> runWren(
     upgradeReleaseApiUri: upgradeReleaseApiUri,
     wrenVersionOverride: wrenVersion,
     stdinStream: stdinStream,
+    fullDoctorCheckTimeout: fullDoctorCheckTimeout,
     traceStartedAt: traceStartedAt,
     traceElapsed: traceElapsed,
   );
@@ -1128,7 +1143,13 @@ class _ListCommand extends WrenCommand {
 }
 
 class _DoctorCommand extends WrenCommand {
-  new(super.context);
+  new(super.context) {
+    argParser.addFlag(
+      'full',
+      negatable: false,
+      help: 'Validate local integrity for every installed release.',
+    );
+  }
 
   @override
   String get name => 'doctor';
@@ -1149,18 +1170,55 @@ class _DoctorCommand extends WrenCommand {
       );
     }
 
+    final fullRequested = argResults!.flag('full');
+    DoctorFullIntegrityReport? fullReport;
     late final List<InstalledRelease> installed;
     Object? releaseEnumerationError;
-    try {
-      installed =
-          context.installedReleasesOverride ??
-          await context.traceOperation<List<InstalledRelease>>(
-            'release.list_installed',
-            context.installer.listInstalled,
-          );
-    } on Object catch (error) {
-      installed = const [];
-      releaseEnumerationError = error;
+    if (fullRequested) {
+      try {
+        fullReport = await context.traceOperation(
+          'release.full_integrity',
+          () => context.installer.inspectFullIntegrity(
+            checkTimeout: context.fullDoctorCheckTimeout,
+          ),
+        );
+      } on Object catch (error) {
+        fullReport = DoctorFullIntegrityReport(
+          const [],
+          checks: [
+            DoctorIntegrityCheck(
+              id: 'full-release-integrity',
+              status: DoctorCheckStatus.incomplete,
+              detail: 'full integrity scan could not complete: $error',
+              nextStep: 'Check Wren storage and retry `wren doctor --full`.',
+            ),
+          ],
+        );
+      }
+      final report = fullReport!;
+      installed = [
+        for (final release in report.releases)
+          InstalledRelease(
+            channel: release.channel,
+            version: release.version,
+            host: release.host,
+            dartVersion: release.dartVersion,
+            needsRepair: release.integrity == DoctorIntegrityStatus.needsRepair,
+            repairReason: release.repairReason,
+          ),
+      ];
+    } else {
+      try {
+        installed =
+            context.installedReleasesOverride ??
+            await context.traceOperation<List<InstalledRelease>>(
+              'release.list_installed',
+              context.installer.listInstalled,
+            );
+      } on Object catch (error) {
+        installed = const [];
+        releaseEnumerationError = error;
+      }
     }
     final setup =
         await DoctorSetupInspector(
@@ -1174,9 +1232,11 @@ class _DoctorCommand extends WrenCommand {
           installedReleases: installed,
           releaseEnumerationError: releaseEnumerationError,
         );
-    final exitStatus = setup.isIncomplete
+    final exitStatus = setup.isIncomplete || (fullReport?.isIncomplete ?? false)
         ? 4
-        : setup.hasCritical || installed.any((release) => release.needsRepair)
+        : setup.hasCritical ||
+              (fullReport?.hasConfirmedDamage ??
+                  installed.any((release) => release.needsRepair))
         ? 1
         : 0;
     final project = context._projectReleaseConstraints();
@@ -1216,7 +1276,11 @@ class _DoctorCommand extends WrenCommand {
       selectionSource = 'none';
     }
 
-    writeOut('Wren quick diagnosis (offline).');
+    writeOut(
+      fullReport == null
+          ? 'Wren quick diagnosis (offline).'
+          : 'Wren full diagnosis (offline).',
+    );
     writeOut('Setup:');
     for (final check in setup.checks) {
       final severity = switch (check.severity) {
@@ -1234,12 +1298,39 @@ class _DoctorCommand extends WrenCommand {
       '  Persistent shell startup and editor settings were not inspected or '
       'changed.',
     );
+    if (fullReport != null) {
+      for (final check in fullReport.checks) {
+        writeOut(
+          'Full scan ${check.id}: ${_doctorCheckStatusLabel(check.status)} — '
+          '${check.detail}',
+        );
+        if (check.nextStep != null) {
+          writeOut('  Next step: ${check.nextStep}');
+        }
+      }
+    }
     if (installed.isEmpty) {
-      writeOut('No Flutter releases are installed.');
+      writeOut(
+        fullReport?.isIncomplete ?? false
+            ? 'No Flutter releases were confirmed by the incomplete full scan.'
+            : 'No Flutter releases are installed.',
+      );
     } else {
       writeOut('Installed Flutter releases:');
       for (final release in installed) {
-        final readiness = release.needsRepair ? 'needs repair' : 'ready';
+        final fullRelease = fullReport?.releases
+            .where(
+              (candidate) =>
+                  candidate.channel == release.channel &&
+                  candidate.version == release.version &&
+                  candidate.host == release.host,
+            )
+            .firstOrNull;
+        final readiness = fullRelease == null
+            ? release.needsRepair
+                  ? 'needs repair'
+                  : 'ready'
+            : _doctorIntegrityLabel(fullRelease.integrity);
         final projectProblem = project.incompatibilityFor(release, targetHost);
         final compatibility = !project.pubspecExists
             ? 'not applicable'
@@ -1256,6 +1347,18 @@ class _DoctorCommand extends WrenCommand {
           '  Flutter ${release.version}  ${release.channel}  ${release.host}  '
           '$dart  $readiness$reason; project: $compatibility',
         );
+        if (fullRelease != null) {
+          for (final check in fullRelease.checks) {
+            if (check.status == DoctorCheckStatus.passed && !verbose) continue;
+            writeOut(
+              '    ${check.id}: ${_doctorCheckStatusLabel(check.status)} — '
+              '${check.detail}',
+            );
+            if (check.nextStep != null) {
+              writeOut('      Next step: ${check.nextStep}');
+            }
+          }
+        }
         if (verbose) {
           writeOut(
             '    Quick readiness uses the same inexpensive checks as '
@@ -1265,7 +1368,7 @@ class _DoctorCommand extends WrenCommand {
             writeOut('    Project compatibility: $projectProblem.');
           }
         }
-        if (release.needsRepair) {
+        if (release.needsRepair && fullRelease == null) {
           writeOut('    Next step: run `wren repair ${release.version}`.');
         }
       }
@@ -1338,6 +1441,19 @@ class _DoctorCommand extends WrenCommand {
     return exitStatus;
   }
 }
+
+String _doctorIntegrityLabel(DoctorIntegrityStatus status) => switch (status) {
+  DoctorIntegrityStatus.basicChecksPassed => 'basic checks passed',
+  DoctorIntegrityStatus.fullyVerified => 'fully verified',
+  DoctorIntegrityStatus.needsRepair => 'needs repair',
+  DoctorIntegrityStatus.incomplete => 'incomplete',
+};
+
+String _doctorCheckStatusLabel(DoctorCheckStatus status) => switch (status) {
+  DoctorCheckStatus.passed => 'passed',
+  DoctorCheckStatus.confirmedDamage => 'confirmed damage',
+  DoctorCheckStatus.incomplete => 'incomplete',
+};
 
 class _SetCommand extends WrenCommand {
   new(super.context) {
