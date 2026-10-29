@@ -1,6 +1,6 @@
 # 16: Repair optional artifacts on Apple Silicon
 
-Status: in-progress
+Status: complete
 Blocked by: [03: Install a stable Flutter release on Apple Silicon](03-install-stable-flutter-apple-silicon.md), [15: Repair optional artifacts on Linux](15-repair-optional-artifacts-linux.md), [CLI architecture: Migrate existing Wren CLI commands](../../wren-cli-architecture/issues/01-migrate-existing-cli.md)
 Contract: [Wren version manager spec](../../wren-version-manager/spec.md)
 
