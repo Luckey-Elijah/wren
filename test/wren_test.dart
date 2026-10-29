@@ -406,6 +406,7 @@ environment:
       required StringSink output,
       required List<InstalledRelease>? installed,
       StringSink? errors,
+      Stream<void>? waitCancellation,
       String? fallback,
       String? environmentRelease,
       String? wrenExecutable,
@@ -414,7 +415,10 @@ environment:
     }) => runWren(
       arguments,
       host: HostPlatform.linuxX64,
-      installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+      installEnvironment: InstallEnvironment(
+        dataDirectory: dataDirectory,
+        waitCancellation: waitCancellation,
+      ),
       projectDirectory: projectDirectory,
       installedReleases: installed,
       globalFallback: fallback,
@@ -859,6 +863,161 @@ environment:
         expect(output.toString(), contains('Release registry: informational'));
         expect(output.toString(), contains('Flutter 3.45.0'));
         expect(output.toString(), contains('needs repair'));
+      },
+    );
+
+    test(
+      'JSON keeps the quick report structured on all diagnostic statuses',
+      () async {
+        await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: ">=3.46.0 <3.48.0"
+  sdk: ">=3.13.0 <3.14.0"
+''');
+        final stdout = StringBuffer();
+        final stderr = StringBuffer();
+        final status = await runDoctor(
+          ['doctor', '--json', '--verbose'],
+          output: stdout,
+          errors: stderr,
+          installed: [_installed('3.47.8')],
+        );
+
+        expect(status, 0);
+        expect(stdout.toString().trim().split('\n'), hasLength(1));
+        final report = jsonDecode(stdout.toString()) as Map<String, Object?>;
+        expect(report['schema_version'], 1);
+        expect(report['depth'], 'quick');
+        expect(report['completion'], 'complete');
+        expect(report['exit_status'], 0);
+        expect(report['has_critical_findings'], isFalse);
+        expect(stderr.toString(), contains('Setup Storage:'));
+
+        final project = report['project']! as Map<String, Object?>;
+        expect(project['pubspec_present'], isTrue);
+        expect(project['compatibility'], 'evaluated');
+        expect(project['compatible_release'], '3.47.8');
+        final releases = report['releases']! as List<Object?>;
+        final release = releases.single! as Map<String, Object?>;
+        expect(release['integrity'], 'basic_checks_passed');
+        expect(
+          (release['compatibility']! as Map<String, Object?>)['status'],
+          'compatible',
+        );
+        final selection = report['selection']! as Map<String, Object?>;
+        expect(selection['release'], '3.47.8');
+        expect(selection['source'], 'project_constraints');
+        expect(selection['is_installed'], isTrue);
+
+        final criticalOutput = StringBuffer();
+        final criticalStatus = await runDoctor(
+          ['doctor', '--json'],
+          output: criticalOutput,
+          installed: [_installed('3.45.0', needsRepair: true)],
+        );
+        expect(criticalStatus, 1);
+        final criticalReport =
+            jsonDecode(criticalOutput.toString()) as Map<String, Object?>;
+        expect(criticalReport['completion'], 'complete');
+        expect(criticalReport['exit_status'], 1);
+        expect(criticalReport['has_critical_findings'], isTrue);
+        final criticalRelease =
+            (criticalReport['releases']! as List<Object?>).single!
+                as Map<String, Object?>;
+        expect(criticalRelease['integrity'], 'needs_repair');
+
+        final noSelectionOutput = StringBuffer();
+        final noSelectionStatus = await runDoctor(
+          ['doctor', '--json'],
+          output: noSelectionOutput,
+          installed: [_installed('3.45.0')],
+        );
+        expect(noSelectionStatus, 0);
+        final noSelectionReport =
+            jsonDecode(noSelectionOutput.toString()) as Map<String, Object?>;
+        expect(noSelectionReport['completion'], 'complete');
+        expect(noSelectionReport['exit_status'], 0);
+        expect(
+          (noSelectionReport['selection']! as Map<String, Object?>)['release'],
+          isNull,
+        );
+
+        final fakePath = Directory('${temporaryDirectory.path}/slow-git')
+          ..createSync();
+        final fakeGit = File('${fakePath.path}/git');
+        await fakeGit.writeAsString('#!/bin/sh\nexec /bin/sleep 10\n');
+        await Process.run('chmod', ['u=rwx,go=rx', fakeGit.path]);
+        final incompleteOutput = StringBuffer();
+        final incompleteStatus = await runDoctor(
+          ['doctor', '--json'],
+          output: incompleteOutput,
+          installed: [_installed('3.45.0', needsRepair: true)],
+          processEnvironment: {'PATH': fakePath.path},
+        );
+        expect(incompleteStatus, 4);
+        final incompleteReport =
+            jsonDecode(incompleteOutput.toString()) as Map<String, Object?>;
+        expect(incompleteReport['completion'], 'incomplete');
+        expect(incompleteReport['exit_status'], 4);
+        expect(incompleteReport['has_critical_findings'], isTrue);
+        final incompleteSetup =
+            incompleteReport['setup']! as Map<String, Object?>;
+        expect(incompleteSetup['is_incomplete'], isTrue);
+        expect(
+          (incompleteSetup['checks']! as List<Object?>)
+              .cast<Map<String, Object?>>()
+              .any(
+                (check) =>
+                    check['component'] == 'System Git' &&
+                    check['severity'] == 'incomplete',
+              ),
+          isTrue,
+        );
+        final incompleteRelease =
+            (incompleteReport['releases']! as List<Object?>).single!
+                as Map<String, Object?>;
+        expect(incompleteRelease['integrity'], 'needs_repair');
+      },
+    );
+
+    test(
+      'JSON usage errors retain status 2 and do not emit a report',
+      () async {
+        final stdout = StringBuffer();
+        final stderr = StringBuffer();
+
+        final status = await runWren(
+          ['doctor', '--json', '--not-a-doctor-option'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+          projectDirectory: projectDirectory,
+          stdoutSink: stdout,
+          stderrSink: stderr,
+        );
+
+        expect(status, 2);
+        expect(stdout.toString(), isEmpty);
+        expect(stderr.toString(), contains('Could not find an option'));
+      },
+    );
+
+    test(
+      'doctor cancellation returns status 6 without emitting JSON',
+      () async {
+        final stdout = StringBuffer();
+        final stderr = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor', '--json'],
+          output: stdout,
+          errors: stderr,
+          installed: const [],
+          waitCancellation: Stream<void>.value(null),
+        );
+
+        expect(status, 6);
+        expect(stdout.toString(), isEmpty);
+        expect(stderr.toString(), contains('wren doctor was cancelled'));
       },
     );
 

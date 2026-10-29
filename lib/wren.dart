@@ -1144,11 +1144,17 @@ class _ListCommand extends WrenCommand {
 
 class _DoctorCommand extends WrenCommand {
   new(super.context) {
-    argParser.addFlag(
-      'full',
-      negatable: false,
-      help: 'Validate local integrity for every installed release.',
-    );
+    argParser
+      ..addFlag(
+        'full',
+        negatable: false,
+        help: 'Validate local integrity for every installed release.',
+      )
+      ..addFlag(
+        'json',
+        negatable: false,
+        help: 'Write a versioned JSON diagnosis to standard output.',
+      );
   }
 
   @override
@@ -1160,6 +1166,20 @@ class _DoctorCommand extends WrenCommand {
 
   @override
   Future<int> run() async {
+    final cancellation = DoctorCancellation(
+      context.installEnvironment.waitCancellation ??
+          io.ProcessSignal.sigint.watch().map((_) {}),
+    );
+    try {
+      await cancellation.race(Future<void>.delayed(Duration.zero));
+      return await cancellation.race(_runDoctor(cancellation));
+    } finally {
+      await cancellation.dispose();
+    }
+  }
+
+  Future<int> _runDoctor(DoctorCancellation cancellation) async {
+    cancellation.throwIfCancelled();
     if (argResults!.rest.isNotEmpty) {
       failUsage('doctor does not accept positional arguments.');
     }
@@ -1171,17 +1191,23 @@ class _DoctorCommand extends WrenCommand {
     }
 
     final fullRequested = argResults!.flag('full');
+    final jsonRequested = argResults!.flag('json');
     DoctorFullIntegrityReport? fullReport;
     late final List<InstalledRelease> installed;
     Object? releaseEnumerationError;
     if (fullRequested) {
       try {
-        fullReport = await context.traceOperation(
-          'release.full_integrity',
-          () => context.installer.inspectFullIntegrity(
-            checkTimeout: context.fullDoctorCheckTimeout,
+        fullReport = await cancellation.race(
+          context.traceOperation(
+            'release.full_integrity',
+            () => context.installer.inspectFullIntegrity(
+              checkTimeout: context.fullDoctorCheckTimeout,
+              cancellation: cancellation,
+            ),
           ),
         );
+      } on InstallCancelledException {
+        rethrow;
       } on Object catch (error) {
         fullReport = DoctorFullIntegrityReport(
           const [],
@@ -1211,27 +1237,34 @@ class _DoctorCommand extends WrenCommand {
       try {
         installed =
             context.installedReleasesOverride ??
-            await context.traceOperation<List<InstalledRelease>>(
-              'release.list_installed',
-              context.installer.listInstalled,
+            await cancellation.race(
+              context.traceOperation<List<InstalledRelease>>(
+                'release.list_installed',
+                () =>
+                    context.installer.listInstalled(cancellation: cancellation),
+              ),
             );
+      } on InstallCancelledException {
+        rethrow;
       } on Object catch (error) {
         installed = const [];
         releaseEnumerationError = error;
       }
     }
-    final setup =
-        await DoctorSetupInspector(
-          dataDirectory: context.installEnvironment.dataDirectory,
-          executablePath:
-              context.runningExecutablePath ?? io.Platform.resolvedExecutable,
-          processEnvironment: context.processEnvironment,
-          processEnvironmentOverride: context.processEnvironmentOverride,
-          globalFallbackOverride: context.globalFallbackOverride,
-        ).inspect(
-          installedReleases: installed,
-          releaseEnumerationError: releaseEnumerationError,
-        );
+    final setup = await cancellation.race(
+      DoctorSetupInspector(
+        dataDirectory: context.installEnvironment.dataDirectory,
+        executablePath:
+            context.runningExecutablePath ?? io.Platform.resolvedExecutable,
+        processEnvironment: context.processEnvironment,
+        processEnvironmentOverride: context.processEnvironmentOverride,
+        globalFallbackOverride: context.globalFallbackOverride,
+      ).inspect(
+        installedReleases: installed,
+        releaseEnumerationError: releaseEnumerationError,
+      ),
+    );
+    cancellation.throwIfCancelled();
     final exitStatus = setup.isIncomplete || (fullReport?.isIncomplete ?? false)
         ? 4
         : setup.hasCritical ||
@@ -1239,6 +1272,13 @@ class _DoctorCommand extends WrenCommand {
                   installed.any((release) => release.needsRepair))
         ? 1
         : 0;
+    final completion = setup.isIncomplete || (fullReport?.isIncomplete ?? false)
+        ? 'incomplete'
+        : 'complete';
+    final hasCriticalFinding =
+        setup.hasCritical ||
+        (fullReport?.hasConfirmedDamage ??
+            installed.any((release) => release.needsRepair));
     final project = context._projectReleaseConstraints();
     final compatibleProjectRelease = project.selectRelease(
       targetHost,
@@ -1251,7 +1291,9 @@ class _DoctorCommand extends WrenCommand {
     final normalizedEnvironmentRelease = environmentRelease?.trim();
     String? fallback;
     try {
-      fallback = await context.globalFallback;
+      fallback = await cancellation.race(context.globalFallback);
+    } on InstallCancelledException {
+      rethrow;
     } on Object {
       // Setup diagnostics report an uninspectable config as incomplete below.
     }
@@ -1275,6 +1317,200 @@ class _DoctorCommand extends WrenCommand {
       selectedRelease = null;
       selectionSource = 'none';
     }
+
+    cancellation.throwIfCancelled();
+
+    DoctorReleaseIntegrity? fullIntegrityFor(InstalledRelease release) =>
+        fullReport?.releases
+            .where(
+              (candidate) =>
+                  candidate.channel == release.channel &&
+                  candidate.version == release.version &&
+                  candidate.host == release.host,
+            )
+            .firstOrNull;
+
+    String compatibilityStatus(InstalledRelease release) {
+      if (!project.pubspecExists) return 'not_applicable';
+      if (project.problem != null) return 'unable_to_evaluate';
+      return project.incompatibilityFor(release, targetHost) == null
+          ? 'compatible'
+          : 'incompatible';
+    }
+
+    String? compatibilityReason(InstalledRelease release) =>
+        !project.pubspecExists
+        ? null
+        : project.incompatibilityFor(release, targetHost);
+
+    Map<String, Object?> setupCheckJson(DoctorSetupCheck check) => {
+      'component': check.component,
+      'severity': switch (check.severity) {
+        DoctorCheckSeverity.ok => 'ok',
+        DoctorCheckSeverity.informational => 'informational',
+        DoctorCheckSeverity.critical => 'critical',
+        DoctorCheckSeverity.incomplete => 'incomplete',
+      },
+      'summary': check.summary,
+      if (check.nextStep != null) 'next_step': check.nextStep,
+    };
+
+    Map<String, Object?> integrityCheckJson(DoctorIntegrityCheck check) => {
+      'id': check.id,
+      'status': switch (check.status) {
+        DoctorCheckStatus.passed => 'passed',
+        DoctorCheckStatus.confirmedDamage => 'confirmed_damage',
+        DoctorCheckStatus.incomplete => 'incomplete',
+      },
+      'detail': check.detail,
+      if (check.nextStep != null) 'next_step': check.nextStep,
+    };
+
+    if (jsonRequested) {
+      if (verbose) {
+        for (final check in setup.checks) {
+          writeError(
+            'Setup ${check.component}: ${check.severity.name} — '
+            '${check.summary}',
+          );
+        }
+        for (final check
+            in fullReport?.checks ?? const <DoctorIntegrityCheck>[]) {
+          writeError(
+            'Full scan ${check.id}: ${_doctorCheckStatusLabel(check.status)} — '
+            '${check.detail}',
+          );
+        }
+        for (final release in installed) {
+          final projectProblem = compatibilityReason(release);
+          if (projectProblem != null) {
+            writeError(
+              'Project compatibility for Flutter ${release.version}: '
+              '$projectProblem.',
+            );
+          }
+          for (final check
+              in fullIntegrityFor(release)?.checks ??
+                  const <DoctorIntegrityCheck>[]) {
+            writeError(
+              'Flutter ${release.version} ${check.id}: '
+              '${_doctorCheckStatusLabel(check.status)} — ${check.detail}',
+            );
+          }
+        }
+      }
+
+      final releaseJson = [
+        for (final release in installed)
+          () {
+            final fullRelease = fullIntegrityFor(release);
+            final integrity = fullRelease == null
+                ? release.needsRepair
+                      ? 'needs_repair'
+                      : 'basic_checks_passed'
+                : switch (fullRelease.integrity) {
+                    DoctorIntegrityStatus.basicChecksPassed =>
+                      'basic_checks_passed',
+                    DoctorIntegrityStatus.fullyVerified => 'fully_verified',
+                    DoctorIntegrityStatus.needsRepair => 'needs_repair',
+                    DoctorIntegrityStatus.incomplete => 'incomplete',
+                  };
+            return <String, Object?>{
+              'channel': release.channel,
+              'version': release.version,
+              'host': release.host,
+              'dart_version': release.dartVersion,
+              'integrity': integrity,
+              'compatibility': {
+                'status': compatibilityStatus(release),
+                if (compatibilityReason(release) != null)
+                  'reason': compatibilityReason(release),
+              },
+              'integrity_checks': fullRelease == null
+                  ? null
+                  : [
+                      for (final check in fullRelease.checks)
+                        integrityCheckJson(check),
+                    ],
+            };
+          }(),
+      ];
+      final selected = selectedRelease == null
+          ? null
+          : installed
+                .where((release) => release.version == selectedRelease)
+                .firstOrNull;
+      final selectionSourceCode = switch (selectionSource) {
+        'command-line --release override' => 'command_line_override',
+        'WREN_FLUTTER_RELEASE environment override' => 'environment_override',
+        'current project constraints' => 'project_constraints',
+        'global fallback' => 'global_fallback',
+        _ => 'none',
+      };
+      final selectedIntegrity = selected == null
+          ? null
+          : fullIntegrityFor(selected)?.integrity;
+      final selectedIntegrityLabel = selected == null
+          ? null
+          : selectedIntegrity == null
+          ? selected.needsRepair
+                ? 'needs_repair'
+                : 'basic_checks_passed'
+          : switch (selectedIntegrity) {
+              DoctorIntegrityStatus.basicChecksPassed => 'basic_checks_passed',
+              DoctorIntegrityStatus.fullyVerified => 'fully_verified',
+              DoctorIntegrityStatus.needsRepair => 'needs_repair',
+              DoctorIntegrityStatus.incomplete => 'incomplete',
+            };
+      final selectedCompatibility = selected == null
+          ? selectedRelease == null
+                ? 'not_applicable'
+                : 'not_installed'
+          : compatibilityStatus(selected);
+      final report = <String, Object?>{
+        'schema_version': 1,
+        'depth': fullRequested ? 'full' : 'quick',
+        'completion': completion,
+        'exit_status': exitStatus,
+        'has_critical_findings': hasCriticalFinding,
+        'setup': {
+          'has_critical_findings': setup.hasCritical,
+          'is_incomplete': setup.isIncomplete,
+          'checks': [for (final check in setup.checks) setupCheckJson(check)],
+        },
+        'project': {
+          'pubspec_present': project.pubspecExists,
+          'flutter_constraint': project.flutterText,
+          'dart_constraint': project.dartText,
+          'compatibility': !project.pubspecExists
+              ? 'not_applicable'
+              : project.problem == null
+              ? 'evaluated'
+              : 'unable_to_evaluate',
+          'compatible_release': compatibleProjectRelease,
+          if (project.problem != null) 'problem': project.problem,
+        },
+        'selection': {
+          'release': selectedRelease,
+          'source': selectionSourceCode,
+          'source_description': selectionSource,
+          'is_installed': selectedRelease == null ? null : selected != null,
+          'integrity': selectedIntegrityLabel,
+          'compatibility': selectedCompatibility,
+        },
+        'releases': releaseJson,
+        'scan_checks': [
+          for (final check
+              in fullReport?.checks ?? const <DoctorIntegrityCheck>[])
+            integrityCheckJson(check),
+        ],
+      };
+      cancellation.throwIfCancelled();
+      writeOut(jsonEncode(report));
+      return exitStatus;
+    }
+
+    cancellation.throwIfCancelled();
 
     writeOut(
       fullReport == null
@@ -1318,14 +1554,7 @@ class _DoctorCommand extends WrenCommand {
     } else {
       writeOut('Installed Flutter releases:');
       for (final release in installed) {
-        final fullRelease = fullReport?.releases
-            .where(
-              (candidate) =>
-                  candidate.channel == release.channel &&
-                  candidate.version == release.version &&
-                  candidate.host == release.host,
-            )
-            .firstOrNull;
+        final fullRelease = fullIntegrityFor(release);
         final readiness = fullRelease == null
             ? release.needsRepair
                   ? 'needs repair'

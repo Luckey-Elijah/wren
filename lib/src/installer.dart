@@ -282,6 +282,43 @@ class InstallCancelledException implements Exception {
   final String message;
 }
 
+/// Cancellation signal scoped to one doctor invocation.
+class DoctorCancellation {
+  /// Listens to [signals] until the doctor invocation is disposed.
+  new(Stream<void> signals) {
+    _subscription = signals.listen((_) {
+      if (!_cancelled.isCompleted) _cancelled.complete();
+    });
+  }
+
+  final Completer<void> _cancelled = Completer<void>();
+  late final StreamSubscription<void> _subscription;
+
+  /// Whether the doctor invocation has received a cancellation signal.
+  bool get isCancelled => _cancelled.isCompleted;
+
+  /// Throws the ordinary Wren cancellation exception when signaled.
+  void throwIfCancelled() {
+    if (isCancelled) {
+      throw InstallCancelledException('wren doctor was cancelled.');
+    }
+  }
+
+  /// Waits for [operation] or interrupts the wait when cancellation arrives.
+  Future<T> race<T>(Future<T> operation) {
+    throwIfCancelled();
+    return Future.any<T>([
+      operation,
+      _cancelled.future.then<T>((_) {
+        throw InstallCancelledException('wren doctor was cancelled.');
+      }),
+    ]);
+  }
+
+  /// Stops listening for later cancellation signals.
+  Future<void> dispose() => _subscription.cancel();
+}
+
 /// An SDK launch failure with its Wren process exit status.
 class SdkLaunchException implements Exception {
   /// Creates a launch failure.
@@ -399,7 +436,10 @@ class FlutterInstaller {
   /// Lists published releases and performs the inexpensive launch-readiness
   /// checks used by Wren before selecting an SDK.
   /// Lists published releases and checks their launch readiness.
-  Future<List<InstalledRelease>> listInstalled() async {
+  Future<List<InstalledRelease>> listInstalled({
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
     final releasesDirectory = Directory(
       p.join(environment.dataDirectory.absolute.path, 'releases'),
     );
@@ -407,6 +447,7 @@ class FlutterInstaller {
 
     final installed = <InstalledRelease>[];
     await for (final entity in releasesDirectory.list(followLinks: false)) {
+      cancellation?.throwIfCancelled();
       if (entity is! Directory ||
           FileSystemEntity.typeSync(entity.path, followLinks: false) !=
               FileSystemEntityType.directory) {
@@ -417,10 +458,18 @@ class FlutterInstaller {
           FileSystemEntityType.notFound) {
         continue;
       }
-      final result = await _readiness(entity, releasesDirectory.parent);
+      final readiness = _readiness(
+        entity,
+        releasesDirectory.parent,
+        cancellation: cancellation,
+      );
+      final result = cancellation == null
+          ? await readiness
+          : await cancellation.race(readiness);
       if (result == null) continue;
       installed.add(result);
     }
+    cancellation?.throwIfCancelled();
     installed.sort((left, right) {
       final channelOrder = _readinessChannelOrder(left.channel)
           .compareTo(_readinessChannelOrder(right.channel));
@@ -443,7 +492,9 @@ class FlutterInstaller {
   /// incomplete and do not create a damage marker.
   Future<DoctorFullIntegrityReport> inspectFullIntegrity({
     Duration checkTimeout = const Duration(seconds: 30),
+    DoctorCancellation? cancellation,
   }) async {
+    cancellation?.throwIfCancelled();
     final releasesDirectory = Directory(
       p.join(environment.dataDirectory.absolute.path, 'releases'),
     );
@@ -487,6 +538,7 @@ class FlutterInstaller {
     try {
       await for (final entity
           in releasesDirectory.list(followLinks: false).timeout(checkTimeout)) {
+        cancellation?.throwIfCancelled();
         if (entity is! Directory ||
             FileSystemEntity.typeSync(entity.path, followLinks: false) !=
                 FileSystemEntityType.directory) {
@@ -519,13 +571,17 @@ class FlutterInstaller {
     final sourceChecks = <String, Future<DoctorIntegrityCheck>>{};
     final results = <DoctorReleaseIntegrity>[];
     for (final release in registered) {
+      cancellation?.throwIfCancelled();
       late final DoctorReleaseIntegrity result;
       try {
         result = await _inspectFullRelease(
           release,
           sourceChecks: sourceChecks,
           checkTimeout: checkTimeout,
+          cancellation: cancellation,
         );
+      } on InstallCancelledException {
+        rethrow;
       } on Object catch (error) {
         result = DoctorReleaseIntegrity(
           channel: 'unknown',
@@ -541,13 +597,18 @@ class FlutterInstaller {
           ],
         );
       }
+      cancellation?.throwIfCancelled();
       results.add(result);
       if (result.hasConfirmedDamage) {
         try {
+          cancellation?.throwIfCancelled();
           await _persistFullDoctorNeedsRepair(
             release,
             result,
+            cancellation: cancellation,
           ).timeout(checkTimeout);
+        } on InstallCancelledException {
+          rethrow;
         } on Object catch (error) {
           results[results.length - 1] = DoctorReleaseIntegrity(
             channel: result.channel,
@@ -567,6 +628,8 @@ class FlutterInstaller {
       }
     }
 
+    cancellation?.throwIfCancelled();
+
     return DoctorFullIntegrityReport(
       results,
       checks: registryCheck == null ? const [] : [registryCheck],
@@ -577,7 +640,9 @@ class FlutterInstaller {
     Directory release, {
     required Map<String, Future<DoctorIntegrityCheck>> sourceChecks,
     required Duration checkTimeout,
+    DoctorCancellation? cancellation,
   }) async {
+    cancellation?.throwIfCancelled();
     _progress('Inspecting registered release ${p.basename(release.path)}');
     final read = await _readDoctorReleaseManifest(release, checkTimeout);
     final data = read.data;
@@ -643,6 +708,7 @@ class FlutterInstaller {
       ),
       checkTimeout,
       nextStep: 'Run `wren repair $version`.',
+      cancellation: cancellation,
     );
     checks.add(identity);
 
@@ -687,6 +753,7 @@ class FlutterInstaller {
           ),
           checkTimeout,
           nextStep: 'Run `wren repair $version`.',
+          cancellation: cancellation,
         ),
       );
       sourceCheck = await sourceFuture;
@@ -713,6 +780,7 @@ class FlutterInstaller {
           ),
           checkTimeout,
           nextStep: 'Run `wren repair $version`.',
+          cancellation: cancellation,
         ),
       );
     } else if (sourceCheck.status == DoctorCheckStatus.confirmedDamage) {
@@ -746,6 +814,7 @@ class FlutterInstaller {
         host: host,
         version: version,
         checkTimeout: checkTimeout,
+        cancellation: cancellation,
       ),
     );
 
@@ -843,15 +912,23 @@ class FlutterInstaller {
     Future<void> Function() validate,
     Duration timeout, {
     String? nextStep,
+    DoctorCancellation? cancellation,
   }) async {
     _progress('Checking doctor integrity: $id');
     try {
-      await validate().timeout(timeout);
+      final operation = validate().timeout(timeout);
+      if (cancellation == null) {
+        await operation;
+      } else {
+        await cancellation.race(operation);
+      }
       return DoctorIntegrityCheck(
         id: id,
         status: DoctorCheckStatus.passed,
         detail: passedDetail,
       );
+    } on InstallCancelledException {
+      rethrow;
     } on _DoctorConfirmedDamage catch (error) {
       return DoctorIntegrityCheck(
         id: id,
@@ -901,6 +978,7 @@ class FlutterInstaller {
     Directory release,
     Map<String, Object?> manifest, {
     required Duration checkTimeout,
+    DoctorCancellation? cancellation,
   }) async {
     final channel = manifest['channel'];
     final version = manifest['version'];
@@ -948,6 +1026,7 @@ class FlutterInstaller {
     final actualFramework = await _readLocalGitHead(
       release.path,
       checkTimeout: checkTimeout,
+      cancellation: cancellation,
     );
     if (actualFramework.toLowerCase() != frameworkRevision.toLowerCase()) {
       throw const _DoctorConfirmedDamage(
@@ -1016,6 +1095,7 @@ class FlutterInstaller {
   Future<String> _readLocalGitHead(
     String workingDirectory, {
     required Duration checkTimeout,
+    DoctorCancellation? cancellation,
   }) async {
     late final Process process;
     try {
@@ -1031,8 +1111,11 @@ class FlutterInstaller {
     final stderr = utf8.decoder.bind(process.stderr).join();
     final exitCode = process.exitCode;
     try {
-      final results = await Future.wait<Object>([stdout, stderr, exitCode])
+      final operation = Future.wait<Object>([stdout, stderr, exitCode])
           .timeout(checkTimeout);
+      final results = cancellation == null
+          ? await operation
+          : await cancellation.race(operation);
       final output = results[0] as String;
       final error = results[1] as String;
       final status = results[2] as int;
@@ -1051,19 +1134,26 @@ class FlutterInstaller {
       }
       return output.trim();
     } on TimeoutException {
-      final exited = process.exitCode;
-      process.kill();
-      try {
-        await exited.timeout(const Duration(milliseconds: 100));
-      } on TimeoutException {
-        process.kill(ProcessSignal.sigkill);
-        try {
-          await exited.timeout(const Duration(seconds: 1));
-        } on TimeoutException {
-          // Keep the doctor's deadline bounded if the OS cannot reap git.
-        }
-      }
+      await _terminateDoctorProcess(process);
       rethrow;
+    } on InstallCancelledException {
+      await _terminateDoctorProcess(process);
+      rethrow;
+    }
+  }
+
+  Future<void> _terminateDoctorProcess(Process process) async {
+    final exited = process.exitCode;
+    process.kill();
+    try {
+      await exited.timeout(const Duration(milliseconds: 100));
+    } on TimeoutException {
+      process.kill(ProcessSignal.sigkill);
+      try {
+        await exited.timeout(const Duration(seconds: 1));
+      } on TimeoutException {
+        // Keep doctor's cancellation and timeout cleanup bounded.
+      }
     }
   }
 
@@ -1347,6 +1437,7 @@ class FlutterInstaller {
     required HostPlatform? host,
     required String version,
     required Duration checkTimeout,
+    DoctorCancellation? cancellation,
   }) async {
     if (host == null) {
       return [
@@ -1444,6 +1535,7 @@ class FlutterInstaller {
           ),
           checkTimeout,
           nextStep: 'Run `wren repair $version`.',
+          cancellation: cancellation,
         ),
       );
     }
@@ -1548,8 +1640,10 @@ class FlutterInstaller {
 
   Future<void> _persistFullDoctorNeedsRepair(
     Directory release,
-    DoctorReleaseIntegrity result,
-  ) async {
+    DoctorReleaseIntegrity result, {
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
     final sourceDamage = result.checks.any(
       (check) =>
           check.id == 'retained-source' &&
@@ -1557,12 +1651,21 @@ class FlutterInstaller {
     );
     if (sourceDamage) {
       final releaseMarker = File(p.join(release.path, '.wren-release.json'));
-      final decoded = await _readDoctorReleaseIdentity(releaseMarker);
+      final decoded = await _readDoctorReleaseIdentity(
+        releaseMarker,
+        cancellation: cancellation,
+      );
+      cancellation?.throwIfCancelled();
       final sourceKey = decoded?.sourceKey;
       if (sourceKey != null) {
         var sourceMarked = false;
         try {
-          sourceMarked = await _persistSharedSourceNeedsRepair(sourceKey);
+          sourceMarked = await _persistSharedSourceNeedsRepair(
+            sourceKey,
+            cancellation: cancellation,
+          );
+        } on InstallCancelledException {
+          rethrow;
         } on Object {
           // Fall back to dependent release safety markers if this path cannot
           // be safely updated or is not writable.
@@ -1571,6 +1674,7 @@ class FlutterInstaller {
           await _markDependentReleasesForSourceRepair(
             sourceKey,
             result.repairReason ?? 'shared artifact source needs repair',
+            cancellation: cancellation,
           );
         }
       }
@@ -1607,14 +1711,19 @@ class FlutterInstaller {
       await _persistReleaseSafetyMarker(
         release,
         result.repairReason ?? 'release metadata needs repair',
+        cancellation: cancellation,
       );
       return;
     }
-    final decoded = await _readDoctorReleaseIdentity(marker);
+    final decoded = await _readDoctorReleaseIdentity(
+      marker,
+      cancellation: cancellation,
+    );
     if (decoded == null) {
       await _persistReleaseSafetyMarker(
         release,
         result.repairReason ?? 'release metadata needs repair',
+        cancellation: cancellation,
       );
       return;
     }
@@ -1626,18 +1735,23 @@ class FlutterInstaller {
     updated['readiness'] = 'needs-repair';
     updated['readinessReason'] =
         result.repairReason ?? 'full integrity check failed';
-    await _publishManifest(release.path, updated);
+    cancellation?.throwIfCancelled();
+    await _publishManifest(release.path, updated, cancellation: cancellation);
   }
 
   Future<_DoctorReleaseIdentity?> _readDoctorReleaseIdentity(
-    File marker,
-  ) async {
+    File marker, {
+    DoctorCancellation? cancellation,
+  }) async {
     try {
       if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
           FileSystemEntityType.file) {
         return null;
       }
-      final data = jsonDecode(await marker.readAsString());
+      final read = marker.readAsString();
+      final data = jsonDecode(
+        cancellation == null ? await read : await cancellation.race(read),
+      );
       if (data is! Map<String, Object?>) return null;
       final engineRevision = data['engineRevision'];
       final host = _hostFromIdentity(
@@ -1653,12 +1767,18 @@ class FlutterInstaller {
           ? sourceKey! as String
           : null;
       return _DoctorReleaseIdentity(data: data, sourceKey: resolvedSourceKey);
+    } on InstallCancelledException {
+      rethrow;
     } on Object {
       return null;
     }
   }
 
-  Future<bool> _persistSharedSourceNeedsRepair(String sourceKey) async {
+  Future<bool> _persistSharedSourceNeedsRepair(
+    String sourceKey, {
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
     final sourcesDirectory = Directory(
       p.join(environment.dataDirectory.absolute.path, 'sources'),
     );
@@ -1668,6 +1788,7 @@ class FlutterInstaller {
     );
     if (sourcesType == FileSystemEntityType.notFound) {
       await sourcesDirectory.create(recursive: true);
+      cancellation?.throwIfCancelled();
     } else if (sourcesType != FileSystemEntityType.directory) {
       return false;
     }
@@ -1679,6 +1800,7 @@ class FlutterInstaller {
     );
     if (sourceType == FileSystemEntityType.notFound) {
       await sourceDirectory.create();
+      cancellation?.throwIfCancelled();
     } else if (sourceType != FileSystemEntityType.directory) {
       return false;
     }
@@ -1697,17 +1819,24 @@ class FlutterInstaller {
     var sourceData = <String, Object?>{};
     if (markerType == FileSystemEntityType.file) {
       try {
-        final value = jsonDecode(await sourceMarker.readAsString());
+        final read = sourceMarker.readAsString();
+        final value = jsonDecode(
+          cancellation == null ? await read : await cancellation.race(read),
+        );
         if (value is Map<String, Object?>) sourceData = value;
+      } on InstallCancelledException {
+        rethrow;
       } on Object {
         // Replace invalid regular metadata with a safety-only manifest.
       }
     }
     if (sourceData['state'] != 'needs-repair') {
+      cancellation?.throwIfCancelled();
       await _publishManifest(
         sourceDirectory.path,
         Map<String, Object?>.from(sourceData)..['state'] = 'needs-repair',
         filename: '.wren-source.json',
+        cancellation: cancellation,
       );
     }
     return true;
@@ -1715,8 +1844,9 @@ class FlutterInstaller {
 
   Future<void> _markDependentReleasesForSourceRepair(
     String sourceKey,
-    String reason,
-  ) async {
+    String reason, {
+    DoctorCancellation? cancellation,
+  }) async {
     final releases = Directory(
       p.join(environment.dataDirectory.absolute.path, 'releases'),
     );
@@ -1727,6 +1857,7 @@ class FlutterInstaller {
       );
     }
     await for (final entity in releases.list(followLinks: false)) {
+      cancellation?.throwIfCancelled();
       if (entity is! Directory ||
           FileSystemEntity.typeSync(entity.path, followLinks: false) !=
               FileSystemEntityType.directory) {
@@ -1737,13 +1868,17 @@ class FlutterInstaller {
           FileSystemEntityType.file) {
         continue;
       }
-      final identity = await _readDoctorReleaseIdentity(marker);
+      final identity = await _readDoctorReleaseIdentity(
+        marker,
+        cancellation: cancellation,
+      );
       if (identity?.sourceKey != sourceKey) continue;
       final updated = Map<String, Object?>.from(identity!.data)
         ..['sourceNeedsRepair'] = true
         ..['readiness'] = 'needs-repair'
         ..['readinessReason'] = reason;
-      await _publishManifest(entity.path, updated);
+      cancellation?.throwIfCancelled();
+      await _publishManifest(entity.path, updated, cancellation: cancellation);
     }
   }
 
@@ -1785,8 +1920,10 @@ class FlutterInstaller {
 
   Future<void> _persistReleaseSafetyMarker(
     Directory release,
-    String reason,
-  ) async {
+    String reason, {
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
     if (FileSystemEntity.typeSync(release.path, followLinks: false) !=
         FileSystemEntityType.directory) {
       throw const FileSystemException(
@@ -1798,11 +1935,12 @@ class FlutterInstaller {
         FileSystemEntityType.notFound) {
       return;
     }
-    await _publishManifest(release.path, {
-      'format': 1,
-      'state': 'needs-repair',
-      'reason': reason,
-    }, filename: p.basename(marker.path));
+    await _publishManifest(
+      release.path,
+      {'format': 1, 'state': 'needs-repair', 'reason': reason},
+      filename: p.basename(marker.path),
+      cancellation: cancellation,
+    );
   }
 
   Future<void> _clearReleaseSafetyMarker(Directory release) async {
@@ -2686,8 +2824,10 @@ class FlutterInstaller {
 
   Future<InstalledRelease?> _readiness(
     Directory release,
-    Directory root,
-  ) async {
+    Directory root, {
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
     final doctorSafetyMarker = File(
       p.join(release.path, '.wren-doctor-needs-repair.json'),
     );
@@ -2743,10 +2883,12 @@ class FlutterInstaller {
             '$engineRevision-${host.catalogOs}-${host.catalogArchitecture}') {
           reason = 'recorded shared source identity is invalid';
         } else {
-          final actualFramework = await _gitText(release.path, [
-            'rev-parse',
-            'HEAD',
-          ], userMessage: 'could not read framework identity');
+          final actualFramework = await _gitText(
+            release.path,
+            ['rev-parse', 'HEAD'],
+            userMessage: 'could not read framework identity',
+            cancellation: cancellation,
+          );
           if (actualFramework.toLowerCase() !=
               frameworkRevision.toLowerCase()) {
             reason = 'framework checkout does not match its recorded identity';
@@ -2781,6 +2923,8 @@ class FlutterInstaller {
           }
         }
       }
+    } on InstallCancelledException {
+      rethrow;
     } on Object catch (error) {
       reason = 'could not validate installed release: $error';
     }
@@ -2798,7 +2942,8 @@ class FlutterInstaller {
       updated['readinessReason'] = reason;
     }
     if (jsonEncode(updated) != jsonEncode(current)) {
-      await _publishManifest(release.path, updated);
+      cancellation?.throwIfCancelled();
+      await _publishManifest(release.path, updated, cancellation: cancellation);
     }
     if (channel == null || version == null || hostName == null) {
       return _invalidRelease(release, reason);
@@ -4755,9 +4900,22 @@ class FlutterInstaller {
     String directory,
     Map<String, Object?> manifest, {
     String filename = '.wren-release.json',
+    DoctorCancellation? cancellation,
   }) async {
     final target = File(p.join(directory, filename));
     final temporary = File('${target.path}.tmp-${_randomId()}');
+    if (cancellation != null) {
+      cancellation.throwIfCancelled();
+      try {
+        temporary.writeAsStringSync(jsonEncode(manifest), flush: true);
+        cancellation.throwIfCancelled();
+        temporary.renameSync(target.path);
+      } on Object {
+        if (temporary.existsSync()) temporary.deleteSync();
+        rethrow;
+      }
+      return;
+    }
     await temporary.writeAsString(jsonEncode(manifest), flush: true);
     await temporary.rename(target.path);
   }
@@ -4802,11 +4960,47 @@ class FlutterInstaller {
     String workingDirectory,
     List<String> arguments, {
     required String userMessage,
+    DoctorCancellation? cancellation,
   }) async {
-    final result = await Process.run(
-      'git',
-      arguments,
-      workingDirectory: workingDirectory,
+    if (cancellation == null) {
+      final result = await Process.run(
+        'git',
+        arguments,
+        workingDirectory: workingDirectory,
+      );
+      if (result.exitCode != 0) {
+        throw InstallException('$userMessage: ${_processDetails(result)}');
+      }
+      return '${result.stdout}'.trim();
+    }
+
+    late final Process process;
+    try {
+      process = await Process.start(
+        'git',
+        arguments,
+        workingDirectory: workingDirectory,
+      );
+    } on ProcessException {
+      rethrow;
+    }
+    final stdout = utf8.decoder.bind(process.stdout).join();
+    final stderr = utf8.decoder.bind(process.stderr).join();
+    final exitCode = process.exitCode;
+    late final List<Object> results;
+    try {
+      results = await cancellation.race(
+        Future.wait<Object>([stdout, stderr, exitCode]),
+      );
+    } on InstallCancelledException {
+      await _terminateDoctorProcess(process);
+      rethrow;
+    }
+    final result = ProcessResult(
+      process.pid,
+      results[2] as int,
+      results[0] as String,
+      results[1] as String,
     );
     if (result.exitCode != 0) {
       throw InstallException('$userMessage: ${_processDetails(result)}');

@@ -734,6 +734,32 @@ printf '\376\000\n' >&2
         );
         expect(initialOutput.toString(), contains('fully verified'));
 
+        final fullJsonOutput = StringBuffer();
+        final fullJsonError = StringBuffer();
+        expect(
+          await runWren(
+            ['doctor', '--full', '--json'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: fullJsonOutput,
+            stderrSink: fullJsonError,
+          ),
+          0,
+        );
+        expect(fullJsonOutput.toString().trim().split('\n'), hasLength(1));
+        final fullJsonReport =
+            jsonDecode(fullJsonOutput.toString()) as Map<String, Object?>;
+        expect(fullJsonReport['schema_version'], 1);
+        expect(fullJsonReport['depth'], 'full');
+        expect(fullJsonReport['completion'], 'complete');
+        expect(fullJsonReport['exit_status'], 0);
+        final fullJsonRelease =
+            (fullJsonReport['releases']! as List<Object?>).single!
+                as Map<String, Object?>;
+        expect(fullJsonRelease['integrity'], 'fully_verified');
+        expect(fullJsonRelease['integrity_checks'], isNotEmpty);
+        expect(fullJsonError.toString(), contains('Checking doctor integrity'));
+
         final trustedManifestBytes = await releaseManifest.readAsBytes();
         try {
           final unsupportedManifest = jsonDecode(
@@ -970,6 +996,50 @@ printf '\376\000\n' >&2
           mixedOutput.toString(),
           contains('release-private-files: confirmed damage'),
         );
+
+        final mixedJsonOutput = StringBuffer();
+        final mixedJsonError = StringBuffer();
+        late final int mixedJsonStatus;
+        await gitConfig.delete();
+        final mixedJsonFifo = await Process.run('mkfifo', [gitConfig.path]);
+        expect(mixedJsonFifo.exitCode, 0, reason: '${mixedJsonFifo.stderr}');
+        try {
+          mixedJsonStatus = await runWren(
+            ['doctor', '--full', '--json', '--verbose'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: mixedJsonOutput,
+            stderrSink: mixedJsonError,
+            fullDoctorCheckTimeout: const Duration(milliseconds: 150),
+          ).timeout(const Duration(seconds: 5));
+        } finally {
+          await gitConfig.delete();
+          await gitConfig.writeAsBytes(savedGitConfig, flush: true);
+        }
+        expect(mixedJsonStatus, 4);
+        expect(mixedJsonOutput.toString().trim().split('\n'), hasLength(1));
+        expect(mixedJsonError.toString(), isNotEmpty);
+        final mixedJsonReport =
+            jsonDecode(mixedJsonOutput.toString()) as Map<String, Object?>;
+        expect(mixedJsonReport['depth'], 'full');
+        expect(mixedJsonReport['completion'], 'incomplete');
+        expect(mixedJsonReport['exit_status'], 4);
+        expect(mixedJsonReport['has_critical_findings'], isTrue);
+        final mixedJsonRelease =
+            (mixedJsonReport['releases']! as List<Object?>).single!
+                as Map<String, Object?>;
+        expect(mixedJsonRelease['integrity'], 'needs_repair');
+        final mixedChecks =
+            (mixedJsonRelease['integrity_checks']! as List<Object?>)
+                .cast<Map<String, Object?>>();
+        expect(
+          mixedChecks.any((check) => check['status'] == 'confirmed_damage'),
+          isTrue,
+        );
+        expect(
+          mixedChecks.any((check) => check['status'] == 'incomplete'),
+          isTrue,
+        );
         final damagedManifest = jsonDecode(
           await releaseManifest.readAsString(),
         ) as Map<String, Object?>;
@@ -982,6 +1052,26 @@ printf '\376\000\n' >&2
           await _snapshotTree(Directory(p.join(installed.path, 'bin'))),
           releaseBeforeDoctor,
         );
+
+        final completedDamageOutput = StringBuffer();
+        final completedDamageStatus = await runWren(
+          ['doctor', '--full', '--json'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: completedDamageOutput,
+          stderrSink: StringBuffer(),
+        );
+        expect(completedDamageStatus, 1);
+        final completedDamageReport = jsonDecode(
+          completedDamageOutput.toString(),
+        ) as Map<String, Object?>;
+        expect(completedDamageReport['completion'], 'complete');
+        expect(completedDamageReport['exit_status'], 1);
+        expect(completedDamageReport['has_critical_findings'], isTrue);
+        final completedDamageRelease =
+            (completedDamageReport['releases']! as List<Object?>).single!
+                as Map<String, Object?>;
+        expect(completedDamageRelease['integrity'], 'needs_repair');
 
         final launchError = StringBuffer();
         expect(
@@ -1006,6 +1096,79 @@ printf '\376\000\n' >&2
           await sourceDart.readAsString(),
           isNot('doctor regression payload'),
         );
+      },
+    );
+
+    test(
+      'full doctor cancellation leaves unfinished releases unmarked',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+
+        final installed = Directory(
+          p.join(dataDirectory.path, 'releases', 'stable-$_version-linux-x64'),
+        );
+        final privateDart = File(
+          p.join(installed.path, 'bin/cache/dart-sdk/bin/dart'),
+        );
+        await privateDart.writeAsString('unverified damage');
+        final cancellation = StreamController<void>(sync: true);
+        final stderr = _CancelOnDoctorIdentitySink(() {
+          cancellation.add(null);
+        });
+        final stdout = StringBuffer();
+        final cancellableEnvironment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+          waitCancellation: cancellation.stream,
+        );
+        late final int status;
+        try {
+          status = await _withGitConfigFifo(
+            installed,
+            () => runWren(
+              ['doctor', '--full', '--json'],
+              host: HostPlatform.linuxX64,
+              installEnvironment: cancellableEnvironment,
+              stdoutSink: stdout,
+              stderrSink: stderr,
+              fullDoctorCheckTimeout: const Duration(seconds: 5),
+            ).timeout(const Duration(seconds: 5)),
+          );
+        } finally {
+          await cancellation.close();
+        }
+
+        expect(status, 6);
+        expect(stdout.toString(), isEmpty);
+        expect(
+          stderr.toString(),
+          contains('Checking doctor integrity: release-identity'),
+        );
+        expect(
+          File(p.join(installed.path, '.wren-doctor-needs-repair.json'))
+              .existsSync(),
+          isFalse,
+        );
+        final manifest = jsonDecode(
+          await File(p.join(installed.path, '.wren-release.json'))
+              .readAsString(),
+        ) as Map<String, Object?>;
+        expect(manifest['privateFilesNeedRepair'], isNot(true));
+        expect(await privateDart.readAsString(), 'unverified damage');
       },
     );
 
@@ -3252,6 +3415,39 @@ Future<void> _waitForFile(File file) async {
     await Future<void>.delayed(const Duration(milliseconds: 10));
   }
   fail('Timed out waiting for ${file.path}.');
+}
+
+class _CancelOnDoctorIdentitySink implements StringSink {
+  new(this._cancel);
+
+  final void Function() _cancel;
+  final StringBuffer _buffer = StringBuffer();
+  var _sentCancellation = false;
+
+  @override
+  void write(Object? object) {
+    final text = object?.toString() ?? 'null';
+    _buffer.write(text);
+    if (!_sentCancellation &&
+        text.contains('Checking doctor integrity: release-identity')) {
+      _sentCancellation = true;
+      _cancel();
+    }
+  }
+
+  @override
+  void writeAll(Iterable<dynamic> objects, [String separator = '']) {
+    write(objects.join(separator));
+  }
+
+  @override
+  void writeCharCode(int charCode) => write(String.fromCharCode(charCode));
+
+  @override
+  void writeln([Object? object = '']) => write('${object ?? 'null'}\n');
+
+  @override
+  String toString() => _buffer.toString();
 }
 
 class _InstallWorker {
