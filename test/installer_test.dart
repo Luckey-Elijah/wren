@@ -1491,20 +1491,46 @@ printf '\376\000\n' >&2
       await optionalFile.writeAsString('trusted ios payload\n');
       await File(p.join(release.path, 'bin/cache/ios-sdk.stamp'))
           .writeAsString('$_engineRevision\n');
-      for (final group in ['android', 'linux', 'windows', 'fuchsia']) {
-        final path = switch (group) {
-          'android' => 'engine/android-arm64',
-          'linux' => 'engine/linux-x64',
-          'windows' => 'engine/windows-x64',
-          _ => 'engine/fuchsia-arm64',
-        };
+      final groupLocations = <String, String>{
+        'android': 'engine/android-arm64',
+        'macos': 'engine/darwin-arm64',
+        'linux': 'engine/linux-x64',
+        'fuchsia': 'fuchsia/sdk/core/mac-amd64',
+        'flutter_runner': 'flutter_runner',
+      };
+      for (final entry in groupLocations.entries) {
         final payload = File(
-          p.join(release.path, 'bin/cache/artifacts/$path/optional-target.bin'),
+          p.join(
+            release.path,
+            'bin/cache/artifacts/${entry.value}/optional-target.bin',
+          ),
         );
         await payload.parent.create(recursive: true);
-        await payload.writeAsString('trusted $group payload\n');
-        await File(p.join(release.path, 'bin/cache/$group-sdk.stamp'))
+        await payload.writeAsString('trusted ${entry.key} payload\n');
+        final stamp = switch (entry.key) {
+          'fuchsia' => 'fuchsia-mac.stamp',
+          'flutter_runner' => 'flutter_runner.stamp',
+          _ => '${entry.key}-sdk.stamp',
+        };
+        await File(p.join(release.path, 'bin/cache/$stamp'))
             .writeAsString('$_engineRevision\n');
+        if (entry.key == 'flutter_runner') {
+          final debugSymbols = Directory(
+            p.join(
+              release.path,
+              'bin/cache/artifacts/flutter_runner_debug_symbols',
+            ),
+          );
+          await debugSymbols.create(recursive: true);
+          await File(p.join(debugSymbols.path, 'optional-target.bin'))
+              .writeAsString('trusted flutter_runner payload\n');
+          await File(
+            p.join(
+              release.path,
+              'bin/cache/flutter_runner_debug_symbols.stamp',
+            ),
+          ).writeAsString('$_engineRevision\n');
+        }
       }
       final releaseMarker = File(p.join(release.path, '.wren-release.json'));
       final releaseData = jsonDecode(
@@ -1531,7 +1557,7 @@ printf '\376\000\n' >&2
       expect(await repair(), 0, reason: lastRepairError);
       final fetchCount = File(p.join(dataDirectory.path, 'ios-fetch-count'));
       expect(await fetchCount.readAsString(), 'x');
-      for (final group in ['android', 'linux', 'windows', 'fuchsia']) {
+      for (final group in groupLocations.keys) {
         expect(
           await File(p.join(dataDirectory.path, '$group-fetch-count'))
               .readAsString(),
@@ -1545,11 +1571,11 @@ printf '\376\000\n' >&2
         (trustedManifest['optionalArtifactInventories']!
                 as Map<String, Object?>)
             .keys,
-        containsAll(['ios', 'android', 'linux', 'windows', 'fuchsia']),
+        containsAll(['ios', ...groupLocations.keys]),
       );
       expect(await repair(), 0);
       expect(await fetchCount.readAsString(), 'x');
-      for (final group in ['android', 'linux', 'windows', 'fuchsia']) {
+      for (final group in groupLocations.keys) {
         expect(
           await File(p.join(dataDirectory.path, '$group-fetch-count'))
               .readAsString(),
@@ -1572,7 +1598,7 @@ printf '\376\000\n' >&2
       expect(askedToCloseEditors, isTrue);
       expect(await optionalFile.readAsString(), 'corrupted');
       expect(await fetchCount.readAsString(), 'xx');
-      for (final group in ['android', 'linux', 'windows', 'fuchsia']) {
+      for (final group in groupLocations.keys) {
         expect(
           await File(p.join(dataDirectory.path, '$group-fetch-count'))
               .readAsString(),
@@ -1583,7 +1609,7 @@ printf '\376\000\n' >&2
       expect(await repair(confirmation: (_) async => true), 0);
       expect(await optionalFile.readAsString(), 'trusted ios payload\n');
       expect(await fetchCount.readAsString(), 'xxx');
-      for (final group in ['android', 'linux', 'windows', 'fuchsia']) {
+      for (final group in groupLocations.keys) {
         expect(
           await File(p.join(dataDirectory.path, '$group-fetch-count'))
               .readAsString(),
@@ -1617,7 +1643,7 @@ printf '\376\000\n' >&2
       expect(await repair(confirmation: (_) async => true), 0);
       expect(await optionalFile.readAsString(), 'trusted ios payload\n');
       expect(await fetchCount.readAsString(), 'xxxxxx');
-      for (final group in ['android', 'linux', 'windows', 'fuchsia']) {
+      for (final group in groupLocations.keys) {
         expect(
           await File(p.join(dataDirectory.path, '$group-fetch-count'))
               .readAsString(),
@@ -1722,6 +1748,250 @@ printf '\376\000\n' >&2
       );
       expect(
         File(p.join(dataDirectory.path, 'ios-fetch-count')).existsSync(),
+        isTrue,
+      );
+    });
+
+    test('repairs evidenced Linux optional artifact groups', () async {
+      await _writeFixtureSdk(repositoryWorktree);
+      await File(p.join(repositoryWorktree.path, 'linux-optional-fixture'))
+          .writeAsString('Linux optional artifact fixture\n');
+      await _git(repositoryWorktree.path, ['add', '.']);
+      await _git(repositoryWorktree.path, [
+        'commit',
+        '-m',
+        'Linux optional fixture',
+      ]);
+      await _git(repositoryWorktree.path, ['tag', '-f', _version]);
+      frameworkRevision = await _git(repositoryWorktree.path, [
+        'rev-parse',
+        'HEAD',
+      ]);
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      expect(
+        await runWren(
+          ['install', _version],
+          catalogJson: _catalog(frameworkRevision),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+
+      final release = Directory(
+        p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
+      );
+      final externalCacheFiles = <File>[
+        File(
+          p.join(
+            dataDirectory.parent.path,
+            '.gradle/caches/modules-2/fixture.bin',
+          ),
+        ),
+        File(
+          p.join(
+            dataDirectory.parent.path,
+            '.m2/repository/fixture/artifact.jar',
+          ),
+        ),
+      ];
+      for (final file in externalCacheFiles) {
+        await file.parent.create(recursive: true);
+        await file.writeAsString('external build cache sentinel');
+      }
+      final groupLocations = <String, String>{
+        'android': 'engine/android-arm64',
+        'flutter_runner': 'flutter_runner',
+      };
+      for (final entry in groupLocations.entries) {
+        final payload = File(
+          p.join(
+            release.path,
+            'bin/cache/artifacts/${entry.value}/optional-target.bin',
+          ),
+        );
+        await payload.parent.create(recursive: true);
+        await payload.writeAsString('trusted ${entry.key} payload\n');
+        final stamp = switch (entry.key) {
+          'flutter_runner' => 'flutter_runner.stamp',
+          _ => '${entry.key}-sdk.stamp',
+        };
+        if (entry.key != 'android') {
+          await File(p.join(release.path, 'bin/cache/$stamp'))
+              .writeAsString('$_engineRevision\n');
+        }
+        if (entry.key == 'flutter_runner') {
+          final debugSymbols = Directory(
+            p.join(
+              release.path,
+              'bin/cache/artifacts/flutter_runner_debug_symbols',
+            ),
+          );
+          await debugSymbols.create(recursive: true);
+          await File(p.join(debugSymbols.path, 'optional-target.bin'))
+              .writeAsString('trusted flutter_runner payload\n');
+          await File(
+            p.join(
+              release.path,
+              'bin/cache/flutter_runner_debug_symbols.stamp',
+            ),
+          ).writeAsString('$_engineRevision\n');
+        }
+      }
+      final releaseMarker = File(p.join(release.path, '.wren-release.json'));
+      final releaseData = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      releaseData['externalUse'] = true;
+      await releaseMarker.writeAsString(jsonEncode(releaseData));
+
+      Future<int> repair(Future<bool?> Function(String)? confirmation) =>
+          runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            confirmation: confirmation,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          );
+
+      expect(await repair((_) async => true), 0);
+      expect(
+        ((jsonDecode(await releaseMarker.readAsString())
+                    as Map<String, Object?>)['optionalArtifactInventories']!
+                as Map<String, Object?>)
+            .keys,
+        containsAll(['android', 'flutter_runner']),
+      );
+      for (final group in ['android', 'flutter_runner']) {
+        expect(
+          await File(p.join(dataDirectory.path, '$group-fetch-count'))
+              .readAsString(),
+          'x',
+        );
+      }
+      expect(await repair(null), 0);
+      for (final group in ['android', 'flutter_runner']) {
+        expect(
+          await File(p.join(dataDirectory.path, '$group-fetch-count'))
+              .readAsString(),
+          'x',
+        );
+      }
+      expect(
+        File(p.join(dataDirectory.path, 'fuchsia-fetch-count')).existsSync(),
+        false,
+      );
+
+      final androidPayload = File(
+        p.join(
+          release.path,
+          'bin/cache/artifacts/engine/android-arm64/optional-target.bin',
+        ),
+      );
+      await androidPayload.writeAsString('corrupted');
+      var confirmationRequested = false;
+      expect(
+        await repair((_) async {
+          confirmationRequested = true;
+          return false;
+        }),
+        6,
+      );
+      expect(confirmationRequested, isTrue);
+      expect(await androidPayload.readAsString(), 'corrupted');
+      expect(await repair((_) async => true), 0);
+      expect(await androidPayload.readAsString(), 'trusted android payload\n');
+      for (final file in externalCacheFiles) {
+        expect(await file.readAsString(), 'external build cache sentinel');
+      }
+      expect(
+        Directory(p.join(dataDirectory.path, 'staging')).listSync(),
+        isEmpty,
+      );
+    });
+
+    test('uses Flutter 3.7 Linux optional artifact layout', () async {
+      const historicalVersion = '3.7.0';
+      const historicalDartVersion = '2.19.0';
+      await _writeFixtureSdk(
+        repositoryWorktree,
+        version: historicalVersion,
+        reportedDartVersion: historicalDartVersion,
+        runtimeDartVersion: historicalDartVersion,
+      );
+      await _git(repositoryWorktree.path, ['add', '.']);
+      await _git(repositoryWorktree.path, [
+        'commit',
+        '-m',
+        'Flutter 3.7 Linux fixture',
+      ]);
+      await _git(repositoryWorktree.path, ['tag', historicalVersion]);
+      final historicalRevision = await _git(repositoryWorktree.path, [
+        'rev-parse',
+        'HEAD',
+      ]);
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      expect(
+        await runWren(
+          ['install', historicalVersion],
+          catalogJson: _catalog(
+            historicalRevision,
+            dartVersion: historicalDartVersion,
+            releaseVersion: historicalVersion,
+          ),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+
+      final release = Directory(
+        p.join(
+          dataDirectory.path,
+          'releases/stable-$historicalVersion-linux-x64',
+        ),
+      );
+      final optionalFile = File(
+        p.join(
+          release.path,
+          'bin/cache/artifacts/engine/android-arm64/optional-target.bin',
+        ),
+      );
+      await optionalFile.parent.create(recursive: true);
+      await optionalFile.writeAsString('trusted android payload\n');
+      await File(p.join(release.path, 'bin/cache/android-sdk.stamp'))
+          .writeAsString('$_engineRevision\n');
+      final repairStderr = StringBuffer();
+      expect(
+        await runWren(
+          ['repair', historicalVersion],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: repairStderr,
+        ),
+        0,
+        reason: repairStderr.toString(),
+      );
+      final manifest = jsonDecode(
+        await File(p.join(release.path, '.wren-release.json')).readAsString(),
+      ) as Map<String, Object?>;
+      expect(
+        (manifest['optionalArtifactInventories']! as Map<String, Object?>)
+            .containsKey('android'),
+        isTrue,
+      );
+      expect(
+        File(p.join(dataDirectory.path, 'android-fetch-count')).existsSync(),
         isTrue,
       );
     });
@@ -2227,27 +2497,47 @@ if [ "\$1" = "precache" ]; then
       --ios)
         group=ios
         if [ '$legacyIos' = 'true' ]; then target=ios/Flutter.framework; else target=engine/ios-arm64; fi
+        stamp=ios-sdk
+        ;;
+      --macos)
+        group=macos
+        target=engine/darwin-arm64
+        stamp=macos-sdk
         ;;
       --android)
         group=android
         target=engine/android-arm64
+        stamp=android-sdk
         ;;
       --linux)
         group=linux
         target=engine/linux-x64
-        ;;
-      --windows)
-        group=windows
-        target=engine/windows-x64
+        stamp=linux-sdk
         ;;
       --fuchsia)
         group=fuchsia
-        target=engine/fuchsia-arm64
+        if [ '$isLinux' = 'true' ]; then
+          target=fuchsia/sdk/core/linux-amd64
+          stamp=fuchsia-linux
+        else
+          target=fuchsia/sdk/core/mac-amd64
+          stamp=fuchsia-mac
+        fi
+        ;;
+      --flutter_runner)
+        group=flutter_runner
+        target=flutter_runner
+        stamp=flutter_runner
         ;;
     esac
     mkdir -p "bin/cache/artifacts/\$target"
     printf "trusted \$group payload\\n" > "bin/cache/artifacts/\$target/optional-target.bin"
-    printf '$_engineRevision\\n' > "bin/cache/\$group-sdk.stamp"
+    printf '$_engineRevision\\n' > "bin/cache/\$stamp.stamp"
+    if [ "\$group" = "flutter_runner" ]; then
+      mkdir -p bin/cache/artifacts/flutter_runner_debug_symbols
+      printf "trusted \$group payload\\n" > bin/cache/artifacts/flutter_runner_debug_symbols/optional-target.bin
+      printf '$_engineRevision\\n' > bin/cache/flutter_runner_debug_symbols.stamp
+    fi
     printf x >> "../../../\$group-fetch-count"
     exit 0
   fi

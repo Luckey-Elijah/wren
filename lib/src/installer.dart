@@ -36,27 +36,48 @@ const _linuxRequiredFiles = <String>[
   'bin/cache/artifacts/engine/linux-x64-release/flutter_linux/libflutter_linux_gtk.so',
 ];
 
-/// Optional Flutter cache groups that can be present in a macOS SDK.
+/// Optional Flutter cache groups that can be present on supported Wren hosts.
 ///
 /// These path roots are deliberately narrower than `artifacts/engine`: host
 /// and other target archives share parent directories in some Flutter
 /// releases. The exact Flutter revision remains the source of truth for the
 /// archive contents; these roots only define ownership after Flutter has
 /// populated the cache in an isolated checkout.
-const _macosOptionalArtifactGroups = <_OptionalArtifactGroup>[
-  _OptionalArtifactGroup(
-    name: 'ios',
-    precacheFlag: '--ios',
-    stampFiles: ['ios-sdk.stamp'],
-    pathPrefixes: [
-      'bin/cache/artifacts/engine/ios/',
-      'bin/cache/artifacts/engine/ios-',
-      'bin/cache/artifacts/ios/',
-      'bin/cache/artifacts/libimobiledevice/',
-      'bin/cache/artifacts/usbmuxd/',
-    ],
-  ),
-  _OptionalArtifactGroup(
+List<_OptionalArtifactGroup> _optionalArtifactGroups(HostPlatform host) => [
+  if (host == HostPlatform.macosArm64)
+    _OptionalArtifactGroup(
+      name: 'ios',
+      precacheFlag: '--ios',
+      stampFiles: [
+        'ios-sdk.stamp',
+        for (final name in [
+          'libimobiledevice',
+          'libusbmuxd',
+          'usbmuxd',
+          'libplist',
+          'openssl',
+          'libimobiledeviceglue',
+          'ios-deploy',
+        ])
+          '$name.stamp',
+      ],
+      pathPrefixes: [
+        'bin/cache/artifacts/engine/ios/',
+        'bin/cache/artifacts/engine/ios-',
+        'bin/cache/artifacts/ios/',
+        for (final name in [
+          'libimobiledevice',
+          'libusbmuxd',
+          'usbmuxd',
+          'libplist',
+          'openssl',
+          'libimobiledeviceglue',
+          'ios-deploy',
+        ])
+          'bin/cache/artifacts/$name/',
+      ],
+    ),
+  const _OptionalArtifactGroup(
     name: 'android',
     precacheFlag: '--android',
     stampFiles: ['android-sdk.stamp'],
@@ -66,36 +87,50 @@ const _macosOptionalArtifactGroups = <_OptionalArtifactGroup>[
       'bin/cache/artifacts/android/',
     ],
   ),
-  _OptionalArtifactGroup(
-    name: 'linux',
-    precacheFlag: '--linux',
-    stampFiles: ['linux-sdk.stamp'],
-    pathPrefixes: [
-      'bin/cache/artifacts/engine/linux/',
-      'bin/cache/artifacts/engine/linux-',
-      'bin/cache/artifacts/linux/',
-    ],
-  ),
-  _OptionalArtifactGroup(
-    name: 'windows',
-    precacheFlag: '--windows',
-    stampFiles: ['windows-sdk.stamp'],
-    pathPrefixes: [
-      'bin/cache/artifacts/engine/windows/',
-      'bin/cache/artifacts/engine/windows-',
-      'bin/cache/artifacts/windows/',
-    ],
-  ),
+  if (host == HostPlatform.macosArm64)
+    const _OptionalArtifactGroup(
+      name: 'macos',
+      precacheFlag: '--macos',
+      stampFiles: ['macos-sdk.stamp'],
+      pathPrefixes: [
+        'bin/cache/artifacts/engine/darwin-',
+        'bin/cache/artifacts/macos/',
+      ],
+    ),
   _OptionalArtifactGroup(
     name: 'fuchsia',
     precacheFlag: '--fuchsia',
-    stampFiles: ['fuchsia-sdk.stamp'],
+    stampFiles: [
+      if (host == HostPlatform.linuxX64) 'fuchsia-linux.stamp',
+      if (host == HostPlatform.macosArm64) 'fuchsia-mac.stamp',
+    ],
     pathPrefixes: [
-      'bin/cache/artifacts/engine/fuchsia/',
-      'bin/cache/artifacts/engine/fuchsia-',
-      'bin/cache/artifacts/fuchsia/',
+      if (host == HostPlatform.linuxX64)
+        'bin/cache/artifacts/fuchsia/sdk/core/linux-amd64/',
+      if (host == HostPlatform.macosArm64)
+        'bin/cache/artifacts/fuchsia/sdk/core/mac-amd64/',
     ],
   ),
+  const _OptionalArtifactGroup(
+    name: 'flutter_runner',
+    precacheFlag: '--flutter_runner',
+    stampFiles: ['flutter_runner.stamp', 'flutter_runner_debug_symbols.stamp'],
+    pathPrefixes: [
+      'bin/cache/artifacts/flutter_runner/',
+      'bin/cache/artifacts/flutter_runner_debug_symbols/',
+    ],
+  ),
+  if (host == HostPlatform.macosArm64)
+    const _OptionalArtifactGroup(
+      name: 'linux',
+      precacheFlag: '--linux',
+      stampFiles: ['linux-sdk.stamp'],
+      pathPrefixes: [
+        'bin/cache/artifacts/engine/linux/',
+        'bin/cache/artifacts/engine/linux-',
+        'bin/cache/artifacts/linux/',
+      ],
+    ),
 ];
 
 class _OptionalArtifactGroup {
@@ -2400,7 +2435,6 @@ class FlutterInstaller {
     required HostPlatform host,
     required Future<bool?> Function(String message) confirmExternalUse,
   }) async {
-    if (host != HostPlatform.macosArm64) return false;
     final saved = releaseManifest['optionalArtifactInventories'];
     if (saved != null && saved is! Map<String, Object?>) {
       throw const InstallException(
@@ -2410,10 +2444,13 @@ class FlutterInstaller {
     final inventories = saved is Map<String, Object?>
         ? Map<String, Object?>.from(saved)
         : <String, Object?>{};
+    final groups = _optionalArtifactGroups(host);
+    final supportedGroups = groups.map((group) => group.name).toSet();
+    inventories.removeWhere((name, _) => !supportedGroups.contains(name));
     var anyFilesRepaired = false;
     var externalConfirmationNeeded = false;
 
-    for (final group in _macosOptionalArtifactGroups) {
+    for (final group in groups) {
       final previous = _decodeOptionalArtifactInventory(
         inventories[group.name],
         group,
@@ -2473,7 +2510,13 @@ class FlutterInstaller {
               'Flutter could not validate its ${group.name} artifact source',
         );
         final expected = await _optionalArtifactInventory(checkout, group);
-        if (expected.isEmpty) {
+        final expectedHasPayload = expected.any((record) {
+          final path = record['path']! as String;
+          return !group.stampFiles.any(
+            (name) => path == p.join('bin/cache', name),
+          );
+        });
+        if (expected.isEmpty || !expectedHasPayload) {
           throw InstallException(
             'Flutter $releaseVersion did not provide a trusted '
             '${group.name} artifact inventory.',
