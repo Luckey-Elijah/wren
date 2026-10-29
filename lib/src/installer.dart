@@ -2570,7 +2570,7 @@ class FlutterInstaller {
     Object? value,
     _OptionalArtifactGroup group,
   ) {
-    if (value is! List<Object?>) return null;
+    if (value is! List<Object?> || value.isEmpty) return null;
     final records = <Map<String, Object?>>[];
     final seenPaths = <String>{};
     for (final item in value) {

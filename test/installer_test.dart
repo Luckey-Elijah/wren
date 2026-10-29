@@ -1624,6 +1624,18 @@ printf '\376\000\n' >&2
           'x',
         );
       }
+      final invalidInventoryManifest = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      (invalidInventoryManifest['optionalArtifactInventories']!
+              as Map<String, Object?>)['ios'] =
+          <Object?>[];
+      await releaseMarker.writeAsString(jsonEncode(invalidInventoryManifest));
+      await optionalFile.delete();
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp')).delete();
+      expect(await repair(), 4);
+      expect(lastRepairError, contains('optional artifact inventory metadata'));
+      expect(await fetchCount.readAsString(), 'xxxxxx');
       expect(
         Directory(p.join(dataDirectory.path, 'staging')).listSync(),
         isEmpty,
