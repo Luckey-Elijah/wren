@@ -382,6 +382,672 @@ environment:
     });
   });
 
+  group('wren doctor', () {
+    late Directory temporaryDirectory;
+    late Directory projectDirectory;
+    late Directory dataDirectory;
+
+    setUp(() async {
+      temporaryDirectory = await Directory.systemTemp.createTemp(
+        'wren-doctor-',
+      );
+      projectDirectory = Directory('${temporaryDirectory.path}/project')
+        ..createSync();
+      dataDirectory = Directory('${temporaryDirectory.path}/data')
+        ..createSync();
+    });
+
+    tearDown(() async {
+      await temporaryDirectory.delete(recursive: true);
+    });
+
+    Future<int> runDoctor(
+      List<String> arguments, {
+      required StringSink output,
+      required List<InstalledRelease>? installed,
+      StringSink? errors,
+      Stream<void>? waitCancellation,
+      String? fallback,
+      String? environmentRelease,
+      String? wrenExecutable,
+      String? runningExecutablePath,
+      Map<String, String>? processEnvironment,
+    }) => runWren(
+      arguments,
+      host: HostPlatform.linuxX64,
+      installEnvironment: InstallEnvironment(
+        dataDirectory: dataDirectory,
+        waitCancellation: waitCancellation,
+      ),
+      projectDirectory: projectDirectory,
+      installedReleases: installed,
+      globalFallback: fallback,
+      flutterReleaseOverride: environmentRelease,
+      wrenExecutable: wrenExecutable,
+      runningExecutablePath: runningExecutablePath,
+      processEnvironment: processEnvironment,
+      stdoutSink: output,
+      stderrSink: errors ?? StringBuffer(),
+    );
+
+    test(
+      'reports all releases and picks one compatible with both ranges',
+      () async {
+        await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: ">=3.46.0 <3.48.0"
+  sdk: ">=3.13.0 <3.14.0"
+''');
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: [
+            _installed('3.47.8'),
+            _installed('3.48.0', dartVersion: '3.14.0'),
+            _installed('3.45.0', needsRepair: true),
+          ],
+        );
+
+        expect(status, 1);
+        expect(output.toString(), contains('Flutter 3.47.8  stable  linux'));
+        expect(output.toString(), contains('Flutter 3.48.0  stable  linux'));
+        expect(output.toString(), contains('Flutter 3.45.0  stable  linux'));
+        expect(
+          output.toString(),
+          contains('Dart 3.13.7  ready; project: compatible'),
+        );
+        expect(output.toString(), contains('project: incompatible'));
+        expect(output.toString(), contains('wren repair 3.45.0'));
+        expect(
+          output.toString(),
+          contains(
+            'Effective selection: Flutter 3.47.8 '
+            '(source: current project constraints).',
+          ),
+        );
+      },
+    );
+
+    test('uses exact override before environment and reports source', () async {
+      final output = StringBuffer();
+
+      final status = await runDoctor(
+        ['--release', '3.45.0', 'doctor'],
+        output: output,
+        installed: [_installed('3.47.8'), _installed('3.45.0')],
+        environmentRelease: '3.47.8',
+      );
+
+      expect(status, 0);
+      expect(
+        output.toString(),
+        contains(
+          'Effective selection: Flutter 3.45.0 '
+          '(source: command-line --release override).',
+        ),
+      );
+    });
+
+    test('reports environment override as the selection source', () async {
+      final output = StringBuffer();
+
+      final status = await runDoctor(
+        ['doctor'],
+        output: output,
+        installed: [_installed('3.47.8')],
+        environmentRelease: '3.47.8',
+      );
+
+      expect(status, 0);
+      expect(
+        output.toString(),
+        contains(
+          'Effective selection: Flutter 3.47.8 '
+          '(source: WREN_FLUTTER_RELEASE environment override).',
+        ),
+      );
+    });
+
+    test(
+      'keeps an incompatible global fallback and no selection informational',
+      () async {
+        await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: ^3.50.0
+  sdk: ^3.14.0
+''');
+        final installed = [_installed('3.47.8')];
+        final fallbackOutput = StringBuffer();
+
+        final fallbackStatus = await runDoctor(
+          ['doctor'],
+          output: fallbackOutput,
+          installed: installed,
+          fallback: '3.47.8',
+        );
+
+        expect(fallbackStatus, 0);
+        expect(fallbackOutput.toString(), contains('source: global fallback'));
+        expect(
+          fallbackOutput.toString(),
+          contains('the effective selection is incompatible'),
+        );
+
+        final noSelectionOutput = StringBuffer();
+        final noSelectionStatus = await runDoctor(
+          ['doctor'],
+          output: noSelectionOutput,
+          installed: installed,
+        );
+        expect(noSelectionStatus, 0);
+        expect(
+          noSelectionOutput.toString(),
+          contains('Effective selection: none.'),
+        );
+      },
+    );
+
+    test(
+      'reports incompatible fallback and absent project as informational',
+      () async {
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: [_installed('3.47.8')],
+          fallback: '3.46.0',
+        );
+
+        expect(status, 0);
+        expect(
+          output.toString(),
+          contains('Project compatibility: not applicable (no pubspec.yaml'),
+        );
+        expect(
+          output.toString(),
+          contains(
+            'Effective selection: Flutter 3.46.0 (source: global fallback).',
+          ),
+        );
+        expect(output.toString(), contains('is not installed'));
+      },
+    );
+
+    test('reports broken storage and release registry as critical', () async {
+      await dataDirectory.delete(recursive: true);
+      await File(dataDirectory.path).writeAsString('not a directory');
+      final storageOutput = StringBuffer();
+      final storageStatus = await runDoctor(
+        ['doctor'],
+        output: storageOutput,
+        installed: const [],
+      );
+
+      expect(storageStatus, 1);
+      expect(storageOutput.toString(), contains('Storage: critical'));
+      expect(storageOutput.toString(), contains('not a directory'));
+
+      await File(dataDirectory.path).delete();
+      await dataDirectory.create();
+      await File('${dataDirectory.path}/releases')
+          .writeAsString('not a registry');
+      final registryOutput = StringBuffer();
+      final registryStatus = await runDoctor(
+        ['doctor'],
+        output: registryOutput,
+        installed: const [],
+      );
+
+      expect(registryStatus, 1);
+      expect(registryOutput.toString(), contains('Release registry: critical'));
+      expect(registryOutput.toString(), contains('not a directory'));
+    });
+
+    test(
+      'reports an unreadable release registry and continues setup checks',
+      () async {
+        final releasesDirectory = Directory('${dataDirectory.path}/releases')
+          ..createSync();
+        await Process.run('chmod', ['000', releasesDirectory.path]);
+        final output = StringBuffer();
+        late final int status;
+        try {
+          status = await runDoctor(['doctor'], output: output, installed: null);
+        } finally {
+          await Process.run('chmod', ['u=rwx,go=rx', releasesDirectory.path]);
+        }
+
+        expect(status, 4);
+        expect(output.toString(), contains('Release registry: incomplete'));
+        expect(output.toString(), contains('Storage: ok'));
+        expect(output.toString(), contains('System Git: ok'));
+        expect(
+          output.toString(),
+          contains('No Flutter releases are installed.'),
+        );
+      },
+    );
+
+    test('rejects a parseable release record with invalid identity', () async {
+      final releaseDirectory = Directory(
+        '${dataDirectory.path}/releases/stable-3.47.8-linux-x64',
+      )..createSync(recursive: true);
+      final engineRevision = 'a' * 40;
+      await File('${releaseDirectory.path}/.wren-release.json').writeAsString(
+        jsonEncode({
+          'channel': 'stable',
+          'version': '3.47.8',
+          'host': 'linux',
+          'architecture': 'x64',
+          'state': 'ready',
+          'frameworkRevision': 'invalid-framework-revision',
+          'engineRevision': engineRevision,
+          'sourceKey': '$engineRevision-linux-x64',
+          'canonicalDartVersion': '3.13.7',
+        }),
+      );
+      final output = StringBuffer();
+
+      final status = await runDoctor(
+        ['doctor'],
+        output: output,
+        installed: null,
+      );
+
+      expect(status, 1);
+      expect(output.toString(), contains('Release registry: critical'));
+      expect(output.toString(), contains('invalid identity or state'));
+      expect(output.toString(), contains('Flutter 3.47.8'));
+    });
+
+    test(
+      'reports a read-only storage directory without writing a probe file',
+      () async {
+        final mode = dataDirectory.statSync().mode;
+        await Process.run('chmod', ['a-w', dataDirectory.path]);
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: const [],
+        );
+
+        await Process.run('chmod', ['u+w', dataDirectory.path]);
+        expect(status, 1);
+        expect(output.toString(), contains('Storage: critical'));
+        expect(output.toString(), contains('no write permission bits'));
+        expect(Directory('${dataDirectory.path}/probe').existsSync(), isFalse);
+        expect(mode & 0x92, isNot(0));
+      },
+    );
+
+    test('reports an unavailable Wren executable as critical', () async {
+      final output = StringBuffer();
+
+      final status = await runDoctor(
+        ['doctor'],
+        output: output,
+        installed: const [],
+        runningExecutablePath: '${temporaryDirectory.path}/missing-wren',
+      );
+
+      expect(status, 1);
+      expect(output.toString(), contains('Executable: critical'));
+      expect(output.toString(), contains('missing or is not a regular file'));
+    });
+
+    test(
+      'reports an invalid global fallback configuration as critical',
+      () async {
+        await File('${dataDirectory.path}/config.json')
+            .writeAsString('{broken');
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: const [],
+        );
+
+        expect(status, 1);
+        expect(output.toString(), contains('Global fallback: critical'));
+        expect(output.toString(), contains('not valid JSON'));
+      },
+    );
+
+    test(
+      'reports missing system Git as critical and PATH as informational',
+      () async {
+        final emptyPath = Directory('${temporaryDirectory.path}/empty-path')
+          ..createSync();
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: const [],
+          processEnvironment: {'PATH': emptyPath.path},
+        );
+
+        expect(status, 1);
+        expect(output.toString(), contains('System Git: critical'));
+        expect(
+          output.toString(),
+          contains('not available on the current-process PATH'),
+        );
+        expect(
+          output.toString(),
+          contains('Current process PATH: informational'),
+        );
+        expect(
+          output.toString(),
+          contains('does not include the Wren shim directory'),
+        );
+      },
+    );
+
+    test(
+      'reports absent shims informational and installed shims on current PATH',
+      () async {
+        final absentOutput = StringBuffer();
+        expect(
+          await runDoctor(
+            ['doctor'],
+            output: absentOutput,
+            installed: const [],
+          ),
+          0,
+        );
+        expect(absentOutput.toString(), contains('PATH shims: informational'));
+        expect(absentOutput.toString(), contains('shims are not installed'));
+        expect(absentOutput.toString(), contains('wren setup'));
+
+        final inheritedPath = Platform.environment['PATH'] ?? '';
+        final wrongCasePath = [
+          '${dataDirectory.path.toUpperCase()}/bin',
+          if (inheritedPath.isNotEmpty) inheritedPath,
+        ].join(Platform.isWindows ? ';' : ':');
+        final pathOutput = StringBuffer();
+        expect(
+          await runDoctor(
+            ['doctor'],
+            output: pathOutput,
+            installed: const [],
+            processEnvironment: {
+              ...Platform.environment,
+              'PATH': wrongCasePath,
+            },
+          ),
+          0,
+        );
+        expect(
+          pathOutput.toString(),
+          contains('Current process PATH: informational'),
+        );
+
+        final wrenExecutable = File('${temporaryDirectory.path}/wren-fixture');
+        await wrenExecutable.writeAsString('#!/bin/sh\nexit 0\n');
+        await Process.run('chmod', ['u=rwx,go=rx', wrenExecutable.path]);
+        expect(
+          await runWren(
+            ['setup'],
+            installEnvironment: InstallEnvironment(
+              dataDirectory: dataDirectory,
+            ),
+            wrenExecutable: wrenExecutable.path,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        final path = [
+          '${dataDirectory.path}/bin',
+          if (inheritedPath.isNotEmpty) inheritedPath,
+        ].join(Platform.isWindows ? ';' : ':');
+        final installedOutput = StringBuffer();
+
+        final installedStatus = await runDoctor(
+          ['doctor'],
+          output: installedOutput,
+          installed: const [],
+          runningExecutablePath: wrenExecutable.path,
+          processEnvironment: {...Platform.environment, 'PATH': path},
+        );
+
+        expect(installedStatus, 0);
+        expect(installedOutput.toString(), contains('PATH shims: ok'));
+        expect(installedOutput.toString(), contains('shims are installed'));
+        expect(
+          installedOutput.toString(),
+          contains('Current process PATH: ok'),
+        );
+        expect(
+          installedOutput.toString(),
+          contains('includes the Wren shim directory'),
+        );
+        expect(
+          installedOutput.toString(),
+          contains(
+            'Persistent shell startup and editor settings were not inspected '
+            'or changed.',
+          ),
+        );
+      },
+    );
+
+    test(
+      'times out a stalled Git check and retains other setup findings',
+      () async {
+        final fakePath = Directory('${temporaryDirectory.path}/slow-git')
+          ..createSync();
+        final fakeGit = File('${fakePath.path}/git');
+        await fakeGit.writeAsString('#!/bin/sh\nexec /bin/sleep 10\n');
+        await Process.run('chmod', ['u=rwx,go=rx', fakeGit.path]);
+        final output = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor'],
+          output: output,
+          installed: [_installed('3.45.0', needsRepair: true)],
+          processEnvironment: {'PATH': fakePath.path},
+        );
+
+        expect(status, 4);
+        expect(output.toString(), contains('System Git: incomplete'));
+        expect(output.toString(), contains('quick check timed out'));
+        expect(output.toString(), contains('Storage: ok'));
+        expect(output.toString(), contains('Release registry: informational'));
+        expect(output.toString(), contains('Flutter 3.45.0'));
+        expect(output.toString(), contains('needs repair'));
+      },
+    );
+
+    test(
+      'JSON keeps the quick report structured on all diagnostic statuses',
+      () async {
+        await File('${projectDirectory.path}/pubspec.yaml').writeAsString('''
+environment:
+  flutter: ">=3.46.0 <3.48.0"
+  sdk: ">=3.13.0 <3.14.0"
+''');
+        final stdout = StringBuffer();
+        final stderr = StringBuffer();
+        final status = await runDoctor(
+          ['doctor', '--json', '--verbose'],
+          output: stdout,
+          errors: stderr,
+          installed: [_installed('3.47.8')],
+        );
+
+        expect(status, 0);
+        expect(stdout.toString().trim().split('\n'), hasLength(1));
+        final report = jsonDecode(stdout.toString()) as Map<String, Object?>;
+        expect(report['schema_version'], 1);
+        expect(report['depth'], 'quick');
+        expect(report['completion'], 'complete');
+        expect(report['exit_status'], 0);
+        expect(report['has_critical_findings'], isFalse);
+        expect(stderr.toString(), contains('Setup Storage:'));
+
+        final project = report['project']! as Map<String, Object?>;
+        expect(project['pubspec_present'], isTrue);
+        expect(project['compatibility'], 'evaluated');
+        expect(project['compatible_release'], '3.47.8');
+        final releases = report['releases']! as List<Object?>;
+        final release = releases.single! as Map<String, Object?>;
+        expect(release['integrity'], 'basic_checks_passed');
+        expect(
+          (release['compatibility']! as Map<String, Object?>)['status'],
+          'compatible',
+        );
+        final selection = report['selection']! as Map<String, Object?>;
+        expect(selection['release'], '3.47.8');
+        expect(selection['source'], 'project_constraints');
+        expect(selection['is_installed'], isTrue);
+
+        final criticalOutput = StringBuffer();
+        final criticalStatus = await runDoctor(
+          ['doctor', '--json'],
+          output: criticalOutput,
+          installed: [_installed('3.45.0', needsRepair: true)],
+        );
+        expect(criticalStatus, 1);
+        final criticalReport =
+            jsonDecode(criticalOutput.toString()) as Map<String, Object?>;
+        expect(criticalReport['completion'], 'complete');
+        expect(criticalReport['exit_status'], 1);
+        expect(criticalReport['has_critical_findings'], isTrue);
+        final criticalRelease =
+            (criticalReport['releases']! as List<Object?>).single!
+                as Map<String, Object?>;
+        expect(criticalRelease['integrity'], 'needs_repair');
+
+        final noSelectionOutput = StringBuffer();
+        final noSelectionStatus = await runDoctor(
+          ['doctor', '--json'],
+          output: noSelectionOutput,
+          installed: [_installed('3.45.0')],
+        );
+        expect(noSelectionStatus, 0);
+        final noSelectionReport =
+            jsonDecode(noSelectionOutput.toString()) as Map<String, Object?>;
+        expect(noSelectionReport['completion'], 'complete');
+        expect(noSelectionReport['exit_status'], 0);
+        expect(
+          (noSelectionReport['selection']! as Map<String, Object?>)['release'],
+          isNull,
+        );
+
+        final fakePath = Directory('${temporaryDirectory.path}/slow-git')
+          ..createSync();
+        final fakeGit = File('${fakePath.path}/git');
+        await fakeGit.writeAsString('#!/bin/sh\nexec /bin/sleep 10\n');
+        await Process.run('chmod', ['u=rwx,go=rx', fakeGit.path]);
+        final incompleteOutput = StringBuffer();
+        final incompleteStatus = await runDoctor(
+          ['doctor', '--json'],
+          output: incompleteOutput,
+          installed: [_installed('3.45.0', needsRepair: true)],
+          processEnvironment: {'PATH': fakePath.path},
+        );
+        expect(incompleteStatus, 4);
+        final incompleteReport =
+            jsonDecode(incompleteOutput.toString()) as Map<String, Object?>;
+        expect(incompleteReport['completion'], 'incomplete');
+        expect(incompleteReport['exit_status'], 4);
+        expect(incompleteReport['has_critical_findings'], isTrue);
+        final incompleteSetup =
+            incompleteReport['setup']! as Map<String, Object?>;
+        expect(incompleteSetup['is_incomplete'], isTrue);
+        expect(
+          (incompleteSetup['checks']! as List<Object?>)
+              .cast<Map<String, Object?>>()
+              .any(
+                (check) =>
+                    check['component'] == 'System Git' &&
+                    check['severity'] == 'incomplete',
+              ),
+          isTrue,
+        );
+        final incompleteRelease =
+            (incompleteReport['releases']! as List<Object?>).single!
+                as Map<String, Object?>;
+        expect(incompleteRelease['integrity'], 'needs_repair');
+      },
+    );
+
+    test(
+      'JSON usage errors retain status 2 and do not emit a report',
+      () async {
+        final stdout = StringBuffer();
+        final stderr = StringBuffer();
+
+        final status = await runWren(
+          ['doctor', '--json', '--not-a-doctor-option'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: InstallEnvironment(dataDirectory: dataDirectory),
+          projectDirectory: projectDirectory,
+          stdoutSink: stdout,
+          stderrSink: stderr,
+        );
+
+        expect(status, 2);
+        expect(stdout.toString(), isEmpty);
+        expect(stderr.toString(), contains('Could not find an option'));
+      },
+    );
+
+    test(
+      'doctor cancellation returns status 6 without emitting JSON',
+      () async {
+        final stdout = StringBuffer();
+        final stderr = StringBuffer();
+
+        final status = await runDoctor(
+          ['doctor', '--json'],
+          output: stdout,
+          errors: stderr,
+          installed: const [],
+          waitCancellation: Stream<void>.value(null),
+        );
+
+        expect(status, 6);
+        expect(stdout.toString(), isEmpty);
+        expect(stderr.toString(), contains('wren doctor was cancelled'));
+      },
+    );
+
+    test(
+      'verbose adds quick-check details without changing its scan',
+      () async {
+        final plain = StringBuffer();
+        final verbose = StringBuffer();
+        final installed = [_installed('3.47.8')];
+
+        expect(
+          await runDoctor(['doctor'], output: plain, installed: installed),
+          0,
+        );
+        expect(
+          await runDoctor(
+            ['doctor', '--verbose'],
+            output: verbose,
+            installed: installed,
+          ),
+          0,
+        );
+
+        expect(verbose.toString(), contains('same inexpensive checks'));
+        expect(verbose.toString(), contains('Flutter 3.47.8'));
+        expect(plain.toString(), isNot(contains('same inexpensive checks')));
+      },
+    );
+  });
+
   group('wren releases', () {
     test(
       'SDK commands suggest set or install when no release is selected',
@@ -1069,8 +1735,24 @@ exec '${child.path}' "\$@"
 
     test('dry-run previews only orphaned stages and sources', () async {
       const stageName = 'install-stable-3.47.8-linux-x64';
+      final sourceRepairStageName =
+          'repair-stable-3.47.8-linux-x64-'
+          '${List.filled(32, 'a').join()}';
+      final privateRepairStageName =
+          'repair-private-stable-3.47.8-linux-x64-'
+          '${List.filled(32, 'b').join()}';
+      const unknownStageName = 'repair-stable-3.47.8-linux-x64-incomplete';
       final stage = Directory('${dataDirectory.path}/staging/$stageName')
         ..createSync(recursive: true);
+      final sourceRepairStage = Directory(
+        '${dataDirectory.path}/staging/$sourceRepairStageName',
+      )..createSync(recursive: true);
+      final privateRepairStage = Directory(
+        '${dataDirectory.path}/staging/$privateRepairStageName',
+      )..createSync(recursive: true);
+      final unknownStage = Directory(
+        '${dataDirectory.path}/staging/$unknownStageName',
+      )..createSync(recursive: true);
       final source = Directory('${dataDirectory.path}/sources/orphan-engine')
         ..createSync(recursive: true);
       final retained = Directory(
@@ -1096,6 +1778,9 @@ exec '${child.path}' "\$@"
 
       expect(status, 0);
       expect(stage.existsSync(), isTrue);
+      expect(sourceRepairStage.existsSync(), isTrue);
+      expect(privateRepairStage.existsSync(), isTrue);
+      expect(unknownStage.existsSync(), isTrue);
       expect(source.existsSync(), isTrue);
       expect(retained.existsSync(), isTrue);
       expect(repository.existsSync(), isTrue);
@@ -1104,6 +1789,15 @@ exec '${child.path}' "\$@"
         output.toString(),
         contains('Would reclaim orphaned stage: $stageName'),
       );
+      expect(
+        output.toString(),
+        contains('Would reclaim orphaned stage: $sourceRepairStageName'),
+      );
+      expect(
+        output.toString(),
+        contains('Would reclaim orphaned stage: $privateRepairStageName'),
+      );
+      expect(output.toString(), isNot(contains(unknownStageName)));
       expect(
         output.toString(),
         contains('Would reclaim unreferenced shared source: orphan-engine'),
@@ -1115,8 +1809,13 @@ exec '${child.path}' "\$@"
       'reclaims crash orphans and preserves referenced recovery data',
       () async {
         const stageName = 'install-stable-3.47.8-linux-x64';
+        const repairStageName =
+            'repair-stable-3.47.8-linux-x64-cccccccccccccccccccccccccccccccc';
         final stage = Directory('${dataDirectory.path}/staging/$stageName')
           ..createSync(recursive: true);
+        final repairStage = Directory(
+          '${dataDirectory.path}/staging/$repairStageName',
+        )..createSync(recursive: true);
         final source = Directory('${dataDirectory.path}/sources/orphan-engine')
           ..createSync(recursive: true);
         final retained = Directory(
@@ -1141,6 +1840,7 @@ exec '${child.path}' "\$@"
 
         expect(status, 0);
         expect(stage.existsSync(), isFalse);
+        expect(repairStage.existsSync(), isFalse);
         expect(source.existsSync(), isFalse);
         expect(retained.existsSync(), isTrue);
         expect(repository.existsSync(), isTrue);
@@ -1148,6 +1848,10 @@ exec '${child.path}' "\$@"
         expect(
           output.toString(),
           contains('Reclaimed orphaned stage: $stageName'),
+        );
+        expect(
+          output.toString(),
+          contains('Reclaimed orphaned stage: $repairStageName'),
         );
         expect(
           output.toString(),
@@ -1187,6 +1891,46 @@ exec '${child.path}' "\$@"
         await cancellation.close();
       },
     );
+
+    test('waits for active source and private repair stages', () async {
+      const releaseKey = 'stable-3.47.8-linux-x64';
+      final stageNames = [
+        'repair-$releaseKey-${List.filled(32, 'd').join()}',
+        'repair-private-$releaseKey-${List.filled(32, 'e').join()}',
+      ];
+
+      for (final stageName in stageNames) {
+        final stage = Directory('${dataDirectory.path}/staging/$stageName')
+          ..createSync(recursive: true);
+        final lock = Directory(
+          '${dataDirectory.path}/locks/install-$releaseKey',
+        )..createSync(recursive: true);
+        File('${lock.path}/owner').writeAsStringSync('$pid\n');
+        final cancellation = StreamController<void>();
+        final errors = StringBuffer();
+        final cleanup = runWren(
+          ['cleanup'],
+          installEnvironment: InstallEnvironment(
+            dataDirectory: dataDirectory,
+            waitCancellation: cancellation.stream,
+          ),
+          stdoutSink: StringBuffer(),
+          stderrSink: errors,
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+        cancellation.add(null);
+
+        expect(await cleanup, 6);
+        expect(stage.existsSync(), isTrue);
+        expect(
+          errors.toString(),
+          contains('Waiting for active work on stage $stageName'),
+        );
+        await cancellation.close();
+        await lock.delete(recursive: true);
+        await stage.delete(recursive: true);
+      }
+    });
 
     test('waits for an active source operation before reclaiming it', () async {
       const sourceKey = 'active-engine';

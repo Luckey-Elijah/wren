@@ -20,4 +20,4 @@ macOS arm64 repair gives optional iOS, Android, macOS, and other supported targe
 
 The shared repair path fetches first-seen target inventories from a detached checkout of the exact framework revision, retains file digests and modes in the release manifest, skips healthy retained groups, and restores damaged or missing files through staged replacements. Exact-version Flutter tooling performs release-specific archive extraction and postprocessing; the audited 3.7 and 3.47 source families share the configured destination roots. Native fixture tests cover evidence from stamps, distinctive paths, and retained records; cancellation and editor confirmation; complete deletion; never-used targets; all supported target groups; and representative Flutter 3.7.0 and 3.47.8 layouts. Windows artifacts are excluded because Flutter does not emit that group for Wren's supported hosts.
 
-`tool/verify.sh` passed formatting, analysis, and all 76 tests.
+After merging current `main`, `tool/verify.sh` passed formatting, analysis, and all 109 tests.

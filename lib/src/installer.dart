@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:pub_semver/pub_semver.dart';
+import 'package:wren/src/doctor_integrity.dart';
 import 'package:wren/src/tracing.dart';
 
 import 'package:wren/wren.dart' show FlutterRelease, HostPlatform;
@@ -35,117 +36,6 @@ const _linuxRequiredFiles = <String>[
   'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux/libflutter_linux_gtk.so',
   'bin/cache/artifacts/engine/linux-x64-release/flutter_linux/libflutter_linux_gtk.so',
 ];
-
-/// Optional Flutter cache groups that can be present on supported Wren hosts.
-///
-/// These path roots are deliberately narrower than `artifacts/engine`: host
-/// and other target archives share parent directories in some Flutter
-/// releases. The exact Flutter revision remains the source of truth for the
-/// archive contents; these roots only define ownership after Flutter has
-/// populated the cache in an isolated checkout.
-List<_OptionalArtifactGroup> _optionalArtifactGroups(HostPlatform host) => [
-  if (host == HostPlatform.macosArm64)
-    _OptionalArtifactGroup(
-      name: 'ios',
-      precacheFlag: '--ios',
-      stampFiles: [
-        'ios-sdk.stamp',
-        for (final name in [
-          'libimobiledevice',
-          'libusbmuxd',
-          'usbmuxd',
-          'libplist',
-          'openssl',
-          'libimobiledeviceglue',
-          'ios-deploy',
-        ])
-          '$name.stamp',
-      ],
-      pathPrefixes: [
-        'bin/cache/artifacts/engine/ios/',
-        'bin/cache/artifacts/engine/ios-',
-        'bin/cache/artifacts/ios/',
-        for (final name in [
-          'libimobiledevice',
-          'libusbmuxd',
-          'usbmuxd',
-          'libplist',
-          'openssl',
-          'libimobiledeviceglue',
-          'ios-deploy',
-        ])
-          'bin/cache/artifacts/$name/',
-      ],
-    ),
-  const _OptionalArtifactGroup(
-    name: 'android',
-    precacheFlag: '--android',
-    stampFiles: ['android-sdk.stamp'],
-    pathPrefixes: [
-      'bin/cache/artifacts/engine/android/',
-      'bin/cache/artifacts/engine/android-',
-      'bin/cache/artifacts/android/',
-    ],
-  ),
-  if (host == HostPlatform.macosArm64)
-    const _OptionalArtifactGroup(
-      name: 'macos',
-      precacheFlag: '--macos',
-      stampFiles: ['macos-sdk.stamp'],
-      pathPrefixes: [
-        'bin/cache/artifacts/engine/darwin-',
-        'bin/cache/artifacts/macos/',
-      ],
-    ),
-  _OptionalArtifactGroup(
-    name: 'fuchsia',
-    precacheFlag: '--fuchsia',
-    stampFiles: [
-      if (host == HostPlatform.linuxX64) 'fuchsia-linux.stamp',
-      if (host == HostPlatform.macosArm64) 'fuchsia-mac.stamp',
-    ],
-    pathPrefixes: [
-      if (host == HostPlatform.linuxX64)
-        'bin/cache/artifacts/fuchsia/sdk/core/linux-amd64/',
-      if (host == HostPlatform.macosArm64)
-        'bin/cache/artifacts/fuchsia/sdk/core/mac-amd64/',
-    ],
-  ),
-  const _OptionalArtifactGroup(
-    name: 'flutter_runner',
-    precacheFlag: '--flutter_runner',
-    stampFiles: ['flutter_runner.stamp', 'flutter_runner_debug_symbols.stamp'],
-    pathPrefixes: [
-      'bin/cache/artifacts/flutter_runner/',
-      'bin/cache/artifacts/flutter_runner_debug_symbols/',
-    ],
-  ),
-  if (host == HostPlatform.macosArm64)
-    const _OptionalArtifactGroup(
-      name: 'linux',
-      precacheFlag: '--linux',
-      stampFiles: ['linux-sdk.stamp'],
-      pathPrefixes: [
-        'bin/cache/artifacts/engine/linux/',
-        'bin/cache/artifacts/engine/linux-',
-        'bin/cache/artifacts/linux/',
-      ],
-    ),
-];
-
-class _OptionalArtifactGroup {
-  const new({
-    required this.name,
-    required this.precacheFlag,
-    required this.stampFiles,
-    required this.pathPrefixes,
-  });
-
-  final String name;
-  final String precacheFlag;
-  final List<String> stampFiles;
-  final List<String> pathPrefixes;
-}
 
 List<String> _requiredDirectories(HostPlatform host) => [
   ..._commonRequiredDirectories,
@@ -204,6 +94,169 @@ List<String> _precacheArguments(HostPlatform host) => [
   '--web',
 ];
 
+class _OptionalArtifactGroup {
+  const new({
+    required this.id,
+    required this.stampFiles,
+    required this.arguments,
+    required this.pathPrefixes,
+  });
+
+  final String id;
+  final List<String> stampFiles;
+  final List<String> arguments;
+  final List<String> pathPrefixes;
+}
+
+/// Artifact footprints used by Linux Flutter checkouts from 3.7 onward.
+///
+/// The framework cache layout is intentionally selected from the pinned
+/// Flutter version. Linux host artifacts remain in the required-source
+/// inventory; optional target groups use their own engine or Fuchsia roots.
+List<_OptionalArtifactGroup> _linuxOptionalArtifactGroups(String version) {
+  final parsed = Version.parse(version);
+  if (parsed < Version(3, 7, 0)) {
+    throw InstallException(
+      'optional artifact repair does not support Flutter $version.',
+    );
+  }
+
+  final legacy = parsed < Version(3, 10, 0);
+  return [
+    _OptionalArtifactGroup(
+      id: 'android-engine',
+      stampFiles: legacy
+          ? const ['android-sdk.stamp']
+          : const [
+              'android-sdk.stamp',
+              'android-internal-build-artifacts.stamp',
+            ],
+      arguments: legacy
+          ? const ['precache', '--android_gen_snapshot', '--no-universal']
+          : const [
+              'precache',
+              '--android_gen_snapshot',
+              '--android_internal_build',
+              '--no-universal',
+            ],
+      pathPrefixes: const ['bin/cache/artifacts/engine/android-'],
+    ),
+    const _OptionalArtifactGroup(
+      id: 'fuchsia-linux',
+      stampFiles: ['fuchsia-linux.stamp'],
+      arguments: ['precache', '--fuchsia', '--no-universal'],
+      pathPrefixes: ['bin/cache/artifacts/fuchsia/sdk/core/linux-amd64/'],
+    ),
+    const _OptionalArtifactGroup(
+      id: 'flutter-runner',
+      stampFiles: [
+        'flutter_runner.stamp',
+        'flutter_runner_debug_symbols.stamp',
+      ],
+      arguments: ['precache', '--flutter_runner', '--no-universal'],
+      pathPrefixes: ['bin/cache/artifacts/flutter_runner/'],
+    ),
+  ];
+}
+
+/// Artifact footprints used by macOS arm64 Flutter checkouts from 3.7 onward.
+List<_OptionalArtifactGroup> _macosOptionalArtifactGroups(String version) {
+  final parsed = Version.parse(version);
+  if (parsed < Version(3, 7, 0)) {
+    throw InstallException(
+      'optional artifact repair does not support Flutter $version.',
+    );
+  }
+
+  final legacy = parsed < Version(3, 10, 0);
+  return [
+    const _OptionalArtifactGroup(
+      id: 'ios',
+      stampFiles: [
+        'ios-sdk.stamp',
+        'libimobiledevice.stamp',
+        'libusbmuxd.stamp',
+        'usbmuxd.stamp',
+        'libplist.stamp',
+        'openssl.stamp',
+        'libimobiledeviceglue.stamp',
+        'ios-deploy.stamp',
+      ],
+      arguments: ['precache', '--ios', '--no-universal'],
+      pathPrefixes: [
+        'bin/cache/artifacts/engine/ios/',
+        'bin/cache/artifacts/engine/ios-',
+        'bin/cache/artifacts/ios/',
+        'bin/cache/artifacts/libimobiledevice/',
+        'bin/cache/artifacts/libusbmuxd/',
+        'bin/cache/artifacts/usbmuxd/',
+        'bin/cache/artifacts/libplist/',
+        'bin/cache/artifacts/openssl/',
+        'bin/cache/artifacts/libimobiledeviceglue/',
+        'bin/cache/artifacts/ios-deploy/',
+      ],
+    ),
+    _OptionalArtifactGroup(
+      id: 'android',
+      stampFiles: legacy
+          ? const ['android-sdk.stamp']
+          : const [
+              'android-sdk.stamp',
+              'android-internal-build-artifacts.stamp',
+            ],
+      arguments: legacy
+          ? const ['precache', '--android_gen_snapshot', '--no-universal']
+          : const [
+              'precache',
+              '--android_gen_snapshot',
+              '--android_internal_build',
+              '--no-universal',
+            ],
+      pathPrefixes: const [
+        'bin/cache/artifacts/engine/android-',
+        'bin/cache/artifacts/android/',
+      ],
+    ),
+    const _OptionalArtifactGroup(
+      id: 'macos',
+      stampFiles: ['macos-sdk.stamp'],
+      arguments: ['precache', '--macos', '--no-universal'],
+      pathPrefixes: [
+        'bin/cache/artifacts/engine/darwin-',
+        'bin/cache/artifacts/macos/',
+      ],
+    ),
+    const _OptionalArtifactGroup(
+      id: 'linux',
+      stampFiles: ['linux-sdk.stamp'],
+      arguments: ['precache', '--linux', '--no-universal'],
+      pathPrefixes: [
+        'bin/cache/artifacts/engine/linux/',
+        'bin/cache/artifacts/engine/linux-',
+        'bin/cache/artifacts/linux/',
+      ],
+    ),
+    const _OptionalArtifactGroup(
+      id: 'fuchsia',
+      stampFiles: ['fuchsia-mac.stamp'],
+      arguments: ['precache', '--fuchsia', '--no-universal'],
+      pathPrefixes: ['bin/cache/artifacts/fuchsia/sdk/core/mac-amd64/'],
+    ),
+    const _OptionalArtifactGroup(
+      id: 'flutter_runner',
+      stampFiles: [
+        'flutter_runner.stamp',
+        'flutter_runner_debug_symbols.stamp',
+      ],
+      arguments: ['precache', '--flutter_runner', '--no-universal'],
+      pathPrefixes: [
+        'bin/cache/artifacts/flutter_runner/',
+        'bin/cache/artifacts/flutter_runner_debug_symbols/',
+      ],
+    ),
+  ];
+}
+
 /// Local storage and source locations for one Wren installation.
 ///
 /// The optional values are also useful for exercising installs against a
@@ -259,6 +312,7 @@ class RepairResult {
     required this.replaced,
     this.privateFilesRepaired = false,
     this.optionalArtifactsRepaired = false,
+    this.optionalArtifactsValidated = false,
   });
 
   /// Shared artifact source that was checked or replaced.
@@ -270,8 +324,11 @@ class RepairResult {
   /// Whether release-private files were restored from the retained source.
   final bool privateFilesRepaired;
 
-  /// Whether files from optional target groups were restored.
+  /// Whether optional device or build-target files were restored.
   final bool optionalArtifactsRepaired;
+
+  /// Whether present optional artifacts were validated.
+  final bool optionalArtifactsValidated;
 }
 
 /// Describes an installed Flutter release and its readiness.
@@ -321,6 +378,50 @@ class InstallCancelledException implements Exception {
 
   /// Explanation of the cancelled operation.
   final String message;
+}
+
+/// Cancellation signal scoped to one doctor invocation.
+class DoctorCancellation {
+  /// Listens to [signals] until the doctor invocation is disposed.
+  new(Stream<void> signals) {
+    _subscription = signals.listen((_) {
+      if (!_cancelled.isCompleted) _cancelled.complete();
+    });
+  }
+
+  final Completer<void> _cancelled = Completer<void>();
+  late final StreamSubscription<void> _subscription;
+
+  /// Whether the doctor invocation has received a cancellation signal.
+  bool get isCancelled => _cancelled.isCompleted;
+
+  /// Throws the ordinary Wren cancellation exception when signaled.
+  void throwIfCancelled() {
+    if (isCancelled) {
+      throw InstallCancelledException('wren doctor was cancelled.');
+    }
+  }
+
+  /// Waits for [operation] or interrupts the wait when cancellation arrives.
+  Future<T> race<T>(Future<T> operation) {
+    if (isCancelled) {
+      unawaited(
+        operation.then<void>((_) {}, onError: (Object _, StackTrace _) {}),
+      );
+      return Future<T>.error(
+        InstallCancelledException('wren doctor was cancelled.'),
+      );
+    }
+    return Future.any<T>([
+      operation,
+      _cancelled.future.then<T>((_) {
+        throw InstallCancelledException('wren doctor was cancelled.');
+      }),
+    ]);
+  }
+
+  /// Stops listening for later cancellation signals.
+  Future<void> dispose() => _subscription.cancel();
 }
 
 /// An SDK launch failure with its Wren process exit status.
@@ -380,12 +481,10 @@ class FlutterInstaller {
           continue;
         }
         final name = p.basename(entry.path);
-        final releaseMatch = RegExp(r'^install-(.+)$').firstMatch(name);
-        final lockPath = name == 'flutter-repo'
-            ? p.join(root, 'locks', 'flutter-git')
-            : releaseMatch == null
+        final operationLockName = _stageOperationLockName(name);
+        final lockPath = operationLockName == null
             ? null
-            : p.join(root, 'locks', 'install-${releaseMatch.group(1)}');
+            : p.join(root, 'locks', operationLockName);
         if (lockPath == null) continue;
 
         _progress('Checking orphaned stage $name');
@@ -442,7 +541,10 @@ class FlutterInstaller {
   /// Lists published releases and performs the inexpensive launch-readiness
   /// checks used by Wren before selecting an SDK.
   /// Lists published releases and checks their launch readiness.
-  Future<List<InstalledRelease>> listInstalled() async {
+  Future<List<InstalledRelease>> listInstalled({
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
     final releasesDirectory = Directory(
       p.join(environment.dataDirectory.absolute.path, 'releases'),
     );
@@ -450,17 +552,29 @@ class FlutterInstaller {
 
     final installed = <InstalledRelease>[];
     await for (final entity in releasesDirectory.list(followLinks: false)) {
+      cancellation?.throwIfCancelled();
       if (entity is! Directory ||
           FileSystemEntity.typeSync(entity.path, followLinks: false) !=
               FileSystemEntityType.directory) {
         continue;
       }
       final marker = File(p.join(entity.path, '.wren-release.json'));
-      if (!marker.existsSync()) continue;
-      final result = await _readiness(entity, releasesDirectory.parent);
+      if (FileSystemEntity.typeSync(marker.path, followLinks: false) ==
+          FileSystemEntityType.notFound) {
+        continue;
+      }
+      final readiness = _readiness(
+        entity,
+        releasesDirectory.parent,
+        cancellation: cancellation,
+      );
+      final result = cancellation == null
+          ? await readiness
+          : await cancellation.race(readiness);
       if (result == null) continue;
       installed.add(result);
     }
+    cancellation?.throwIfCancelled();
     installed.sort((left, right) {
       final channelOrder = _readinessChannelOrder(left.channel)
           .compareTo(_readinessChannelOrder(right.channel));
@@ -473,6 +587,1476 @@ class FlutterInstaller {
       }
     });
     return List.unmodifiable(installed);
+  }
+
+  /// Inspects every registered release with local evidence only.
+  ///
+  /// This path does not invoke Flutter or Dart, access the network, or repair
+  /// SDK files. It only persists a needs-repair marker after a check confirms
+  /// damage. Checks which time out or lack trusted expected contents remain
+  /// incomplete and do not create a damage marker.
+  Future<DoctorFullIntegrityReport> inspectFullIntegrity({
+    Duration checkTimeout = const Duration(seconds: 30),
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
+    final releasesDirectory = Directory(
+      p.join(environment.dataDirectory.absolute.path, 'releases'),
+    );
+    late final FileSystemEntityType registryType;
+    try {
+      registryType = FileSystemEntity.typeSync(
+        releasesDirectory.path,
+        followLinks: false,
+      );
+    } on FileSystemException catch (error) {
+      return DoctorFullIntegrityReport(
+        const [],
+        checks: [
+          DoctorIntegrityCheck(
+            id: 'release-registry',
+            status: DoctorCheckStatus.incomplete,
+            detail: 'could not inspect the release registry: $error',
+          ),
+        ],
+      );
+    }
+    if (registryType == FileSystemEntityType.notFound) {
+      return DoctorFullIntegrityReport(const []);
+    }
+    if (registryType != FileSystemEntityType.directory) {
+      return DoctorFullIntegrityReport(
+        const [],
+        checks: [
+          const DoctorIntegrityCheck(
+            id: 'release-registry',
+            status: DoctorCheckStatus.incomplete,
+            detail: 'the release registry is not a regular directory.',
+          ),
+        ],
+      );
+    }
+
+    _progress('Enumerating installed Flutter releases');
+    final registered = <Directory>[];
+    DoctorIntegrityCheck? registryCheck;
+    try {
+      await for (final entity
+          in releasesDirectory.list(followLinks: false).timeout(checkTimeout)) {
+        cancellation?.throwIfCancelled();
+        if (entity is! Directory ||
+            FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+                FileSystemEntityType.directory) {
+          continue;
+        }
+        final markerPath = p.join(entity.path, '.wren-release.json');
+        if (FileSystemEntity.typeSync(markerPath, followLinks: false) !=
+            FileSystemEntityType.notFound) {
+          registered.add(entity);
+        }
+      }
+    } on TimeoutException {
+      registryCheck = const DoctorIntegrityCheck(
+        id: 'release-registry',
+        status: DoctorCheckStatus.incomplete,
+        detail:
+            'release registry enumeration timed out; partial results follow.',
+      );
+    } on FileSystemException catch (error) {
+      registryCheck = DoctorIntegrityCheck(
+        id: 'release-registry',
+        status: DoctorCheckStatus.incomplete,
+        detail: 'could not finish release registry enumeration: $error',
+      );
+    }
+
+    registered.sort(
+      (left, right) => p.basename(left.path).compareTo(p.basename(right.path)),
+    );
+    final sourceChecks = <String, Future<DoctorIntegrityCheck>>{};
+    final results = <DoctorReleaseIntegrity>[];
+    for (final release in registered) {
+      cancellation?.throwIfCancelled();
+      late final DoctorReleaseIntegrity result;
+      try {
+        result = await _inspectFullRelease(
+          release,
+          sourceChecks: sourceChecks,
+          checkTimeout: checkTimeout,
+          cancellation: cancellation,
+        );
+      } on InstallCancelledException {
+        rethrow;
+      } on Object catch (error) {
+        result = DoctorReleaseIntegrity(
+          channel: 'unknown',
+          version: p.basename(release.path),
+          host: 'unknown',
+          dartVersion: null,
+          checks: [
+            DoctorIntegrityCheck(
+              id: 'release-inspection',
+              status: DoctorCheckStatus.incomplete,
+              detail: 'the release could not be fully inspected: $error',
+            ),
+          ],
+        );
+      }
+      cancellation?.throwIfCancelled();
+      results.add(result);
+      if (result.hasConfirmedDamage) {
+        try {
+          cancellation?.throwIfCancelled();
+          await _persistFullDoctorNeedsRepair(
+            release,
+            result,
+            cancellation: cancellation,
+          ).timeout(checkTimeout);
+        } on InstallCancelledException {
+          rethrow;
+        } on Object catch (error) {
+          results[results.length - 1] = DoctorReleaseIntegrity(
+            channel: result.channel,
+            version: result.version,
+            host: result.host,
+            dartVersion: result.dartVersion,
+            checks: [
+              ...result.checks,
+              DoctorIntegrityCheck(
+                id: 'needs-repair-marker',
+                status: DoctorCheckStatus.incomplete,
+                detail: 'could not persist the needs-repair marker: $error',
+              ),
+            ],
+          );
+        }
+      }
+    }
+
+    cancellation?.throwIfCancelled();
+
+    return DoctorFullIntegrityReport(
+      results,
+      checks: registryCheck == null ? const [] : [registryCheck],
+    );
+  }
+
+  Future<DoctorReleaseIntegrity> _inspectFullRelease(
+    Directory release, {
+    required Map<String, Future<DoctorIntegrityCheck>> sourceChecks,
+    required Duration checkTimeout,
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
+    _progress('Inspecting registered release ${p.basename(release.path)}');
+    final read = await _readDoctorReleaseManifest(release, checkTimeout);
+    final data = read.data;
+    if (data == null) {
+      return DoctorReleaseIntegrity(
+        channel: 'unknown',
+        version: p.basename(release.path),
+        host: 'unknown',
+        dartVersion: null,
+        checks: [read.check],
+      );
+    }
+
+    final version = data['version'] is String
+        ? data['version']! as String
+        : p.basename(release.path);
+    final channel = data['channel'] is String
+        ? data['channel']! as String
+        : 'unknown';
+    final hostName = data['host'] is String
+        ? data['host']! as String
+        : 'unknown';
+    final dartVersion = data['canonicalDartVersion'] is String
+        ? data['canonicalDartVersion']! as String
+        : null;
+    final checks = <DoctorIntegrityCheck>[read.check];
+
+    final readinessReason = data['readinessReason'];
+    final doctorSafetyMarker = File(
+      p.join(release.path, '.wren-doctor-needs-repair.json'),
+    );
+    final hasDoctorSafetyMarker =
+        FileSystemEntity.typeSync(
+          doctorSafetyMarker.path,
+          followLinks: false,
+        ) !=
+        FileSystemEntityType.notFound;
+    if (data['privateFilesNeedRepair'] == true ||
+        data['sourceNeedsRepair'] == true ||
+        data['optionalArtifactsNeedRepair'] == true ||
+        hasDoctorSafetyMarker) {
+      checks.add(
+        DoctorIntegrityCheck(
+          id: 'recorded-needs-repair',
+          status: DoctorCheckStatus.confirmedDamage,
+          detail: readinessReason is String && readinessReason.isNotEmpty
+              ? readinessReason
+              : hasDoctorSafetyMarker
+              ? 'a doctor safety marker is present and blocks this release.'
+              : 'the release already has a needs-repair safety marker.',
+          nextStep: 'Run `wren repair $version`.',
+        ),
+      );
+    }
+
+    final identity = await _runDoctorCheck(
+      'release-identity',
+      'recorded release identity and Flutter checkout match.',
+      () => _validateDoctorReleaseIdentity(
+        release,
+        data,
+        checkTimeout: checkTimeout,
+        cancellation: cancellation,
+      ),
+      checkTimeout,
+      nextStep: 'Run `wren repair $version`.',
+      cancellation: cancellation,
+    );
+    checks.add(identity);
+
+    final host = _hostFromIdentity(
+      data['host'] is String ? data['host']! as String : null,
+      data['architecture'] is String ? data['architecture']! as String : null,
+    );
+    final engineRevision = data['engineRevision'];
+    final sourceKey = data['sourceKey'];
+    late final DoctorIntegrityCheck sourceCheck;
+    if (host == null ||
+        engineRevision is! String ||
+        !RegExp(_engineRevisionPattern).hasMatch(engineRevision) ||
+        sourceKey is! String ||
+        sourceKey != _sourceKey(engineRevision, host)) {
+      sourceCheck = DoctorIntegrityCheck(
+        id: 'retained-source',
+        status: DoctorCheckStatus.incomplete,
+        detail: 'the release has no trustworthy retained-source identity.',
+        nextStep: 'Run `wren repair $version`.',
+      );
+    } else {
+      final cacheKey =
+          '$sourceKey:${host.catalogOs}:${host.catalogArchitecture}';
+      final sourceFuture = sourceChecks.putIfAbsent(
+        cacheKey,
+        () => _runDoctorCheck(
+          'retained-source',
+          'retained shared source contents match their local inventory.',
+          () => _validateDoctorSource(
+            Directory(
+              p.join(
+                environment.dataDirectory.absolute.path,
+                'sources',
+                sourceKey,
+              ),
+            ),
+            engineRevision: engineRevision,
+            host: host,
+            releaseVersion: version,
+            checkTimeout: checkTimeout,
+          ),
+          checkTimeout,
+          nextStep: 'Run `wren repair $version`.',
+          cancellation: cancellation,
+        ),
+      );
+      sourceCheck = await sourceFuture;
+    }
+    checks.add(sourceCheck);
+
+    if (sourceCheck.status == DoctorCheckStatus.passed) {
+      checks.add(
+        await _runDoctorCheck(
+          'release-private-files',
+          'release-private artifacts match the retained source inventory.',
+          () => _validateDoctorPrivateFiles(
+            release,
+            Directory(
+              p.join(
+                environment.dataDirectory.absolute.path,
+                'sources',
+                sourceKey! as String,
+              ),
+            ),
+            releaseManifest: data,
+            host: host!,
+            checkTimeout: checkTimeout,
+          ),
+          checkTimeout,
+          nextStep: 'Run `wren repair $version`.',
+          cancellation: cancellation,
+        ),
+      );
+    } else if (sourceCheck.status == DoctorCheckStatus.confirmedDamage) {
+      checks.add(
+        DoctorIntegrityCheck(
+          id: 'release-private-files',
+          status: DoctorCheckStatus.incomplete,
+          detail:
+              'private files could not be compared against a damaged '
+              'retained source.',
+          nextStep: 'Run `wren repair $version`.',
+        ),
+      );
+    } else {
+      checks.add(
+        DoctorIntegrityCheck(
+          id: 'release-private-files',
+          status: DoctorCheckStatus.incomplete,
+          detail:
+              'private files could not be checked without a trusted retained '
+              'source inventory.',
+          nextStep: 'Run `wren repair $version`.',
+        ),
+      );
+    }
+
+    checks.addAll(
+      await _inspectDoctorOptionalArtifacts(
+        release,
+        data,
+        host: host,
+        version: version,
+        checkTimeout: checkTimeout,
+        cancellation: cancellation,
+      ),
+    );
+
+    return DoctorReleaseIntegrity(
+      channel: channel,
+      version: version,
+      host: hostName,
+      dartVersion: dartVersion,
+      checks: checks,
+    );
+  }
+
+  Future<_DoctorReleaseManifestRead> _readDoctorReleaseManifest(
+    Directory release,
+    Duration checkTimeout,
+  ) async {
+    final markerPath = p.join(release.path, '.wren-release.json');
+    final markerType = FileSystemEntity.typeSync(
+      markerPath,
+      followLinks: false,
+    );
+    if (markerType != FileSystemEntityType.file) {
+      return _DoctorReleaseManifestRead(
+        data: null,
+        check: DoctorIntegrityCheck(
+          id: 'release-record',
+          status: DoctorCheckStatus.confirmedDamage,
+          detail: markerType == FileSystemEntityType.notFound
+              ? 'the registered release record is missing.'
+              : 'the registered release record is not a regular file.',
+          nextStep: 'Restore trusted release metadata before retrying repair.',
+        ),
+      );
+    }
+
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(
+        await File(markerPath).readAsString().timeout(checkTimeout),
+      );
+    } on TimeoutException {
+      return const _DoctorReleaseManifestRead(
+        data: null,
+        check: DoctorIntegrityCheck(
+          id: 'release-record',
+          status: DoctorCheckStatus.incomplete,
+          detail: 'reading the release record timed out.',
+        ),
+      );
+    } on FormatException {
+      return const _DoctorReleaseManifestRead(
+        data: null,
+        check: DoctorIntegrityCheck(
+          id: 'release-record',
+          status: DoctorCheckStatus.confirmedDamage,
+          detail: 'the release record is not valid JSON.',
+          nextStep: 'Restore trusted release metadata before retrying repair.',
+        ),
+      );
+    } on FileSystemException catch (error) {
+      return _DoctorReleaseManifestRead(
+        data: null,
+        check: DoctorIntegrityCheck(
+          id: 'release-record',
+          status: DoctorCheckStatus.incomplete,
+          detail: 'could not read the release record: $error',
+        ),
+      );
+    }
+
+    if (decoded is! Map<String, Object?>) {
+      return const _DoctorReleaseManifestRead(
+        data: null,
+        check: DoctorIntegrityCheck(
+          id: 'release-record',
+          status: DoctorCheckStatus.confirmedDamage,
+          detail: 'the release record must contain a JSON object.',
+          nextStep: 'Restore trusted release metadata before retrying repair.',
+        ),
+      );
+    }
+    return _DoctorReleaseManifestRead(
+      data: decoded,
+      check: const DoctorIntegrityCheck(
+        id: 'release-record',
+        status: DoctorCheckStatus.passed,
+        detail: 'the release record is readable.',
+      ),
+    );
+  }
+
+  Future<DoctorIntegrityCheck> _runDoctorCheck(
+    String id,
+    String passedDetail,
+    Future<void> Function() validate,
+    Duration timeout, {
+    String? nextStep,
+    DoctorCancellation? cancellation,
+  }) async {
+    _progress('Checking doctor integrity: $id');
+    try {
+      final operation = validate().timeout(timeout);
+      if (cancellation == null) {
+        await operation;
+      } else {
+        await cancellation.race(operation);
+      }
+      return DoctorIntegrityCheck(
+        id: id,
+        status: DoctorCheckStatus.passed,
+        detail: passedDetail,
+      );
+    } on InstallCancelledException {
+      rethrow;
+    } on _DoctorConfirmedDamage catch (error) {
+      return DoctorIntegrityCheck(
+        id: id,
+        status: DoctorCheckStatus.confirmedDamage,
+        detail: error.message,
+        nextStep: nextStep,
+      );
+    } on _DoctorEvidenceUnavailable catch (error) {
+      return DoctorIntegrityCheck(
+        id: id,
+        status: DoctorCheckStatus.incomplete,
+        detail: error.message,
+        nextStep: nextStep,
+      );
+    } on TimeoutException {
+      return DoctorIntegrityCheck(
+        id: id,
+        status: DoctorCheckStatus.incomplete,
+        detail: 'the check timed out before it could establish integrity.',
+        nextStep: nextStep,
+      );
+    } on FileSystemException catch (error) {
+      return DoctorIntegrityCheck(
+        id: id,
+        status: DoctorCheckStatus.incomplete,
+        detail: 'the check could not read local evidence: $error',
+        nextStep: nextStep,
+      );
+    } on ProcessException catch (error) {
+      return DoctorIntegrityCheck(
+        id: id,
+        status: DoctorCheckStatus.incomplete,
+        detail: 'the local identity check could not run: $error',
+        nextStep: nextStep,
+      );
+    } on Object catch (error) {
+      return DoctorIntegrityCheck(
+        id: id,
+        status: DoctorCheckStatus.incomplete,
+        detail: 'the check could not establish integrity: $error',
+        nextStep: nextStep,
+      );
+    }
+  }
+
+  Future<void> _validateDoctorReleaseIdentity(
+    Directory release,
+    Map<String, Object?> manifest, {
+    required Duration checkTimeout,
+    DoctorCancellation? cancellation,
+  }) async {
+    final channel = manifest['channel'];
+    final version = manifest['version'];
+    final hostName = manifest['host'];
+    final architecture = manifest['architecture'];
+    final frameworkRevision = manifest['frameworkRevision'];
+    final engineRevision = manifest['engineRevision'];
+    final sourceKey = manifest['sourceKey'];
+    final host = _hostFromIdentity(
+      hostName is String ? hostName : null,
+      architecture is String ? architecture : null,
+    );
+    if (host == null) {
+      throw const _DoctorEvidenceUnavailable(
+        'the release uses an unsupported host or architecture layout.',
+      );
+    }
+    if (channel is! String ||
+        !{'stable', 'beta'}.contains(channel) ||
+        version is! String ||
+        manifest['state'] != 'ready' ||
+        p.basename(release.path) !=
+            '$channel-$version-${_readinessVariant(host)}') {
+      throw const _DoctorConfirmedDamage(
+        'recorded release identity does not match its installation path.',
+      );
+    }
+    try {
+      Version.parse(version);
+    } on FormatException {
+      throw const _DoctorConfirmedDamage(
+        'recorded Flutter version is not valid semantic version data.',
+      );
+    }
+    if (frameworkRevision is! String ||
+        !RegExp(r'^[a-fA-F0-9]{40}$').hasMatch(frameworkRevision) ||
+        engineRevision is! String ||
+        !RegExp(_engineRevisionPattern).hasMatch(engineRevision) ||
+        sourceKey != _sourceKey(engineRevision, host)) {
+      throw const _DoctorConfirmedDamage(
+        'recorded framework, engine, or shared-source identity is invalid.',
+      );
+    }
+
+    final actualFramework = await _readLocalGitHead(
+      release.path,
+      checkTimeout: checkTimeout,
+      cancellation: cancellation,
+    );
+    if (actualFramework.toLowerCase() != frameworkRevision.toLowerCase()) {
+      throw const _DoctorConfirmedDamage(
+        'Flutter checkout does not match its recorded framework revision.',
+      );
+    }
+    final engineFile = File(
+      p.join(release.path, 'bin/internal/engine.version'),
+    );
+    if (FileSystemEntity.typeSync(engineFile.path, followLinks: false) !=
+        FileSystemEntityType.file) {
+      throw const _DoctorConfirmedDamage(
+        'Flutter checkout is missing bin/internal/engine.version.',
+      );
+    }
+    final actualEngine = (await engineFile.readAsString().timeout(checkTimeout))
+        .trim();
+    if (actualEngine.toLowerCase() != engineRevision.toLowerCase()) {
+      throw const _DoctorConfirmedDamage(
+        'Flutter checkout does not match its recorded engine revision.',
+      );
+    }
+
+    final checkoutRecords = manifest['checkoutFiles'];
+    if (checkoutRecords == null) {
+      throw const _DoctorEvidenceUnavailable(
+        'the release has no trusted local checkout-file inventory.',
+      );
+    }
+    try {
+      _validateCheckoutFileRecords(checkoutRecords);
+    } on InstallException catch (error) {
+      throw _DoctorEvidenceUnavailable(
+        'the local checkout-file inventory cannot be trusted: ${error.message}',
+      );
+    }
+    var hashedCheckoutFiles = 0;
+    for (final item in checkoutRecords as List<Object?>) {
+      final record = item! as Map<String, Object?>;
+      final relativePath = record['path']! as String;
+      final file = File(p.join(release.path, relativePath));
+      if (FileSystemEntity.typeSync(file.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        throw _DoctorConfirmedDamage(
+          'release checkout file $relativePath is missing or not a regular '
+          'file.',
+        );
+      }
+      final digest = await _hashFile(file, checkTimeout);
+      hashedCheckoutFiles++;
+      if (hashedCheckoutFiles == 1 || hashedCheckoutFiles % 16 == 0) {
+        _progress(
+          'Hashed $hashedCheckoutFiles checkout files for Flutter $version',
+        );
+      }
+      if (digest != record['sha256'] ||
+          (file.statSync().mode & 0x1ff) != record['mode']) {
+        throw _DoctorConfirmedDamage(
+          'release checkout file $relativePath differs from its trusted '
+          'inventory.',
+        );
+      }
+    }
+  }
+
+  Future<String> _readLocalGitHead(
+    String workingDirectory, {
+    required Duration checkTimeout,
+    DoctorCancellation? cancellation,
+  }) async {
+    late final Process process;
+    try {
+      process = await Process.start('git', [
+        'rev-parse',
+        '--verify',
+        'HEAD',
+      ], workingDirectory: workingDirectory);
+    } on ProcessException {
+      rethrow;
+    }
+    final stdout = utf8.decoder.bind(process.stdout).join();
+    final stderr = utf8.decoder.bind(process.stderr).join();
+    final exitCode = process.exitCode;
+    try {
+      final operation = Future.wait<Object>([stdout, stderr, exitCode])
+          .timeout(checkTimeout);
+      final results = cancellation == null
+          ? await operation
+          : await cancellation.race(operation);
+      final output = results[0] as String;
+      final error = results[1] as String;
+      final status = results[2] as int;
+      if (cancellation?.isCancelled == true) {
+        throw InstallCancelledException('wren doctor was cancelled.');
+      }
+      if (status != 0) {
+        cancellation?.throwIfCancelled();
+        final details = '$error\n$output'.trim();
+        if (details.contains('not a git repository') ||
+            details.contains('unknown revision') ||
+            details.contains('ambiguous argument')) {
+          throw _DoctorConfirmedDamage(
+            'Flutter checkout has no readable Git identity: $details',
+          );
+        }
+        throw _DoctorEvidenceUnavailable(
+          'could not read the local Flutter Git identity: $details',
+        );
+      }
+      return output.trim();
+    } on TimeoutException {
+      await _terminateDoctorProcess(process);
+      rethrow;
+    } on InstallCancelledException {
+      await _terminateDoctorProcess(process);
+      rethrow;
+    }
+  }
+
+  Future<void> _terminateDoctorProcess(Process process) async {
+    final exited = process.exitCode;
+    process.kill();
+    try {
+      await exited.timeout(const Duration(milliseconds: 100));
+    } on TimeoutException {
+      process.kill(ProcessSignal.sigkill);
+      try {
+        await exited.timeout(const Duration(seconds: 1));
+      } on TimeoutException {
+        // Keep doctor's cancellation and timeout cleanup bounded.
+      }
+    }
+  }
+
+  Future<void> _validateDoctorSource(
+    Directory source, {
+    required String engineRevision,
+    required HostPlatform host,
+    required String releaseVersion,
+    required Duration checkTimeout,
+  }) async {
+    final sourceType = FileSystemEntity.typeSync(
+      source.path,
+      followLinks: false,
+    );
+    if (sourceType != FileSystemEntityType.directory) {
+      throw const _DoctorConfirmedDamage(
+        'the retained shared artifact source is missing or not a directory.',
+      );
+    }
+    final marker = File(p.join(source.path, '.wren-source.json'));
+    if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+        FileSystemEntityType.file) {
+      throw const _DoctorConfirmedDamage(
+        'the retained shared artifact source record is missing.',
+      );
+    }
+
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(await marker.readAsString().timeout(checkTimeout));
+    } on FormatException {
+      throw const _DoctorConfirmedDamage(
+        'the retained shared artifact source record is not valid JSON.',
+      );
+    }
+    if (decoded is! Map<String, Object?>) {
+      throw const _DoctorConfirmedDamage(
+        'the retained shared artifact source record must be a JSON object.',
+      );
+    }
+    final data = decoded;
+    if (data['state'] != 'ready') {
+      throw const _DoctorConfirmedDamage(
+        'the retained shared artifact source is marked as needing repair.',
+      );
+    }
+    if (data['engineRevision'] != engineRevision ||
+        data['host'] != host.catalogOs ||
+        data['architecture'] != host.catalogArchitecture ||
+        data['archiveVariant'] != _archiveVariant(host) ||
+        jsonEncode(data['artifacts']) !=
+            jsonEncode(_sourceArtifactPaths(host))) {
+      throw const _DoctorConfirmedDamage(
+        'the retained shared artifact source identity or artifact list is '
+        'incoherent.',
+      );
+    }
+
+    final expectedInventory = _doctorInventoryMap(
+      data['inventory'],
+      evidenceName: 'retained shared-source inventory',
+    );
+    final stamps = data['stamps'];
+    if (stamps is! Map<String, Object?>) {
+      throw const _DoctorEvidenceUnavailable(
+        'the retained shared source has no trusted cache-stamp inventory.',
+      );
+    }
+    final stampFiles = _sourceStampFiles(host);
+    if (stamps.keys.any((stamp) => !stampFiles.contains(stamp)) ||
+        stampFiles
+            .where((stamp) => stamp != 'engine.realm')
+            .any((stamp) => stamps[stamp] is! String) ||
+        stamps['engine.realm'] is! String) {
+      throw const _DoctorEvidenceUnavailable(
+        'the retained shared source has incomplete cache-stamp evidence.',
+      );
+    }
+    for (final stamp in stampFiles.where((stamp) => stamp != 'engine.realm')) {
+      if ((stamps[stamp]! as String).trim() != engineRevision) {
+        throw _DoctorConfirmedDamage(
+          'retained shared source stamp $stamp does not match its engine '
+          'revision.',
+        );
+      }
+    }
+
+    for (final artifact in _sourceArtifactPaths(host)) {
+      if (FileSystemEntity.typeSync(
+            p.join(source.path, artifact),
+            followLinks: false,
+          ) !=
+          FileSystemEntityType.directory) {
+        throw _DoctorConfirmedDamage(
+          'retained shared source artifact is missing: $artifact.',
+        );
+      }
+    }
+    final missingArtifact = _readinessMissingArtifact(source.path, host);
+    if (missingArtifact != null) {
+      throw _DoctorConfirmedDamage(
+        'retained shared source required artifact is missing: '
+        '$missingArtifact.',
+      );
+    }
+    for (final executable in [
+      _dartExecutable,
+      ..._readinessHostExecutables(host),
+    ]) {
+      final file = File(p.join(source.path, executable));
+      if ((file.statSync().mode & 0x49) == 0) {
+        throw _DoctorConfirmedDamage(
+          'retained shared source executable is not runnable: $executable.',
+        );
+      }
+    }
+
+    var hashedFiles = 0;
+    late final List<Map<String, String>> actualInventory;
+    try {
+      actualInventory = await _sourceInventory(
+        source,
+        host,
+        readTimeout: checkTimeout,
+        onHashedFile: (_) {
+          hashedFiles++;
+          if (hashedFiles == 1 || hashedFiles % 16 == 0) {
+            _progress(
+              'Hashed $hashedFiles retained source files for Flutter '
+              '$releaseVersion',
+            );
+          }
+        },
+      );
+    } on InstallException catch (error) {
+      if (error.message.contains('symbolic link')) {
+        throw _DoctorConfirmedDamage(error.message);
+      }
+      throw _DoctorEvidenceUnavailable(
+        'retained shared-source contents could not be inventoried: '
+        '${error.message}',
+      );
+    }
+    final actual = _doctorInventoryMap(
+      actualInventory,
+      evidenceName: 'retained shared-source files',
+    );
+    if (!_sameDoctorInventory(actual, expectedInventory)) {
+      throw const _DoctorConfirmedDamage(
+        'retained shared source files do not match their trusted inventory.',
+      );
+    }
+  }
+
+  Future<void> _validateDoctorPrivateFiles(
+    Directory release,
+    Directory source, {
+    required Map<String, Object?> releaseManifest,
+    required HostPlatform host,
+    required Duration checkTimeout,
+  }) async {
+    final missingArtifact = _readinessMissingArtifact(release.path, host);
+    if (missingArtifact != null) {
+      throw _DoctorConfirmedDamage(
+        'release-private required artifact is missing: $missingArtifact.',
+      );
+    }
+
+    final cache = Directory(p.join(release.path, 'bin/cache'));
+    if (FileSystemEntity.typeSync(cache.path, followLinks: false) !=
+        FileSystemEntityType.directory) {
+      throw const _DoctorConfirmedDamage(
+        'release-private Flutter cache is missing or not a directory.',
+      );
+    }
+    final sourcesPath = p.join(
+      environment.dataDirectory.absolute.path,
+      'sources',
+    );
+    final entries = cache.list(recursive: true, followLinks: false);
+    await for (final entity in entries.timeout(checkTimeout)) {
+      if (FileSystemEntity.typeSync(entity.path, followLinks: false) ==
+          FileSystemEntityType.link) {
+        try {
+          final target = Link(entity.path).resolveSymbolicLinksSync();
+          if (target == sourcesPath || p.isWithin(sourcesPath, target)) {
+            throw _DoctorConfirmedDamage(
+              'release-private cache links into the shared artifact source: '
+              '${p.relative(entity.path, from: release.path)}.',
+            );
+          }
+        } on FileSystemException {
+          throw _DoctorConfirmedDamage(
+            'release-private cache contains a broken symbolic link: '
+            '${p.relative(entity.path, from: release.path)}.',
+          );
+        }
+      }
+    }
+
+    for (final executable in [
+      'bin/flutter',
+      _dartExecutable,
+      ..._readinessHostExecutables(host),
+    ]) {
+      final file = File(p.join(release.path, executable));
+      if (FileSystemEntity.typeSync(file.path, followLinks: false) !=
+              FileSystemEntityType.file ||
+          (file.statSync().mode & 0x49) == 0) {
+        throw _DoctorConfirmedDamage(
+          'release-private required executable is missing or not runnable: '
+          '$executable.',
+        );
+      }
+    }
+
+    var hashedFiles = 0;
+    final changed = await _changedPrivateArtifactFiles(
+      release,
+      source,
+      releaseManifest,
+      readTimeout: checkTimeout,
+      onHashedFile: (_) {
+        hashedFiles++;
+        if (hashedFiles == 1 || hashedFiles % 16 == 0) {
+          _progress(
+            'Hashed $hashedFiles release-private files for Flutter '
+            '${releaseManifest['version']}',
+          );
+        }
+      },
+    );
+    if (changed.isNotEmpty) {
+      throw _DoctorConfirmedDamage(
+        'release-private artifact differs from its retained source: '
+        '${changed.first}.',
+      );
+    }
+  }
+
+  Map<String, String> _doctorInventoryMap(
+    Object? value, {
+    required String evidenceName,
+  }) {
+    if (value is! List<Object?> || value.isEmpty) {
+      throw _DoctorEvidenceUnavailable('$evidenceName is missing or empty.');
+    }
+    final inventory = <String, String>{};
+    for (final entry in value) {
+      if (entry is! Map<String, Object?> ||
+          entry['path'] is! String ||
+          entry['sha256'] is! String ||
+          !RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(entry['sha256']! as String)) {
+        throw _DoctorEvidenceUnavailable(
+          '$evidenceName contains an untrusted file record.',
+        );
+      }
+      final path = p.normalize(entry['path']! as String);
+      if (p.isAbsolute(path) ||
+          p.split(path).contains('..') ||
+          inventory.containsKey(path)) {
+        throw _DoctorEvidenceUnavailable(
+          '$evidenceName contains an unsafe or duplicate path.',
+        );
+      }
+      inventory[path] = (entry['sha256']! as String).toLowerCase();
+    }
+    return inventory;
+  }
+
+  bool _sameDoctorInventory(
+    Map<String, String> actual,
+    Map<String, String> expected,
+  ) =>
+      actual.length == expected.length &&
+      actual.entries.every((entry) => expected[entry.key] == entry.value);
+
+  Future<List<DoctorIntegrityCheck>> _inspectDoctorOptionalArtifacts(
+    Directory release,
+    Map<String, Object?> releaseManifest, {
+    required HostPlatform? host,
+    required String version,
+    required Duration checkTimeout,
+    DoctorCancellation? cancellation,
+  }) async {
+    if (host == null) {
+      return [
+        DoctorIntegrityCheck(
+          id: 'optional-artifacts',
+          status: DoctorCheckStatus.incomplete,
+          detail:
+              'optional artifact inventory cannot be selected without a '
+              'supported release host.',
+          nextStep: 'Run `wren repair $version`.',
+        ),
+      ];
+    }
+    final List<_OptionalArtifactGroup> groups;
+    try {
+      groups = switch (host) {
+        HostPlatform.linuxX64 => _linuxOptionalArtifactGroups(version),
+        HostPlatform.macosArm64 => _macosOptionalArtifactGroups(version),
+      };
+    } on InstallException catch (error) {
+      return [
+        DoctorIntegrityCheck(
+          id: 'optional-artifacts',
+          status: DoctorCheckStatus.incomplete,
+          detail:
+              'the Linux optional artifact inventory is unavailable: '
+              '${error.message}',
+          nextStep: 'Run `wren repair $version`.',
+        ),
+      ];
+    } on FormatException catch (error) {
+      return [
+        DoctorIntegrityCheck(
+          id: 'optional-artifacts',
+          status: DoctorCheckStatus.incomplete,
+          detail:
+              'the Flutter version has no usable optional artifact inventory: '
+              '$error',
+          nextStep: 'Run `wren repair $version`.',
+        ),
+      ];
+    }
+
+    final recordValue = releaseManifest['optionalArtifactGroups'];
+    if (recordValue != null && recordValue is! Map<String, Object?>) {
+      return [
+        DoctorIntegrityCheck(
+          id: 'optional-artifact-inventory',
+          status: DoctorCheckStatus.incomplete,
+          detail: 'the retained optional artifact inventory cannot be trusted.',
+          nextStep: 'Run `wren repair $version`.',
+        ),
+      ];
+    }
+    final records = recordValue as Map<String, Object?>? ?? const {};
+    final groupIds = groups.map((group) => group.id).toSet();
+    final results = <DoctorIntegrityCheck>[];
+    for (final unknown in records.keys.where((id) => !groupIds.contains(id))) {
+      results.add(
+        DoctorIntegrityCheck(
+          id: 'optional-artifact-inventory',
+          status: DoctorCheckStatus.incomplete,
+          detail:
+              'optional artifact group `$unknown` has no trusted inventory for '
+              'Flutter $version.',
+          nextStep: 'Run `wren repair $version`.',
+        ),
+      );
+    }
+
+    for (final group in groups) {
+      results.add(
+        await _runDoctorCheck(
+          'optional-artifacts-${group.id}',
+          'the ${group.id} group was verified, or no local evidence shows it '
+              'was present.',
+          () => _validateDoctorOptionalGroup(
+            release,
+            releaseManifest,
+            group,
+            version: version,
+            checkTimeout: checkTimeout,
+          ),
+          checkTimeout,
+          nextStep: 'Run `wren repair $version`.',
+          cancellation: cancellation,
+        ),
+      );
+    }
+    return results;
+  }
+
+  Future<void> _validateDoctorOptionalGroup(
+    Directory release,
+    Map<String, Object?> releaseManifest,
+    _OptionalArtifactGroup group, {
+    required String version,
+    required Duration checkTimeout,
+  }) async {
+    final recordsValue = releaseManifest['optionalArtifactGroups'];
+    final records = recordsValue is Map<String, Object?>
+        ? recordsValue
+        : const <String, Object?>{};
+    final hasRecord = records.containsKey(group.id);
+    final record = records[group.id];
+    final hasEvidence =
+        hasRecord ||
+        group.stampFiles.any(
+          (stamp) =>
+              FileSystemEntity.typeSync(
+                p.join(release.path, 'bin/cache', stamp),
+                followLinks: false,
+              ) !=
+              FileSystemEntityType.notFound,
+        ) ||
+        await _hasDoctorOptionalArtifactFiles(release, group, checkTimeout);
+    if (!hasEvidence) return;
+    if (record == null) {
+      throw _DoctorEvidenceUnavailable(
+        'the present ${group.id} group has no trusted local content inventory.',
+      );
+    }
+
+    final frameworkRevision = releaseManifest['frameworkRevision'];
+    final engineRevision = releaseManifest['engineRevision'];
+    if (frameworkRevision is! String || engineRevision is! String) {
+      throw _DoctorEvidenceUnavailable(
+        'the ${group.id} inventory cannot be matched to a framework and '
+        'engine revision.',
+      );
+    }
+    try {
+      _validateOptionalGroupRecord(
+        record,
+        group,
+        releaseVersion: version,
+        frameworkRevision: frameworkRevision,
+        engineRevision: engineRevision,
+      );
+    } on InstallException catch (error) {
+      throw _DoctorEvidenceUnavailable(
+        'the retained ${group.id} inventory cannot be trusted: '
+        '${error.message}',
+      );
+    }
+    var hashedFiles = 0;
+    final matches = await _optionalGroupMatches(
+      release,
+      group,
+      record,
+      readTimeout: checkTimeout,
+      onHashedFile: (_) {
+        hashedFiles++;
+        if (hashedFiles == 1 || hashedFiles % 16 == 0) {
+          _progress(
+            'Hashed $hashedFiles ${group.id} files for Flutter $version',
+          );
+        }
+      },
+    );
+    if (!matches) {
+      throw _DoctorConfirmedDamage(
+        'the present ${group.id} group differs from its trusted local '
+        'inventory.',
+      );
+    }
+  }
+
+  Future<bool> _hasDoctorOptionalArtifactFiles(
+    Directory release,
+    _OptionalArtifactGroup group,
+    Duration checkTimeout,
+  ) async {
+    final cache = Directory(p.join(release.path, 'bin/cache'));
+    if (FileSystemEntity.typeSync(cache.path, followLinks: false) !=
+        FileSystemEntityType.directory) {
+      return false;
+    }
+    await for (final entity
+        in cache
+            .list(recursive: true, followLinks: false)
+            .timeout(checkTimeout)) {
+      final relative = p.relative(entity.path, from: release.path);
+      if (_optionalGroupOwnsPath(group, relative)) return true;
+    }
+    return false;
+  }
+
+  Future<void> _persistFullDoctorNeedsRepair(
+    Directory release,
+    DoctorReleaseIntegrity result, {
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
+    final sourceDamage = result.checks.any(
+      (check) =>
+          check.id == 'retained-source' &&
+          check.status == DoctorCheckStatus.confirmedDamage,
+    );
+    if (sourceDamage) {
+      final releaseMarker = File(p.join(release.path, '.wren-release.json'));
+      final decoded = await _readDoctorReleaseIdentity(
+        releaseMarker,
+        cancellation: cancellation,
+      );
+      cancellation?.throwIfCancelled();
+      final sourceKey = decoded?.sourceKey;
+      if (sourceKey != null) {
+        var sourceMarked = false;
+        try {
+          sourceMarked = await _persistSharedSourceNeedsRepair(
+            sourceKey,
+            cancellation: cancellation,
+          );
+        } on InstallCancelledException {
+          rethrow;
+        } on Object {
+          // Fall back to dependent release safety markers if this path cannot
+          // be safely updated or is not writable.
+        }
+        if (!sourceMarked) {
+          await _markDependentReleasesForSourceRepair(
+            sourceKey,
+            result.repairReason ?? 'shared artifact source needs repair',
+            cancellation: cancellation,
+          );
+        }
+      }
+    }
+
+    final privateDamage = result.checks.any(
+      (check) =>
+          check.id == 'release-private-files' &&
+          check.status == DoctorCheckStatus.confirmedDamage,
+    );
+    final optionalDamage = result.checks.any(
+      (check) =>
+          (check.id.startsWith('optional-artifacts-') ||
+              check.id == 'optional-artifact-inventory') &&
+          check.status == DoctorCheckStatus.confirmedDamage,
+    );
+    final checkoutDamage = result.checks.any(
+      (check) =>
+          check.id == 'release-identity' &&
+          check.status == DoctorCheckStatus.confirmedDamage,
+    );
+    final recordDamage = result.checks.any(
+      (check) =>
+          check.id == 'release-record' &&
+          check.status == DoctorCheckStatus.confirmedDamage,
+    );
+    if (!privateDamage && !optionalDamage && !checkoutDamage && !recordDamage) {
+      return;
+    }
+
+    final marker = File(p.join(release.path, '.wren-release.json'));
+    if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+        FileSystemEntityType.file) {
+      await _persistReleaseSafetyMarker(
+        release,
+        result.repairReason ?? 'release metadata needs repair',
+        cancellation: cancellation,
+      );
+      return;
+    }
+    final decoded = await _readDoctorReleaseIdentity(
+      marker,
+      cancellation: cancellation,
+    );
+    if (decoded == null) {
+      await _persistReleaseSafetyMarker(
+        release,
+        result.repairReason ?? 'release metadata needs repair',
+        cancellation: cancellation,
+      );
+      return;
+    }
+    final updated = Map<String, Object?>.from(decoded.data);
+    if (privateDamage || checkoutDamage) {
+      updated['privateFilesNeedRepair'] = true;
+    }
+    if (optionalDamage) updated['optionalArtifactsNeedRepair'] = true;
+    updated['readiness'] = 'needs-repair';
+    updated['readinessReason'] =
+        result.repairReason ?? 'full integrity check failed';
+    cancellation?.throwIfCancelled();
+    await _publishManifest(release.path, updated, cancellation: cancellation);
+  }
+
+  Future<_DoctorReleaseIdentity?> _readDoctorReleaseIdentity(
+    File marker, {
+    DoctorCancellation? cancellation,
+  }) async {
+    try {
+      if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        return null;
+      }
+      final read = marker.readAsString();
+      final data = jsonDecode(
+        cancellation == null ? await read : await cancellation.race(read),
+      );
+      if (data is! Map<String, Object?>) return null;
+      final engineRevision = data['engineRevision'];
+      final host = _hostFromIdentity(
+        data['host'] is String ? data['host']! as String : null,
+        data['architecture'] is String ? data['architecture']! as String : null,
+      );
+      final sourceKey = data['sourceKey'];
+      final resolvedSourceKey =
+          engineRevision is String &&
+              RegExp(_engineRevisionPattern).hasMatch(engineRevision) &&
+              host != null &&
+              sourceKey == _sourceKey(engineRevision, host)
+          ? sourceKey! as String
+          : null;
+      return _DoctorReleaseIdentity(data: data, sourceKey: resolvedSourceKey);
+    } on InstallCancelledException {
+      rethrow;
+    } on Object {
+      return null;
+    }
+  }
+
+  Future<bool> _persistSharedSourceNeedsRepair(
+    String sourceKey, {
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
+    final sourcesDirectory = Directory(
+      p.join(environment.dataDirectory.absolute.path, 'sources'),
+    );
+    final sourcesType = FileSystemEntity.typeSync(
+      sourcesDirectory.path,
+      followLinks: false,
+    );
+    if (sourcesType == FileSystemEntityType.notFound) {
+      await sourcesDirectory.create(recursive: true);
+      cancellation?.throwIfCancelled();
+    } else if (sourcesType != FileSystemEntityType.directory) {
+      return false;
+    }
+
+    final sourceDirectory = Directory(p.join(sourcesDirectory.path, sourceKey));
+    final sourceType = FileSystemEntity.typeSync(
+      sourceDirectory.path,
+      followLinks: false,
+    );
+    if (sourceType == FileSystemEntityType.notFound) {
+      await sourceDirectory.create();
+      cancellation?.throwIfCancelled();
+    } else if (sourceType != FileSystemEntityType.directory) {
+      return false;
+    }
+
+    final sourceMarker = File(
+      p.join(sourceDirectory.path, '.wren-source.json'),
+    );
+    final markerType = FileSystemEntity.typeSync(
+      sourceMarker.path,
+      followLinks: false,
+    );
+    if (markerType != FileSystemEntityType.notFound &&
+        markerType != FileSystemEntityType.file) {
+      return false;
+    }
+    var sourceData = <String, Object?>{};
+    if (markerType == FileSystemEntityType.file) {
+      try {
+        final read = sourceMarker.readAsString();
+        final value = jsonDecode(
+          cancellation == null ? await read : await cancellation.race(read),
+        );
+        if (value is Map<String, Object?>) sourceData = value;
+      } on InstallCancelledException {
+        rethrow;
+      } on Object {
+        // Replace invalid regular metadata with a safety-only manifest.
+      }
+    }
+    if (sourceData['state'] != 'needs-repair') {
+      cancellation?.throwIfCancelled();
+      await _publishManifest(
+        sourceDirectory.path,
+        Map<String, Object?>.from(sourceData)..['state'] = 'needs-repair',
+        filename: '.wren-source.json',
+        cancellation: cancellation,
+      );
+    }
+    return true;
+  }
+
+  Future<void> _markDependentReleasesForSourceRepair(
+    String sourceKey,
+    String reason, {
+    DoctorCancellation? cancellation,
+  }) async {
+    final releases = Directory(
+      p.join(environment.dataDirectory.absolute.path, 'releases'),
+    );
+    if (FileSystemEntity.typeSync(releases.path, followLinks: false) !=
+        FileSystemEntityType.directory) {
+      throw const FileSystemException(
+        'could not locate releases that depend on the damaged shared source.',
+      );
+    }
+    await for (final entity in releases.list(followLinks: false)) {
+      cancellation?.throwIfCancelled();
+      if (entity is! Directory ||
+          FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+              FileSystemEntityType.directory) {
+        continue;
+      }
+      final marker = File(p.join(entity.path, '.wren-release.json'));
+      if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        continue;
+      }
+      final identity = await _readDoctorReleaseIdentity(
+        marker,
+        cancellation: cancellation,
+      );
+      if (identity?.sourceKey != sourceKey) continue;
+      final updated = Map<String, Object?>.from(identity!.data)
+        ..['sourceNeedsRepair'] = true
+        ..['readiness'] = 'needs-repair'
+        ..['readinessReason'] = reason;
+      cancellation?.throwIfCancelled();
+      await _publishManifest(entity.path, updated, cancellation: cancellation);
+    }
+  }
+
+  Future<void> _clearDependentSourceRepairMarkers(
+    String root,
+    String sourceKey,
+  ) async {
+    final releases = Directory(p.join(root, 'releases'));
+    if (FileSystemEntity.typeSync(releases.path, followLinks: false) !=
+        FileSystemEntityType.directory) {
+      return;
+    }
+    await for (final entity in releases.list(followLinks: false)) {
+      if (entity is! Directory ||
+          FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+              FileSystemEntityType.directory) {
+        continue;
+      }
+      final marker = File(p.join(entity.path, '.wren-release.json'));
+      if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        continue;
+      }
+      final identity = await _readDoctorReleaseIdentity(marker);
+      if (identity?.sourceKey != sourceKey ||
+          identity!.data['sourceNeedsRepair'] != true) {
+        continue;
+      }
+      final updated = Map<String, Object?>.from(identity.data)
+        ..remove('sourceNeedsRepair');
+      if (updated['readinessReason'] == 'shared artifact source needs repair') {
+        updated
+          ..remove('readiness')
+          ..remove('readinessReason');
+      }
+      await _publishManifest(entity.path, updated);
+    }
+  }
+
+  Future<void> _persistReleaseSafetyMarker(
+    Directory release,
+    String reason, {
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
+    if (FileSystemEntity.typeSync(release.path, followLinks: false) !=
+        FileSystemEntityType.directory) {
+      throw const FileSystemException(
+        'the release directory is not safe for a needs-repair marker.',
+      );
+    }
+    final marker = File(p.join(release.path, '.wren-doctor-needs-repair.json'));
+    if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+        FileSystemEntityType.notFound) {
+      return;
+    }
+    await _publishManifest(
+      release.path,
+      {'format': 1, 'state': 'needs-repair', 'reason': reason},
+      filename: p.basename(marker.path),
+      cancellation: cancellation,
+    );
+  }
+
+  Future<void> _clearReleaseSafetyMarker(Directory release) async {
+    final marker = File(p.join(release.path, '.wren-doctor-needs-repair.json'));
+    if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+        FileSystemEntityType.file) {
+      return;
+    }
+    try {
+      final data = jsonDecode(await marker.readAsString());
+      if (data is Map<String, Object?> &&
+          data['format'] == 1 &&
+          data['state'] == 'needs-repair') {
+        await marker.delete();
+      }
+    } on Object {
+      // A damaged sidecar remains a safety stop until it can be inspected.
+    }
   }
 
   /// Validates and, if needed, replaces the shared source for [releaseVersion].
@@ -493,7 +2077,10 @@ class FlutterInstaller {
       await for (final entity in releases.list(followLinks: false)) {
         if (entity is! Directory) continue;
         final marker = File(p.join(entity.path, '.wren-release.json'));
-        if (!marker.existsSync()) continue;
+        if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+            FileSystemEntityType.file) {
+          continue;
+        }
         try {
           final data = jsonDecode(await marker.readAsString());
           if (data is Map<String, Object?> &&
@@ -625,16 +2212,18 @@ class FlutterInstaller {
             externalUse: releaseManifest['externalUse'] == true,
             confirmExternalUse: confirmExternalUse,
           );
-          final optionalArtifactsRepaired = await _repairOptionalArtifactGroups(
+          final optionalArtifactOutcome = await _repairOptionalArtifacts(
             releaseDirectory,
             root,
-            releaseManifest: releaseManifest,
             releaseKey: releaseKey,
             releaseVersion: releaseVersion,
             frameworkRevision: frameworkRevision,
+            engineRevision: engineRevision,
             host: host,
             confirmExternalUse: confirmExternalUse,
           );
+          await _clearDependentSourceRepairMarkers(root.path, sourceKey);
+          await _clearReleaseSafetyMarker(releaseDirectory);
           final readiness = await _readiness(releaseDirectory, root);
           if (readiness?.needsRepair ?? true) {
             throw InstallException(
@@ -646,7 +2235,8 @@ class FlutterInstaller {
             sourceKey: sourceKey,
             replaced: false,
             privateFilesRepaired: privateFilesRepaired,
-            optionalArtifactsRepaired: optionalArtifactsRepaired,
+            optionalArtifactsRepaired: optionalArtifactOutcome.repaired,
+            optionalArtifactsValidated: optionalArtifactOutcome.validated,
           );
         }
         // An invalid retained source is rebuilt from the pinned Flutter
@@ -779,16 +2369,18 @@ class FlutterInstaller {
             externalUse: releaseManifest['externalUse'] == true,
             confirmExternalUse: confirmExternalUse,
           );
-          final optionalArtifactsRepaired = await _repairOptionalArtifactGroups(
+          final optionalArtifactOutcome = await _repairOptionalArtifacts(
             releaseDirectory,
             root,
-            releaseManifest: releaseManifest,
             releaseKey: releaseKey,
             releaseVersion: releaseVersion,
             frameworkRevision: frameworkRevision,
+            engineRevision: engineRevision,
             host: host,
             confirmExternalUse: confirmExternalUse,
           );
+          await _clearDependentSourceRepairMarkers(root.path, sourceKey);
+          await _clearReleaseSafetyMarker(releaseDirectory);
           final readiness = await _readiness(releaseDirectory, root);
           if (readiness?.needsRepair ?? true) {
             throw InstallException(
@@ -803,7 +2395,8 @@ class FlutterInstaller {
             sourceKey: sourceKey,
             replaced: true,
             privateFilesRepaired: privateFilesRepaired,
-            optionalArtifactsRepaired: optionalArtifactsRepaired,
+            optionalArtifactsRepaired: optionalArtifactOutcome.repaired,
+            optionalArtifactsValidated: optionalArtifactOutcome.validated,
           );
         } catch (error) {
           if (newSourcePublished && source.existsSync()) {
@@ -861,7 +2454,17 @@ class FlutterInstaller {
           continue;
         }
         final marker = File(p.join(entity.path, '.wren-release.json'));
-        if (!marker.existsSync()) continue;
+        final safetyMarker = File(
+          p.join(entity.path, '.wren-doctor-needs-repair.json'),
+        );
+        if (FileSystemEntity.typeSync(safetyMarker.path, followLinks: false) !=
+            FileSystemEntityType.notFound) {
+          continue;
+        }
+        if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+            FileSystemEntityType.file) {
+          continue;
+        }
         try {
           final data = jsonDecode(await marker.readAsString());
           if (data is Map<String, Object?> &&
@@ -990,8 +2593,18 @@ class FlutterInstaller {
                 FileSystemEntityType.directory) {
           continue;
         }
+        final safetyMarker = File(
+          p.join(entity.path, '.wren-doctor-needs-repair.json'),
+        );
+        if (FileSystemEntity.typeSync(safetyMarker.path, followLinks: false) !=
+            FileSystemEntityType.notFound) {
+          continue;
+        }
         final marker = File(p.join(entity.path, '.wren-release.json'));
-        if (!marker.existsSync()) continue;
+        if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+            FileSystemEntityType.file) {
+          continue;
+        }
         try {
           final data = jsonDecode(await marker.readAsString());
           if (data is Map<String, Object?> &&
@@ -1083,7 +2696,10 @@ class FlutterInstaller {
       await for (final entity in releases.list(followLinks: false)) {
         if (entity is! Directory) continue;
         final marker = File(p.join(entity.path, '.wren-release.json'));
-        if (!marker.existsSync()) continue;
+        if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+            FileSystemEntityType.file) {
+          continue;
+        }
         try {
           final data = jsonDecode(await marker.readAsString());
           if (data is Map<String, Object?> &&
@@ -1260,7 +2876,10 @@ class FlutterInstaller {
     for (final entity in releases.listSync(followLinks: false)) {
       if (entity is! Directory) continue;
       final marker = File(p.join(entity.path, '.wren-release.json'));
-      if (!marker.existsSync()) continue;
+      if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        continue;
+      }
       try {
         final data = jsonDecode(marker.readAsStringSync());
         if (data is Map<String, Object?> &&
@@ -1303,9 +2922,28 @@ class FlutterInstaller {
 
   Future<InstalledRelease?> _readiness(
     Directory release,
-    Directory root,
-  ) async {
+    Directory root, {
+    DoctorCancellation? cancellation,
+  }) async {
+    cancellation?.throwIfCancelled();
+    final doctorSafetyMarker = File(
+      p.join(release.path, '.wren-doctor-needs-repair.json'),
+    );
+    if (FileSystemEntity.typeSync(
+          doctorSafetyMarker.path,
+          followLinks: false,
+        ) !=
+        FileSystemEntityType.notFound) {
+      return _invalidRelease(
+        release,
+        'the release record or integrity metadata needs repair',
+      );
+    }
     final marker = File(p.join(release.path, '.wren-release.json'));
+    if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+        FileSystemEntityType.file) {
+      return _invalidRelease(release, 'release metadata is not a regular file');
+    }
     String? channel;
     String? version;
     String? hostName;
@@ -1343,10 +2981,12 @@ class FlutterInstaller {
             '$engineRevision-${host.catalogOs}-${host.catalogArchitecture}') {
           reason = 'recorded shared source identity is invalid';
         } else {
-          final actualFramework = await _gitText(release.path, [
-            'rev-parse',
-            'HEAD',
-          ], userMessage: 'could not read framework identity');
+          final actualFramework = await _gitText(
+            release.path,
+            ['rev-parse', 'HEAD'],
+            userMessage: 'could not read framework identity',
+            cancellation: cancellation,
+          );
           if (actualFramework.toLowerCase() !=
               frameworkRevision.toLowerCase()) {
             reason = 'framework checkout does not match its recorded identity';
@@ -1360,24 +3000,29 @@ class FlutterInstaller {
               final source = Directory(
                 p.join(root.path, 'sources', sourceKey! as String),
               );
-              reason =
-                  await _quickReadinessReason(
-                    release,
-                    source,
-                    data,
-                    engineRevision,
-                    host,
-                  ) ??
-                  '';
-              if (reason.isEmpty && data['privateFilesNeedRepair'] == true) {
+              reason = data['sourceNeedsRepair'] == true
+                  ? 'shared artifact source needs repair'
+                  : await _quickReadinessReason(
+                          release,
+                          source,
+                          data,
+                          engineRevision,
+                          host,
+                        ) ??
+                        '';
+              if (reason.isEmpty &&
+                  (data['privateFilesNeedRepair'] == true ||
+                      data['optionalArtifactsNeedRepair'] == true)) {
                 reason =
                     data['readinessReason'] as String? ??
-                    'release-private artifact contents need repair';
+                    'release artifact contents need repair';
               }
             }
           }
         }
       }
+    } on InstallCancelledException {
+      rethrow;
     } on Object catch (error) {
       reason = 'could not validate installed release: $error';
     }
@@ -1395,7 +3040,8 @@ class FlutterInstaller {
       updated['readinessReason'] = reason;
     }
     if (jsonEncode(updated) != jsonEncode(current)) {
-      await _publishManifest(release.path, updated);
+      cancellation?.throwIfCancelled();
+      await _publishManifest(release.path, updated, cancellation: cancellation);
     }
     if (channel == null || version == null || hostName == null) {
       return _invalidRelease(release, reason);
@@ -2173,10 +3819,17 @@ class FlutterInstaller {
     required String engineRevision,
     required HostPlatform host,
   }) async {
-    final marker = File(p.join(source.path, '.wren-source.json'));
-    if (!marker.existsSync()) {
+    if (FileSystemEntity.typeSync(source.path, followLinks: false) !=
+        FileSystemEntityType.directory) {
       throw const InstallException(
-        'the retained host artifact source is damaged.',
+        'the retained host artifact source is not a regular directory.',
+      );
+    }
+    final marker = File(p.join(source.path, '.wren-source.json'));
+    if (FileSystemEntity.typeSync(marker.path, followLinks: false) !=
+        FileSystemEntityType.file) {
+      throw const InstallException(
+        'the retained host artifact source record is missing or not regular.',
       );
     }
     final artifactPaths = _sourceArtifactPaths(host);
@@ -2425,323 +4078,609 @@ class FlutterInstaller {
     }
   }
 
-  Future<bool> _repairOptionalArtifactGroups(
+  Future<_OptionalArtifactRepairOutcome> _repairOptionalArtifacts(
     Directory release,
     Directory root, {
-    required Map<String, Object?> releaseManifest,
     required String releaseKey,
     required String releaseVersion,
     required String frameworkRevision,
+    required String engineRevision,
     required HostPlatform host,
     required Future<bool?> Function(String message) confirmExternalUse,
   }) async {
-    final saved = releaseManifest['optionalArtifactInventories'];
-    if (saved != null && saved is! Map<String, Object?>) {
+    final marker = File(p.join(release.path, '.wren-release.json'));
+    final decodedManifest = jsonDecode(await marker.readAsString());
+    if (decodedManifest is! Map<String, Object?>) {
+      throw const InstallException('installed release metadata is invalid.');
+    }
+    final releaseManifest = Map<String, Object?>.from(decodedManifest);
+    final externalUse = releaseManifest['externalUse'] == true;
+    final groups = switch (host) {
+      HostPlatform.linuxX64 => _linuxOptionalArtifactGroups(releaseVersion),
+      HostPlatform.macosArm64 => _macosOptionalArtifactGroups(releaseVersion),
+    };
+    final recordsValue = releaseManifest['optionalArtifactGroups'];
+    if (recordsValue != null && recordsValue is! Map<String, Object?>) {
+      await _setOptionalRepairMarker(release, needsRepair: true);
       throw const InstallException(
-        'installed optional artifact inventory metadata is invalid.',
+        'the optional artifact inventory is invalid.',
       );
     }
-    final inventories = saved is Map<String, Object?>
-        ? Map<String, Object?>.from(saved)
-        : <String, Object?>{};
-    final groups = _optionalArtifactGroups(host);
-    final supportedGroups = groups.map((group) => group.name).toSet();
-    inventories.removeWhere((name, _) => !supportedGroups.contains(name));
-    var anyFilesRepaired = false;
-    var externalConfirmationNeeded = false;
+    final records = Map<String, Object?>.from(
+      recordsValue as Map<String, Object?>? ?? const {},
+    );
+    final knownGroupIds = groups.map((group) => group.id).toSet();
+    if (records.keys.any((id) => !knownGroupIds.contains(id))) {
+      await _setOptionalRepairMarker(release, needsRepair: true);
+      throw const InstallException(
+        'the optional artifact inventory contains an unsupported group.',
+      );
+    }
 
+    var repaired = false;
+    var validated = false;
+    var observedGroup = false;
     for (final group in groups) {
-      final previous = _decodeOptionalArtifactInventory(
-        inventories[group.name],
+      final existingRecord = records[group.id];
+      final hasStamp = group.stampFiles.any(
+        (stamp) => File(p.join(release.path, 'bin/cache', stamp)).existsSync(),
+      );
+      final hasFiles = await _optionalGroupFiles(
+        release,
         group,
-      );
-      final current = await _optionalArtifactInventory(release, group);
-      if (inventories.containsKey(group.name) && previous == null) {
-        throw const InstallException(
-          'installed optional artifact inventory metadata is invalid.',
-        );
+      ).then((files) => files.isNotEmpty);
+      if (existingRecord == null && !hasStamp && !hasFiles) {
+        continue;
       }
-      if (previous == null && current.isEmpty) continue;
+      observedGroup = true;
 
-      final trustedCurrent =
-          previous != null &&
-          await _optionalArtifactInventoryMatches(release, previous);
-      if (trustedCurrent) continue;
+      if (existingRecord != null) {
+        _validateOptionalGroupRecord(
+          existingRecord,
+          group,
+          releaseVersion: releaseVersion,
+          frameworkRevision: frameworkRevision,
+          engineRevision: engineRevision,
+        );
+        if (await _optionalGroupMatches(release, group, existingRecord)) {
+          validated = true;
+          continue;
+        }
+      }
 
-      final stageRoot = Directory(
-        p.join(
-          root.path,
-          'staging',
-          'optional-$releaseKey-${group.name}-${_randomId()}',
-        ),
+      // Preserve the damaged state if the trusted group source is unavailable.
+      await _setOptionalRepairMarker(release, needsRepair: true);
+      releaseManifest
+        ..['optionalArtifactsNeedRepair'] = true
+        ..['readiness'] = 'needs-repair'
+        ..['readinessReason'] = 'optional artifact contents need repair';
+      final staged = await _stageOptionalArtifactGroup(
+        release,
+        root,
+        group,
+        releaseKey: releaseKey,
+        releaseVersion: releaseVersion,
+        frameworkRevision: frameworkRevision,
+        engineRevision: engineRevision,
       );
-      final checkout = Directory(p.join(stageRoot.path, 'checkout'));
-      var worktreeCreated = false;
       try {
-        await checkout.parent.create(recursive: true);
-        await _requireGit();
-        final gitLock = await _acquireLock(
-          Directory(p.join(root.path, 'locks', 'flutter-git')),
-          cancellation: _waitCancellation,
-          onWait: () => _progress('Waiting for the shared Flutter Git lock'),
-        );
-        try {
-          await _ensureSharedRepository(root);
-          await _fetchFrameworkCommit(root, frameworkRevision, releaseVersion);
-          await _runGit(root, [
-            '--git-dir',
-            p.join(root.path, 'flutter.git'),
-            'worktree',
-            'add',
-            '--detach',
-            checkout.path,
-            frameworkRevision,
-          ], userMessage: 'could not create an optional-artifact repair SDK');
-          worktreeCreated = true;
-        } finally {
-          await _releaseLock(gitLock);
-        }
-
-        _progress('Validating Flutter $releaseVersion ${group.name} artifacts');
-        await _runFlutter(
-          checkout,
-          ['precache', '--force', group.precacheFlag],
-          userMessage:
-              'Flutter could not validate its ${group.name} artifact source',
-        );
-        final expected = await _optionalArtifactInventory(checkout, group);
-        final expectedHasPayload = expected.any((record) {
-          final path = record['path']! as String;
-          return !group.stampFiles.any(
-            (name) => path == p.join('bin/cache', name),
-          );
-        });
-        if (expected.isEmpty || !expectedHasPayload) {
+        if (existingRecord != null &&
+            !_sameOptionalGroupInventory(existingRecord, staged.record)) {
           throw InstallException(
-            'Flutter $releaseVersion did not provide a trusted '
-            '${group.name} artifact inventory.',
+            'trusted ${group.id} artifacts no longer match the retained '
+            'Flutter $releaseVersion inventory.',
           );
         }
 
-        final damaged = !await _optionalArtifactInventoryMatches(
+        final contentsMatch = await _optionalGroupMatches(
           release,
-          expected,
+          group,
+          staged.record,
         );
-        if (damaged && !externalConfirmationNeeded) {
+        validated = true;
+        records[group.id] = staged.record;
+        final updatedManifest = Map<String, Object?>.from(releaseManifest)
+          ..['optionalArtifactGroups'] = records;
+        if (!contentsMatch) {
           await _waitForReleaseUsers(releaseKey, releaseVersion);
-          if (releaseManifest['externalUse'] == true) {
+          if (externalUse) {
             final confirmed = await confirmExternalUse(
               'Flutter $releaseVersion was exposed to an editor or external '
-              'tool. Close editors using it and confirm private-file repair.',
+              'tool. Close editors using it and confirm optional artifact '
+              'repair.',
             );
             if (confirmed != true) {
               throw InstallCancelledException(
                 'repair cancelled; Flutter $releaseVersion was not changed.',
               );
             }
-            externalConfirmationNeeded = true;
           }
-        }
-
-        if (damaged) {
-          await _publishOptionalArtifactInventory(
+          await _publishOptionalArtifactGroup(
             release,
-            stageRoot,
-            checkout,
             group,
-            previous,
-            expected,
+            staged,
+            updatedManifest,
           );
-          anyFilesRepaired = true;
+          repaired = true;
+        } else {
+          await _publishManifest(release.path, updatedManifest);
         }
-        inventories[group.name] = expected;
-        final manifestFile = File(p.join(release.path, '.wren-release.json'));
-        final decodedManifest = jsonDecode(await manifestFile.readAsString());
-        if (decodedManifest is! Map<String, Object?>) {
-          throw const InstallException(
-            'installed release metadata is invalid.',
-          );
-        }
-        releaseManifest
-          ..clear()
-          ..addAll(decodedManifest);
-        releaseManifest['optionalArtifactInventories'] = inventories;
-        await _publishManifest(release.path, releaseManifest);
       } finally {
-        if (worktreeCreated) await _discardWorktree(root, checkout.path);
-        if (stageRoot.existsSync()) await stageRoot.delete(recursive: true);
+        await _discardWorktree(root, staged.checkout.path);
+        if (staged.stagingRoot.existsSync()) {
+          await staged.stagingRoot.delete(recursive: true);
+        }
       }
     }
-    return anyFilesRepaired;
-  }
 
-  Future<List<Map<String, Object?>>> _optionalArtifactInventory(
-    Directory root,
-    _OptionalArtifactGroup group,
-  ) async {
-    final cache = Directory(p.join(root.path, 'bin/cache'));
-    if (!cache.existsSync()) return const [];
-    final files = <String, Map<String, Object?>>{};
-    await for (final entity in cache.list(
-      recursive: true,
-      followLinks: false,
-    )) {
-      if (FileSystemEntity.typeSync(entity.path, followLinks: false) !=
-          FileSystemEntityType.file) {
-        continue;
-      }
-      final relative = p.relative(entity.path, from: root.path);
-      final stamp = group.stampFiles.any(
-        (name) => relative == p.join('bin/cache', name),
-      );
-      if (!stamp && !group.pathPrefixes.any(relative.startsWith)) {
-        continue;
-      }
-      final file = File(entity.path);
-      final digest = await sha256.bind(file.openRead()).first;
-      files[relative] = {
-        'path': relative,
-        'sha256': digest.toString(),
-        'mode': file.statSync().mode & 0x1ff,
-      };
+    if (observedGroup ||
+        (recordsValue is Map<String, Object?> && recordsValue.isNotEmpty)) {
+      await _setOptionalRepairMarker(release, needsRepair: false);
     }
-    return files.values.toList()
-      ..sort((a, b) => '${a['path']}'.compareTo('${b['path']}'));
+    return _OptionalArtifactRepairOutcome(
+      repaired: repaired,
+      validated: validated,
+    );
   }
 
-  List<Map<String, Object?>>? _decodeOptionalArtifactInventory(
+  void _validateOptionalGroupRecord(
     Object? value,
+    _OptionalArtifactGroup group, {
+    required String releaseVersion,
+    required String frameworkRevision,
+    required String engineRevision,
+  }) {
+    if (value is! Map<String, Object?> ||
+        value['version'] != releaseVersion ||
+        value['frameworkRevision'] != frameworkRevision ||
+        value['engineRevision'] != engineRevision ||
+        value['files'] is! List<Object?> ||
+        value['stamps'] is! Map<String, Object?>) {
+      throw InstallException(
+        'the retained ${group.id} artifact inventory is invalid.',
+      );
+    }
+    final files = value['files']! as List<Object?>;
+    if (files.isEmpty) {
+      throw InstallException(
+        'the retained ${group.id} artifact inventory is empty.',
+      );
+    }
+    for (final item in files) {
+      if (item is! Map<String, Object?> ||
+          item['path'] is! String ||
+          item['sha256'] is! String ||
+          !RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(item['sha256']! as String) ||
+          item['mode'] is! int) {
+        throw InstallException(
+          'the retained ${group.id} artifact inventory is invalid.',
+        );
+      }
+      final path = p.normalize(item['path']! as String);
+      if (p.isAbsolute(path) ||
+          p.split(path).contains('..') ||
+          !_optionalGroupOwnsPath(group, path)) {
+        throw InstallException(
+          'the retained ${group.id} artifact inventory is invalid.',
+        );
+      }
+    }
+    final stamps = value['stamps']! as Map<String, Object?>;
+    if (stamps.isEmpty ||
+        stamps.keys.any(
+          (stamp) =>
+              !group.stampFiles.contains(stamp) || stamps[stamp] is! String,
+        )) {
+      throw InstallException(
+        'the retained ${group.id} artifact stamps are invalid.',
+      );
+    }
+  }
+
+  Future<bool> _optionalGroupMatches(
+    Directory release,
     _OptionalArtifactGroup group,
-  ) {
-    if (value is! List<Object?> || value.isEmpty) return null;
-    final records = <Map<String, Object?>>[];
-    final seenPaths = <String>{};
-    for (final item in value) {
+    Object? record, {
+    Duration? readTimeout,
+    void Function(String path)? onHashedFile,
+  }) async {
+    if (record is! Map<String, Object?>) return false;
+    final expectedFiles = record['files'];
+    final expectedStamps = record['stamps'];
+    if (expectedFiles is! List<Object?> ||
+        expectedStamps is! Map<String, Object?>) {
+      return false;
+    }
+    final expectedPaths = <String>{};
+    for (final item in expectedFiles) {
       if (item is! Map<String, Object?> ||
           item['path'] is! String ||
           item['sha256'] is! String ||
           item['mode'] is! int) {
-        return null;
+        return false;
       }
-      final path = p.normalize(item['path']! as String);
-      final isStamp = group.stampFiles.any(
-        (name) => path == p.join('bin/cache', name),
-      );
-      final isGroupPath = group.pathPrefixes.any(path.startsWith);
-      if (p.isAbsolute(path) ||
-          p.split(path).contains('..') ||
-          (!isStamp && !isGroupPath) ||
-          !RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(item['sha256']! as String) ||
-          (item['mode']! as int) < 0 ||
-          (item['mode']! as int) > 0x1ff ||
-          !seenPaths.add(path)) {
-        return null;
-      }
-      records.add(item);
-    }
-    return records;
-  }
-
-  Future<bool> _optionalArtifactInventoryMatches(
-    Directory root,
-    List<Map<String, Object?>> expected,
-  ) async {
-    for (final record in expected) {
-      final file = File(p.join(root.path, record['path']! as String));
+      final relative = item['path']! as String;
+      expectedPaths.add(relative);
+      final file = File(p.join(release.path, relative));
       if (FileSystemEntity.typeSync(file.path, followLinks: false) !=
           FileSystemEntityType.file) {
-        _progress('Optional artifact is missing: ${record['path']}');
         return false;
       }
-      final digest = await sha256.bind(file.openRead()).first;
-      if (digest.toString() != record['sha256']) {
-        _progress('Optional artifact changed: ${record['path']}');
+      final digest = await _hashFile(file, readTimeout);
+      onHashedFile?.call(relative);
+      if (digest != item['sha256'] ||
+          (file.statSync().mode & 0x1ff) != item['mode']) {
         return false;
       }
-      if (file.statSync().mode & 0x1ff != record['mode']) {
-        _progress('Optional artifact mode changed: ${record['path']}');
+    }
+    if (expectedPaths.isEmpty) return false;
+    final actualFiles = await _optionalGroupFiles(
+      release,
+      group,
+      readTimeout: readTimeout,
+      onHashedFile: onHashedFile,
+    );
+    if (actualFiles.map((entry) => entry['path']! as String).toSet().length !=
+            expectedPaths.length ||
+        !actualFiles.every(
+          (entry) => expectedPaths.contains(entry['path']! as String),
+        )) {
+      return false;
+    }
+    if (expectedStamps.values.any((value) => value is! String)) {
+      return false;
+    }
+    for (final entry in expectedStamps.entries) {
+      final stamp = File(p.join(release.path, 'bin/cache', entry.key));
+      if (FileSystemEntity.typeSync(stamp.path, followLinks: false) !=
+              FileSystemEntityType.file ||
+          await stamp.readAsString() != entry.value) {
         return false;
       }
     }
     return true;
   }
 
-  Future<void> _publishOptionalArtifactInventory(
+  Future<List<Map<String, Object?>>> _optionalGroupFiles(
     Directory release,
-    Directory stageRoot,
-    Directory checkout,
+    _OptionalArtifactGroup group, {
+    Duration? readTimeout,
+    void Function(String path)? onHashedFile,
+  }) async {
+    final cache = Directory(p.join(release.path, 'bin/cache'));
+    if (!cache.existsSync()) return const [];
+    final files = <Map<String, Object?>>[];
+    final entries = cache.list(recursive: true, followLinks: false);
+    final boundedEntries = readTimeout == null
+        ? entries
+        : entries.timeout(readTimeout);
+    await for (final entity in boundedEntries) {
+      if (FileSystemEntity.typeSync(entity.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        continue;
+      }
+      final relative = p.relative(entity.path, from: release.path);
+      if (!_optionalGroupOwnsPath(group, relative)) continue;
+      final file = File(entity.path);
+      final digest = await _hashFile(file, readTimeout);
+      onHashedFile?.call(relative);
+      files.add({
+        'path': relative,
+        'sha256': digest,
+        'mode': file.statSync().mode & 0x1ff,
+      });
+    }
+    files.sort(
+      (left, right) =>
+          (left['path']! as String).compareTo(right['path']! as String),
+    );
+    return files;
+  }
+
+  bool _optionalGroupOwnsPath(
     _OptionalArtifactGroup group,
-    List<Map<String, Object?>>? previous,
-    List<Map<String, Object?>> expected,
-  ) async {
-    final replacements = <String>[];
-    final backups = <String>[];
-    final published = <String>[];
-    final expectedPaths = expected
-        .map((item) => item['path']! as String)
-        .toSet();
-    final oldPaths =
-        previous?.map((item) => item['path']! as String).toSet() ?? {};
-    final paths = {...expectedPaths, ...oldPaths}.toList()..sort();
+    String relativePath,
+  ) => group.pathPrefixes.any(relativePath.startsWith);
+
+  bool _sameOptionalGroupInventory(Object? left, Object? right) {
+    if (left is! Map<String, Object?> || right is! Map<String, Object?>) {
+      return false;
+    }
+    return jsonEncode(left['files']) == jsonEncode(right['files']) &&
+        jsonEncode(left['stamps']) == jsonEncode(right['stamps']);
+  }
+
+  Future<_StagedOptionalArtifactGroup> _stageOptionalArtifactGroup(
+    Directory release,
+    Directory root,
+    _OptionalArtifactGroup group, {
+    required String releaseKey,
+    required String releaseVersion,
+    required String frameworkRevision,
+    required String engineRevision,
+  }) async {
+    final stagingRoot = Directory(
+      p.join(
+        root.path,
+        'staging',
+        'repair-optional-$releaseKey-${group.id}-${_randomId()}',
+      ),
+    );
+    final checkout = Directory(p.join(stagingRoot.path, 'checkout'));
+    var worktreeCreated = false;
     try {
-      for (final relative in paths) {
-        final staged = File(p.join(stageRoot.path, 'replacements', relative));
-        if (expectedPaths.contains(relative)) {
-          await staged.parent.create(recursive: true);
-          await File(p.join(checkout.path, relative)).copy(staged.path);
-          final record = expected.firstWhere(
-            (item) => item['path'] == relative,
-          );
-          final digest = await sha256.bind(staged.openRead()).first;
-          if (digest.toString() != record['sha256']) {
-            throw InstallException(
-              'could not validate staged ${group.name} artifact $relative.',
-            );
-          }
-          final chmod = await Process.run('chmod', [
-            (record['mode']! as int).toRadixString(8),
-            staged.path,
-          ]);
-          if (chmod.exitCode != 0) {
-            throw InstallException(
-              'could not preserve permissions for $relative.',
-            );
-          }
-        }
-        replacements.add(relative);
+      await stagingRoot.create(recursive: true);
+      await _requireGit();
+      final gitLock = await _acquireOperationLock(
+        Directory(p.join(root.path, 'locks', 'flutter-git')),
+        cancellation: _waitCancellation,
+        onWait: () => _progress('Waiting for the shared Flutter Git lock'),
+      );
+      try {
+        await _ensureSharedRepository(root);
+        await _fetchFrameworkCommit(root, frameworkRevision, releaseVersion);
+        await _runGit(root, [
+          '--git-dir',
+          p.join(root.path, 'flutter.git'),
+          'worktree',
+          'add',
+          '--detach',
+          checkout.path,
+          frameworkRevision,
+        ], userMessage: 'could not create an optional repair worktree');
+        worktreeCreated = true;
+      } finally {
+        await _releaseLock(gitLock);
       }
-      for (final relative in replacements) {
-        final destination = p.join(release.path, relative);
-        final backup = p.join(stageRoot.path, 'backups', relative);
-        await Directory(p.dirname(destination)).create(recursive: true);
-        if (FileSystemEntity.typeSync(destination, followLinks: false) !=
-            FileSystemEntityType.notFound) {
-          await Directory(p.dirname(backup)).create(recursive: true);
-          await File(destination).rename(backup);
-          backups.add(relative);
-        }
-        if (expectedPaths.contains(relative)) {
-          await File(p.join(stageRoot.path, 'replacements', relative))
-              .rename(destination);
-          published.add(relative);
-        }
-      }
-      if (!await _optionalArtifactInventoryMatches(release, expected)) {
-        throw InstallException(
-          'optional ${group.name} artifact validation failed after repair.',
+
+      final actualFramework = await _gitText(checkout.path, [
+        'rev-parse',
+        'HEAD',
+      ], userMessage: 'could not verify the optional repair checkout');
+      if (actualFramework.toLowerCase() != frameworkRevision.toLowerCase()) {
+        throw const InstallException(
+          'optional repair checkout does not match the installed release.',
         );
       }
+      final actualEngine = (await File(
+        p.join(checkout.path, 'bin/internal/engine.version'),
+      ).readAsString()).trim();
+      if (actualEngine.toLowerCase() != engineRevision.toLowerCase()) {
+        throw const InstallException(
+          'optional repair checkout has a different engine revision.',
+        );
+      }
+
+      final liveCache = Directory(p.join(release.path, 'bin/cache'));
+      final stagedCache = Directory(p.join(checkout.path, 'bin/cache'));
+      if (stagedCache.existsSync()) {
+        await stagedCache.delete(recursive: true);
+      }
+      await _copyTree(liveCache, stagedCache);
+      await _clearOptionalGroupPaths(checkout, group);
+      for (final stamp in group.stampFiles) {
+        final file = File(p.join(stagedCache.path, stamp));
+        if (file.existsSync()) await file.delete();
+      }
+
+      _progress('Validating optional ${group.id} artifacts');
+      await _runFlutter(
+        checkout,
+        group.arguments,
+        userMessage:
+            'Flutter failed to validate optional ${group.id} artifacts',
+      );
+
+      final files = await _optionalGroupFiles(checkout, group);
+      if (files.isEmpty) {
+        throw InstallException(
+          'Flutter did not provide a trusted ${group.id} artifact inventory.',
+        );
+      }
+      final stamps = <String, Object?>{};
+      for (final stamp in group.stampFiles) {
+        final file = File(p.join(checkout.path, 'bin/cache', stamp));
+        if (file.existsSync()) stamps[stamp] = await file.readAsString();
+      }
+      if (stamps.isEmpty) {
+        throw InstallException(
+          'Flutter did not provide a trusted ${group.id} artifact stamp.',
+        );
+      }
+      return _StagedOptionalArtifactGroup(
+        stagingRoot: stagingRoot,
+        checkout: checkout,
+        record: {
+          'version': releaseVersion,
+          'frameworkRevision': frameworkRevision,
+          'engineRevision': engineRevision,
+          'files': files,
+          'stamps': stamps,
+        },
+      );
+    } catch (error) {
+      if (worktreeCreated) await _discardWorktree(root, checkout.path);
+      if (stagingRoot.existsSync()) {
+        await stagingRoot.delete(recursive: true);
+      }
+      if (error is InstallException || error is InstallCancelledException) {
+        rethrow;
+      }
+      throw InstallException(
+        'Flutter $releaseVersion optional ${group.id} repair failed: $error',
+      );
+    }
+  }
+
+  Future<void> _clearOptionalGroupPaths(
+    Directory checkout,
+    _OptionalArtifactGroup group,
+  ) async {
+    for (final prefix in group.pathPrefixes) {
+      final absolutePrefix = p.join(checkout.path, prefix);
+      final relativePrefix = p.relative(absolutePrefix, from: checkout.path);
+      final prefixName = p.basename(relativePrefix);
+      if (prefixName.endsWith('-')) {
+        final parent = Directory(p.dirname(absolutePrefix));
+        if (!parent.existsSync()) continue;
+        await for (final entity in parent.list(followLinks: false)) {
+          if (p.basename(entity.path).startsWith(prefixName) &&
+              FileSystemEntity.typeSync(entity.path, followLinks: false) ==
+                  FileSystemEntityType.directory) {
+            await Directory(entity.path).delete(recursive: true);
+          }
+        }
+      } else {
+        final type = FileSystemEntity.typeSync(
+          absolutePrefix,
+          followLinks: false,
+        );
+        if (type == FileSystemEntityType.directory) {
+          await Directory(absolutePrefix).delete(recursive: true);
+        } else if (type == FileSystemEntityType.file) {
+          await File(absolutePrefix).delete();
+        }
+      }
+    }
+  }
+
+  Future<void> _publishOptionalArtifactGroup(
+    Directory release,
+    _OptionalArtifactGroup group,
+    _StagedOptionalArtifactGroup staged,
+    Map<String, Object?> updatedManifest,
+  ) async {
+    final replacementRoot = Directory(
+      p.join(staged.stagingRoot.path, 'replacement'),
+    );
+    final backupRoot = Directory(p.join(staged.stagingRoot.path, 'backup'));
+    final expectedFiles = staged.record['files']! as List<Object?>;
+    final expectedPaths = <String>{};
+    final replacedPaths = <String>[];
+    final backedUpPaths = <String>[];
+    final changedPaths = (await _optionalGroupFiles(
+      release,
+      group,
+    )).map((entry) => entry['path']! as String).toSet();
+    try {
+      for (final item in expectedFiles) {
+        final record = item! as Map<String, Object?>;
+        final relative = record['path']! as String;
+        expectedPaths.add(relative);
+        final source = File(p.join(staged.checkout.path, relative));
+        final replacement = File(p.join(replacementRoot.path, relative));
+        await replacement.parent.create(recursive: true);
+        await source.copy(replacement.path);
+        final chmod = await Process.run('chmod', [
+          (record['mode']! as int).toRadixString(8),
+          replacement.path,
+        ]);
+        if (chmod.exitCode != 0) {
+          throw InstallException(
+            'could not preserve permissions for optional artifact $relative.',
+          );
+        }
+        final digest = await sha256.bind(replacement.openRead()).first;
+        if (digest.toString() != record['sha256']) {
+          throw InstallException(
+            'could not validate staged optional artifact $relative.',
+          );
+        }
+      }
+
+      final stampRecords = staged.record['stamps']! as Map<String, Object?>;
+      for (final entry in stampRecords.entries) {
+        final replacement = File(
+          p.join(replacementRoot.path, 'bin/cache', entry.key),
+        );
+        await replacement.parent.create(recursive: true);
+        await replacement.writeAsString(entry.value! as String, flush: true);
+      }
+
+      for (final relative in changedPaths) {
+        final destination = p.join(release.path, relative);
+        final backup = p.join(backupRoot.path, relative);
+        final type = FileSystemEntity.typeSync(destination, followLinks: false);
+        if (type != FileSystemEntityType.notFound) {
+          await Directory(p.dirname(backup)).create(recursive: true);
+          await _renameEntity(destination, backup, type);
+          backedUpPaths.add(relative);
+        }
+        if (!expectedPaths.contains(relative)) continue;
+        final stagedFile = File(p.join(replacementRoot.path, relative));
+        await Directory(p.dirname(destination)).create(recursive: true);
+        await stagedFile.rename(destination);
+        replacedPaths.add(relative);
+      }
+      for (final relative in expectedPaths.difference(changedPaths)) {
+        final destination = p.join(release.path, relative);
+        final stagedFile = File(p.join(replacementRoot.path, relative));
+        await Directory(p.dirname(destination)).create(recursive: true);
+        await stagedFile.rename(destination);
+        replacedPaths.add(relative);
+      }
+
+      for (final entry in stampRecords.entries) {
+        final destination = p.join(release.path, 'bin/cache', entry.key);
+        final backup = p.join(backupRoot.path, 'bin/cache', entry.key);
+        final type = FileSystemEntity.typeSync(destination, followLinks: false);
+        if (type != FileSystemEntityType.notFound) {
+          await Directory(p.dirname(backup)).create(recursive: true);
+          await _renameEntity(destination, backup, type);
+          backedUpPaths.add(p.relative(destination, from: release.path));
+        }
+        final stagedStamp = File(
+          p.join(replacementRoot.path, 'bin/cache', entry.key),
+        );
+        await Directory(p.dirname(destination)).create(recursive: true);
+        await stagedStamp.rename(destination);
+        replacedPaths.add(p.relative(destination, from: release.path));
+      }
+      await _publishManifest(release.path, updatedManifest);
     } catch (_) {
-      for (final relative in published.reversed) {
+      for (final relative in replacedPaths.reversed) {
         await _deletePathIfPresent(p.join(release.path, relative));
       }
-      for (final relative in backups.reversed) {
-        final backup = p.join(stageRoot.path, 'backups', relative);
-        if (File(backup).existsSync()) {
-          await File(backup).rename(p.join(release.path, relative));
+      for (final relative in backedUpPaths.reversed) {
+        final backup = p.join(backupRoot.path, relative);
+        if (FileSystemEntity.typeSync(backup, followLinks: false) !=
+            FileSystemEntityType.notFound) {
+          await _renameEntity(
+            backup,
+            p.join(release.path, relative),
+            FileSystemEntity.typeSync(backup, followLinks: false),
+          );
         }
       }
       rethrow;
+    }
+  }
+
+  Future<void> _setOptionalRepairMarker(
+    Directory release, {
+    required bool needsRepair,
+  }) async {
+    final marker = File(p.join(release.path, '.wren-release.json'));
+    final decoded = jsonDecode(await marker.readAsString());
+    if (decoded is! Map<String, Object?>) {
+      throw const InstallException('installed release metadata is invalid.');
+    }
+    final updated = Map<String, Object?>.from(decoded);
+    if (needsRepair) {
+      updated['optionalArtifactsNeedRepair'] = true;
+      updated['readiness'] = 'needs-repair';
+      updated['readinessReason'] = 'optional artifact contents need repair';
+    } else {
+      updated.remove('optionalArtifactsNeedRepair');
+      if (updated['readinessReason'] ==
+          'optional artifact contents need repair') {
+        updated
+          ..remove('readiness')
+          ..remove('readinessReason');
+      }
+    }
+    if (jsonEncode(updated) != jsonEncode(decoded)) {
+      await _publishManifest(release.path, updated);
     }
   }
 
@@ -2777,9 +4716,15 @@ class FlutterInstaller {
   Future<List<String>> _changedPrivateArtifactFiles(
     Directory release,
     Directory source,
-    Map<String, Object?> releaseManifest,
-  ) async {
-    final expected = await _readSourceInventory(source, releaseManifest);
+    Map<String, Object?> releaseManifest, {
+    Duration? readTimeout,
+    void Function(String path)? onHashedFile,
+  }) async {
+    final expected = await _readSourceInventory(
+      source,
+      releaseManifest,
+      readTimeout: readTimeout,
+    );
     final checkoutModes = _readReleaseCheckoutModes(releaseManifest);
     final changed = <String>[];
     for (final entry in expected.entries) {
@@ -2792,12 +4737,13 @@ class FlutterInstaller {
         continue;
       }
       final releaseFile = File(releasePath);
-      final digest = await sha256.bind(releaseFile.openRead()).first;
+      final digest = await _hashFile(releaseFile, readTimeout);
+      onHashedFile?.call(path);
       final actualMode = releaseFile.statSync().mode & 0x1ff;
       final expectedMode = sourceFile.existsSync()
           ? sourceFile.statSync().mode & 0x1ff
           : checkoutModes[path];
-      if (digest.toString() != entry.value ||
+      if (digest != entry.value ||
           (expectedMode != null && actualMode != expectedMode)) {
         changed.add(path);
       }
@@ -2807,10 +4753,16 @@ class FlutterInstaller {
 
   Future<Map<String, String>> _readSourceInventory(
     Directory source,
-    Map<String, Object?> releaseManifest,
-  ) async {
+    Map<String, Object?> releaseManifest, {
+    Duration? readTimeout,
+  }) async {
     final marker = File(p.join(source.path, '.wren-source.json'));
-    final data = jsonDecode(await marker.readAsString());
+    final contents = marker.readAsString();
+    final data = jsonDecode(
+      readTimeout == null
+          ? await contents
+          : await contents.timeout(readTimeout),
+    );
     if (data is! Map<String, Object?> || data['inventory'] is! List<Object?>) {
       throw const InstallException(
         'the retained host artifact source has no trusted file inventory.',
@@ -3054,9 +5006,22 @@ class FlutterInstaller {
     String directory,
     Map<String, Object?> manifest, {
     String filename = '.wren-release.json',
+    DoctorCancellation? cancellation,
   }) async {
     final target = File(p.join(directory, filename));
     final temporary = File('${target.path}.tmp-${_randomId()}');
+    if (cancellation != null) {
+      cancellation.throwIfCancelled();
+      try {
+        temporary.writeAsStringSync(jsonEncode(manifest), flush: true);
+        cancellation.throwIfCancelled();
+        temporary.renameSync(target.path);
+      } on Object {
+        if (temporary.existsSync()) temporary.deleteSync();
+        rethrow;
+      }
+      return;
+    }
     await temporary.writeAsString(jsonEncode(manifest), flush: true);
     await temporary.rename(target.path);
   }
@@ -3101,11 +5066,47 @@ class FlutterInstaller {
     String workingDirectory,
     List<String> arguments, {
     required String userMessage,
+    DoctorCancellation? cancellation,
   }) async {
-    final result = await Process.run(
-      'git',
-      arguments,
-      workingDirectory: workingDirectory,
+    if (cancellation == null) {
+      final result = await Process.run(
+        'git',
+        arguments,
+        workingDirectory: workingDirectory,
+      );
+      if (result.exitCode != 0) {
+        throw InstallException('$userMessage: ${_processDetails(result)}');
+      }
+      return '${result.stdout}'.trim();
+    }
+
+    late final Process process;
+    try {
+      process = await Process.start(
+        'git',
+        arguments,
+        workingDirectory: workingDirectory,
+      );
+    } on ProcessException {
+      rethrow;
+    }
+    final stdout = utf8.decoder.bind(process.stdout).join();
+    final stderr = utf8.decoder.bind(process.stderr).join();
+    final exitCode = process.exitCode;
+    late final List<Object> results;
+    try {
+      results = await cancellation.race(
+        Future.wait<Object>([stdout, stderr, exitCode]),
+      );
+    } on InstallCancelledException {
+      await _terminateDoctorProcess(process);
+      rethrow;
+    }
+    final result = ProcessResult(
+      process.pid,
+      results[2] as int,
+      results[0] as String,
+      results[1] as String,
     );
     if (result.exitCode != 0) {
       throw InstallException('$userMessage: ${_processDetails(result)}');
@@ -3177,6 +5178,51 @@ class FlutterInstaller {
   }
 }
 
+class _DoctorReleaseManifestRead {
+  const new({required this.data, required this.check});
+
+  final Map<String, Object?>? data;
+  final DoctorIntegrityCheck check;
+}
+
+class _DoctorReleaseIdentity {
+  const new({required this.data, required this.sourceKey});
+
+  final Map<String, Object?> data;
+  final String? sourceKey;
+}
+
+class _DoctorConfirmedDamage implements Exception {
+  const new(this.message);
+
+  final String message;
+}
+
+class _DoctorEvidenceUnavailable implements Exception {
+  const new(this.message);
+
+  final String message;
+}
+
+class _OptionalArtifactRepairOutcome {
+  const new({this.repaired = false, this.validated = false});
+
+  final bool repaired;
+  final bool validated;
+}
+
+class _StagedOptionalArtifactGroup {
+  const new({
+    required this.stagingRoot,
+    required this.checkout,
+    required this.record,
+  });
+
+  final Directory stagingRoot;
+  final Directory checkout;
+  final Map<String, Object?> record;
+}
+
 enum _ExistingInstall { incomplete, healthy, damaged }
 
 List<String> _hostExecutables(HostPlatform host) =>
@@ -3205,12 +5251,18 @@ String? _missingRequiredArtifact(String rootPath, HostPlatform host) {
 
 Future<List<Map<String, String>>> _sourceInventory(
   Directory source,
-  HostPlatform host,
-) async {
-  final entries = <Map<String, String>>[];
+  HostPlatform host, {
+  Duration? readTimeout,
+  void Function(String path)? onHashedFile,
+}) async {
+  final inventory = <Map<String, String>>[];
   for (final relativePath in _sourceArtifactPaths(host)) {
     final root = Directory(p.join(source.path, relativePath));
-    await for (final entity in root.list(recursive: true, followLinks: false)) {
+    final stream = root.list(recursive: true, followLinks: false);
+    final boundedEntries = readTimeout == null
+        ? stream
+        : stream.timeout(readTimeout);
+    await for (final entity in boundedEntries) {
       if (FileSystemEntity.typeSync(entity.path, followLinks: false) !=
           FileSystemEntityType.file) {
         if (FileSystemEntity.typeSync(entity.path, followLinks: false) ==
@@ -3221,15 +5273,23 @@ Future<List<Map<String, String>>> _sourceInventory(
         }
         continue;
       }
-      final digest = await sha256.bind(File(entity.path).openRead()).first;
-      entries.add({
-        'path': p.relative(entity.path, from: source.path),
-        'sha256': digest.toString(),
-      });
+      final digest = await _hashFile(File(entity.path), readTimeout);
+      final path = p.relative(entity.path, from: source.path);
+      onHashedFile?.call(path);
+      inventory.add({'path': path, 'sha256': digest});
     }
   }
-  entries.sort((left, right) => left['path']!.compareTo(right['path']!));
-  return entries;
+  inventory.sort((left, right) => left['path']!.compareTo(right['path']!));
+  return inventory;
+}
+
+Future<String> _hashFile(File file, Duration? readTimeout) async {
+  final stream = file.openRead();
+  final boundedStream = readTimeout == null
+      ? stream
+      : stream.timeout(readTimeout);
+  final digest = await sha256.bind(boundedStream).first;
+  return digest.toString();
 }
 
 Directory _defaultDataDirectory() {
@@ -3467,6 +5527,18 @@ bool _sameVersion(String left, String right) {
 
 String _sourceKey(String engineRevision, HostPlatform host) =>
     '$engineRevision-${host.catalogOs}-${host.catalogArchitecture}';
+
+String? _stageOperationLockName(String stageName) {
+  if (stageName == 'flutter-repo') return 'flutter-git';
+  if (stageName.startsWith('install-') &&
+      stageName.length > 'install-'.length) {
+    return 'install-${stageName.substring('install-'.length)}';
+  }
+  final repairMatch = RegExp(r'^repair-(?:private-)?(.+)-[a-fA-F0-9]{32}$')
+      .firstMatch(stageName);
+  if (repairMatch == null) return null;
+  return 'install-${repairMatch.group(1)}';
+}
 
 String _randomId() {
   final random = Random.secure();

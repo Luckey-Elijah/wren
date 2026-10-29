@@ -631,6 +631,40 @@ printf '\376\000\n' >&2
       ) as Map<String, Object?>;
       expect(releaseMarker['readiness'], 'needs-repair');
 
+      var sdkLaunched = false;
+      final doctorOutput = StringBuffer();
+      final doctorStatus = await runWren(
+        ['doctor'],
+        host: HostPlatform.linuxX64,
+        installEnvironment: environment,
+        stdoutSink: doctorOutput,
+        stderrSink: StringBuffer(),
+        sdkLauncher:
+            ({
+              required release,
+              required executable,
+              required arguments,
+            }) async {
+              sdkLaunched = true;
+              return 0;
+            },
+      );
+      expect(doctorStatus, 1);
+      expect(doctorOutput.toString(), contains('needs repair'));
+      expect(doctorOutput.toString(), contains('wren repair $_version'));
+      expect(sdkLaunched, isFalse);
+      expect(
+        File(p.join(installed.path, 'bin/cache/linux-sdk.stamp')).existsSync(),
+        isFalse,
+      );
+      expect(
+        (jsonDecode(
+          await File(p.join(installed.path, '.wren-release.json'))
+              .readAsString(),
+        ) as Map<String, Object?>)['readiness'],
+        'needs-repair',
+      );
+
       await File(p.join(installed.path, 'bin/cache/linux-sdk.stamp'))
           .writeAsString('$_engineRevision\n');
       final actualSourceDart = File(
@@ -661,6 +695,857 @@ printf '\376\000\n' >&2
         contains('shared artifact source executable is not runnable'),
       );
     });
+
+    test(
+      'full doctor keeps untrusted optional evidence incomplete with damage',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+
+        final installed = Directory(
+          p.join(dataDirectory.path, 'releases', 'stable-$_version-linux-x64'),
+        );
+        final releaseManifest = File(
+          p.join(installed.path, '.wren-release.json'),
+        );
+        final initialOutput = StringBuffer();
+        expect(
+          await runWren(
+            ['doctor', '--full'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: initialOutput,
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        expect(initialOutput.toString(), contains('fully verified'));
+
+        final fullJsonOutput = StringBuffer();
+        final fullJsonError = StringBuffer();
+        expect(
+          await runWren(
+            ['doctor', '--full', '--json'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: fullJsonOutput,
+            stderrSink: fullJsonError,
+          ),
+          0,
+        );
+        expect(fullJsonOutput.toString().trim().split('\n'), hasLength(1));
+        final fullJsonReport =
+            jsonDecode(fullJsonOutput.toString()) as Map<String, Object?>;
+        expect(fullJsonReport['schema_version'], 1);
+        expect(fullJsonReport['depth'], 'full');
+        expect(fullJsonReport['completion'], 'complete');
+        expect(fullJsonReport['exit_status'], 0);
+        final fullJsonRelease =
+            (fullJsonReport['releases']! as List<Object?>).single!
+                as Map<String, Object?>;
+        expect(fullJsonRelease['integrity'], 'fully_verified');
+        expect(fullJsonRelease['integrity_checks'], isNotEmpty);
+        expect(fullJsonError.toString(), contains('Checking doctor integrity'));
+
+        final trustedManifestBytes = await releaseManifest.readAsBytes();
+        try {
+          final unsupportedManifest = jsonDecode(
+            utf8.decode(trustedManifestBytes),
+          ) as Map<String, Object?>;
+          unsupportedManifest['host'] = 'freebsd';
+          unsupportedManifest['architecture'] = 'x64';
+          await releaseManifest.writeAsString(jsonEncode(unsupportedManifest));
+          final unsupportedOutput = StringBuffer();
+          expect(
+            await runWren(
+              ['doctor', '--full'],
+              host: HostPlatform.linuxX64,
+              installEnvironment: environment,
+              stdoutSink: unsupportedOutput,
+              stderrSink: StringBuffer(),
+            ),
+            4,
+          );
+          expect(
+            unsupportedOutput.toString(),
+            contains('release-identity: incomplete'),
+          );
+          expect(
+            unsupportedOutput.toString(),
+            isNot(contains('confirmed damage')),
+          );
+          expect(unsupportedOutput.toString(), isNot(contains('needs repair')));
+          expect(
+            File(p.join(installed.path, '.wren-doctor-needs-repair.json'))
+                .existsSync(),
+            isFalse,
+          );
+        } finally {
+          await releaseManifest.writeAsBytes(trustedManifestBytes, flush: true);
+        }
+
+        final timeoutOutput = StringBuffer();
+        late final int timeoutStatus;
+        await _withGitConfigFifo(installed, () async {
+          timeoutStatus = await runWren(
+            ['doctor', '--full'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: timeoutOutput,
+            stderrSink: StringBuffer(),
+            fullDoctorCheckTimeout: const Duration(milliseconds: 150),
+          );
+        });
+        expect(timeoutStatus, 4);
+        expect(
+          timeoutOutput.toString(),
+          contains('release-identity: incomplete'),
+        );
+        expect(timeoutOutput.toString(), contains('timed out'));
+        final timeoutManifest = jsonDecode(
+          await releaseManifest.readAsString(),
+        ) as Map<String, Object?>;
+        expect(timeoutManifest['privateFilesNeedRepair'], isNot(true));
+        expect(timeoutManifest['optionalArtifactsNeedRepair'], isNot(true));
+        expect(
+          File(p.join(installed.path, '.wren-doctor-needs-repair.json'))
+              .existsSync(),
+          isFalse,
+        );
+
+        final optionalStamp = File(
+          p.join(installed.path, 'bin/cache/android-sdk.stamp'),
+        );
+        await optionalStamp.writeAsString('$_engineRevision\n');
+        final incompleteOutput = StringBuffer();
+        expect(
+          await runWren(
+            ['doctor', '--full'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: incompleteOutput,
+            stderrSink: StringBuffer(),
+          ),
+          4,
+        );
+        expect(
+          incompleteOutput.toString(),
+          contains('optional-artifacts-android-engine: incomplete'),
+        );
+        final incompleteManifest = jsonDecode(
+          await releaseManifest.readAsString(),
+        ) as Map<String, Object?>;
+        expect(incompleteManifest['optionalArtifactsNeedRepair'], isNot(true));
+        expect(incompleteManifest['privateFilesNeedRepair'], isNot(true));
+        expect(
+          File(p.join(installed.path, '.wren-doctor-needs-repair.json'))
+              .existsSync(),
+          isFalse,
+        );
+
+        final optionalRepairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: optionalRepairError,
+          ),
+          0,
+          reason: optionalRepairError.toString(),
+        );
+        final precacheCounter = File(
+          p.join(dataDirectory.path, 'android-precache-ran'),
+        );
+        expect(await precacheCounter.readAsString(), 'x');
+        final trustedSourceBin = Directory(
+          p.join(dataDirectory.path, 'sources/$_engineRevision-linux-x64/bin'),
+        );
+        final trustedSourceSnapshot = await _snapshotTree(trustedSourceBin);
+        final trustedReleaseSnapshot = await _snapshotTree(
+          Directory(p.join(installed.path, 'bin')),
+        );
+        var sdkLaunchCount = 0;
+        final trustedOutput = StringBuffer();
+        expect(
+          await runWren(
+            ['doctor', '--full', '--verbose'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: trustedOutput,
+            stderrSink: StringBuffer(),
+            sdkLauncher:
+                ({
+                  required release,
+                  required executable,
+                  required arguments,
+                }) async {
+                  sdkLaunchCount++;
+                  return 0;
+                },
+          ),
+          0,
+        );
+        expect(sdkLaunchCount, 0);
+        expect(
+          trustedOutput.toString(),
+          contains('optional-artifacts-android-engine: passed'),
+        );
+        expect(await precacheCounter.readAsString(), 'x');
+        expect(await _snapshotTree(trustedSourceBin), trustedSourceSnapshot);
+        expect(
+          await _snapshotTree(Directory(p.join(installed.path, 'bin'))),
+          trustedReleaseSnapshot,
+        );
+
+        final quickOutput = StringBuffer();
+        expect(
+          await runWren(
+            ['list'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: quickOutput,
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        expect(
+          quickOutput.toString(),
+          contains('$_version  stable  linux  ready'),
+        );
+
+        final sourceKey = incompleteManifest['sourceKey']! as String;
+        final sourceBin = Directory(
+          p.join(dataDirectory.path, 'sources', sourceKey, 'bin'),
+        );
+        final sourceDart = File(
+          p.join(sourceBin.path, 'cache/dart-sdk/bin/dart'),
+        );
+        final privateDart = File(
+          p.join(installed.path, 'bin/cache/dart-sdk/bin/dart'),
+        );
+        await privateDart.writeAsString('doctor regression payload');
+        final sourceBeforeDoctor = await _snapshotTree(sourceBin);
+        final releaseBeforeDoctor = await _snapshotTree(
+          Directory(p.join(installed.path, 'bin')),
+        );
+
+        final commonGitDirectory = await Process.run('git', [
+          'rev-parse',
+          '--git-common-dir',
+        ], workingDirectory: installed.path);
+        expect(commonGitDirectory.exitCode, 0);
+        final gitConfig = File(
+          p.join(
+            p.absolute(installed.path, '${commonGitDirectory.stdout}'.trim()),
+            'config',
+          ),
+        );
+        final savedGitConfig = await gitConfig.readAsBytes();
+        await gitConfig.delete();
+        final fifoResult = await Process.run('mkfifo', [gitConfig.path]);
+        expect(fifoResult.exitCode, 0, reason: '${fifoResult.stderr}');
+
+        final mixedOutput = StringBuffer();
+        late final int mixedStatus;
+        try {
+          mixedStatus = await runWren(
+            ['doctor', '--full'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: mixedOutput,
+            stderrSink: StringBuffer(),
+            fullDoctorCheckTimeout: const Duration(milliseconds: 150),
+            sdkLauncher:
+                ({
+                  required release,
+                  required executable,
+                  required arguments,
+                }) async {
+                  sdkLaunchCount++;
+                  return 0;
+                },
+          ).timeout(const Duration(seconds: 5));
+        } finally {
+          await gitConfig.delete();
+          await gitConfig.writeAsBytes(savedGitConfig, flush: true);
+        }
+        expect(mixedStatus, 4);
+        expect(sdkLaunchCount, 0);
+        expect(mixedOutput.toString(), contains('needs repair'));
+        expect(
+          mixedOutput.toString(),
+          contains('release-identity: incomplete'),
+        );
+        expect(mixedOutput.toString(), contains('timed out'));
+        expect(
+          mixedOutput.toString(),
+          contains('release-private-files: confirmed damage'),
+        );
+
+        final mixedJsonOutput = StringBuffer();
+        final mixedJsonError = StringBuffer();
+        late final int mixedJsonStatus;
+        await gitConfig.delete();
+        final mixedJsonFifo = await Process.run('mkfifo', [gitConfig.path]);
+        expect(mixedJsonFifo.exitCode, 0, reason: '${mixedJsonFifo.stderr}');
+        try {
+          mixedJsonStatus = await runWren(
+            ['doctor', '--full', '--json', '--verbose'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: mixedJsonOutput,
+            stderrSink: mixedJsonError,
+            fullDoctorCheckTimeout: const Duration(milliseconds: 150),
+          ).timeout(const Duration(seconds: 5));
+        } finally {
+          await gitConfig.delete();
+          await gitConfig.writeAsBytes(savedGitConfig, flush: true);
+        }
+        expect(mixedJsonStatus, 4);
+        expect(mixedJsonOutput.toString().trim().split('\n'), hasLength(1));
+        expect(mixedJsonError.toString(), isNotEmpty);
+        final mixedJsonReport =
+            jsonDecode(mixedJsonOutput.toString()) as Map<String, Object?>;
+        expect(mixedJsonReport['depth'], 'full');
+        expect(mixedJsonReport['completion'], 'incomplete');
+        expect(mixedJsonReport['exit_status'], 4);
+        expect(mixedJsonReport['has_critical_findings'], isTrue);
+        final mixedJsonRelease =
+            (mixedJsonReport['releases']! as List<Object?>).single!
+                as Map<String, Object?>;
+        expect(mixedJsonRelease['integrity'], 'needs_repair');
+        final mixedChecks =
+            (mixedJsonRelease['integrity_checks']! as List<Object?>)
+                .cast<Map<String, Object?>>();
+        expect(
+          mixedChecks.any((check) => check['status'] == 'confirmed_damage'),
+          isTrue,
+        );
+        expect(
+          mixedChecks.any((check) => check['status'] == 'incomplete'),
+          isTrue,
+        );
+        final damagedManifest = jsonDecode(
+          await releaseManifest.readAsString(),
+        ) as Map<String, Object?>;
+        expect(damagedManifest['privateFilesNeedRepair'], isTrue);
+        expect(damagedManifest['optionalArtifactsNeedRepair'], isNot(true));
+        expect(await privateDart.readAsString(), 'doctor regression payload');
+        expect(optionalStamp.existsSync(), isTrue);
+        expect(await _snapshotTree(sourceBin), sourceBeforeDoctor);
+        expect(
+          await _snapshotTree(Directory(p.join(installed.path, 'bin'))),
+          releaseBeforeDoctor,
+        );
+
+        final completedDamageOutput = StringBuffer();
+        final completedDamageStatus = await runWren(
+          ['doctor', '--full', '--json'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: completedDamageOutput,
+          stderrSink: StringBuffer(),
+        );
+        expect(completedDamageStatus, 1);
+        final completedDamageReport = jsonDecode(
+          completedDamageOutput.toString(),
+        ) as Map<String, Object?>;
+        expect(completedDamageReport['completion'], 'complete');
+        expect(completedDamageReport['exit_status'], 1);
+        expect(completedDamageReport['has_critical_findings'], isTrue);
+        final completedDamageRelease =
+            (completedDamageReport['releases']! as List<Object?>).single!
+                as Map<String, Object?>;
+        expect(completedDamageRelease['integrity'], 'needs_repair');
+
+        final launchError = StringBuffer();
+        expect(
+          await runWren(
+            ['--release', _version, 'flutter', '--version'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: launchError,
+          ),
+          3,
+          reason: launchError.toString(),
+        );
+        expect(sdkLaunchCount, 0);
+        expect(await _snapshotTree(sourceBin), sourceBeforeDoctor);
+        expect(
+          await _snapshotTree(Directory(p.join(installed.path, 'bin'))),
+          releaseBeforeDoctor,
+        );
+        expect(sourceDart.existsSync(), isTrue);
+        expect(
+          await sourceDart.readAsString(),
+          isNot('doctor regression payload'),
+        );
+      },
+    );
+
+    test(
+      'full doctor cancellation leaves unfinished releases unmarked',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+
+        final installed = Directory(
+          p.join(dataDirectory.path, 'releases', 'stable-$_version-linux-x64'),
+        );
+        final privateDart = File(
+          p.join(installed.path, 'bin/cache/dart-sdk/bin/dart'),
+        );
+        await privateDart.writeAsString('unverified damage');
+        final cancellation = StreamController<void>(sync: true);
+        final stderr = _CancelOnDoctorIdentitySink(() {
+          cancellation.add(null);
+        });
+        final stdout = StringBuffer();
+        final cancellableEnvironment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+          waitCancellation: cancellation.stream,
+        );
+        late final int status;
+        try {
+          status = await _withGitConfigFifo(
+            installed,
+            () => runWren(
+              ['doctor', '--full', '--json'],
+              host: HostPlatform.linuxX64,
+              installEnvironment: cancellableEnvironment,
+              stdoutSink: stdout,
+              stderrSink: stderr,
+              fullDoctorCheckTimeout: const Duration(seconds: 5),
+            ).timeout(const Duration(seconds: 5)),
+          );
+        } finally {
+          await cancellation.close();
+        }
+
+        expect(status, 6);
+        expect(stdout.toString(), isEmpty);
+        expect(
+          stderr.toString(),
+          contains('Checking doctor integrity: release-identity'),
+        );
+        expect(
+          File(p.join(installed.path, '.wren-doctor-needs-repair.json'))
+              .existsSync(),
+          isFalse,
+        );
+        final manifest = jsonDecode(
+          await File(p.join(installed.path, '.wren-release.json'))
+              .readAsString(),
+        ) as Map<String, Object?>;
+        expect(manifest['privateFilesNeedRepair'], isNot(true));
+        expect(await privateDart.readAsString(), 'unverified damage');
+      },
+    );
+
+    test(
+      'full doctor sidecar blocks a symlinked release record until repair',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+
+        final installed = Directory(
+          p.join(dataDirectory.path, 'releases', 'stable-$_version-linux-x64'),
+        );
+        final releaseManifest = File(
+          p.join(installed.path, '.wren-release.json'),
+        );
+        final trustedManifest = jsonDecode(
+          await releaseManifest.readAsString(),
+        ) as Map<String, Object?>;
+        final externalManifest = File(p.join(temp.path, 'release-record.json'));
+        await externalManifest.writeAsString(jsonEncode(trustedManifest));
+        await releaseManifest.delete();
+        await Link(releaseManifest.path).create(externalManifest.path);
+
+        var sdkLaunchCount = 0;
+        final doctorOutput = StringBuffer();
+        expect(
+          await runWren(
+            ['doctor', '--full'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: doctorOutput,
+            stderrSink: StringBuffer(),
+            sdkLauncher:
+                ({
+                  required release,
+                  required executable,
+                  required arguments,
+                }) async {
+                  sdkLaunchCount++;
+                  return 0;
+                },
+          ),
+          1,
+          reason: doctorOutput.toString(),
+        );
+        final safetyMarker = File(
+          p.join(installed.path, '.wren-doctor-needs-repair.json'),
+        );
+        expect(safetyMarker.existsSync(), isTrue);
+        expect(
+          FileSystemEntity.typeSync(safetyMarker.path, followLinks: false),
+          FileSystemEntityType.file,
+        );
+
+        final listOutput = StringBuffer();
+        expect(
+          await runWren(
+            ['list'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: listOutput,
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        expect(listOutput.toString(), contains('needs repair'));
+        final blockedOutput = StringBuffer();
+        expect(
+          await runWren(
+            ['--release', _version, 'flutter', '--version'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: blockedOutput,
+          ),
+          3,
+          reason: blockedOutput.toString(),
+        );
+        expect(sdkLaunchCount, 0);
+        expect(safetyMarker.existsSync(), isTrue);
+
+        await releaseManifest.delete();
+        final restoredManifest = Map<String, Object?>.from(trustedManifest)
+          ..['externalUse'] = true;
+        await releaseManifest.writeAsString(jsonEncode(restoredManifest));
+        final recordedMarkerOutput = StringBuffer();
+        expect(
+          await runWren(
+            ['doctor', '--full'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: recordedMarkerOutput,
+            stderrSink: StringBuffer(),
+          ),
+          1,
+          reason: recordedMarkerOutput.toString(),
+        );
+        expect(
+          recordedMarkerOutput.toString(),
+          contains('recorded-needs-repair: confirmed damage'),
+        );
+        expect(safetyMarker.existsSync(), isTrue);
+        final privateDart = File(
+          p.join(installed.path, 'bin/cache/dart-sdk/bin/dart'),
+        );
+        await privateDart.writeAsString('repair must restore this payload');
+
+        var cancelConfirmationCount = 0;
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            confirmation: (_) async {
+              cancelConfirmationCount++;
+              return false;
+            },
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          6,
+        );
+        expect(cancelConfirmationCount, 1);
+        expect(safetyMarker.existsSync(), isTrue);
+        expect(
+          await privateDart.readAsString(),
+          'repair must restore this payload',
+        );
+
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            confirmation: (_) async => true,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        expect(safetyMarker.existsSync(), isFalse);
+        final repairedList = StringBuffer();
+        expect(
+          await runWren(
+            ['list'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: repairedList,
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        expect(
+          repairedList.toString(),
+          contains('$_version  stable  linux  ready'),
+        );
+        final sourceDart = File(
+          p.join(
+            dataDirectory.path,
+            'sources/$_engineRevision-linux-x64/bin/cache/dart-sdk/bin/dart',
+          ),
+        );
+        expect(
+          await privateDart.readAsString(),
+          await sourceDart.readAsString(),
+        );
+      },
+    );
+
+    test(
+      'full doctor source symlink blocks all dependents until repair',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+
+        const secondVersion = '3.47.9';
+        await _writeFixtureSdk(repositoryWorktree, version: secondVersion);
+        await _git(repositoryWorktree.path, ['add', '.']);
+        await _git(repositoryWorktree.path, [
+          'commit',
+          '-m',
+          'second fixture for full doctor source marker',
+        ]);
+        await _git(repositoryWorktree.path, ['tag', '-f', secondVersion]);
+        final secondRevision = await _git(repositoryWorktree.path, [
+          'rev-parse',
+          'HEAD',
+        ]);
+        expect(
+          await runWren(
+            ['install', secondVersion],
+            catalogJson: _catalog(
+              secondRevision,
+              releaseVersion: secondVersion,
+            ),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+
+        final source = Directory(
+          p.join(dataDirectory.path, 'sources/$_engineRevision-linux-x64'),
+        );
+        final savedSource = Directory(
+          p.join(dataDirectory.path, 'detached-source-fixture'),
+        );
+        await source.rename(savedSource.path);
+        await Link(source.path).create(savedSource.path);
+        final sourceTargetBefore = await Link(source.path).target();
+        final sourceBinSnapshot = await _snapshotTree(
+          Directory(p.join(savedSource.path, 'bin')),
+        );
+        final releaseBins = <Directory>[
+          Directory(
+            p.join(
+              dataDirectory.path,
+              'releases/stable-$_version-linux-x64/bin',
+            ),
+          ),
+          Directory(
+            p.join(
+              dataDirectory.path,
+              'releases/stable-$secondVersion-linux-x64/bin',
+            ),
+          ),
+        ];
+        final releaseSnapshots = [
+          for (final bin in releaseBins) await _snapshotTree(bin),
+        ];
+
+        final doctorOutput = StringBuffer();
+        expect(
+          await runWren(
+            ['doctor', '--full'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: doctorOutput,
+            stderrSink: StringBuffer(),
+          ),
+          4,
+          reason: doctorOutput.toString(),
+        );
+        expect(await Link(source.path).target(), sourceTargetBefore);
+        expect(
+          await _snapshotTree(Directory(p.join(savedSource.path, 'bin'))),
+          sourceBinSnapshot,
+        );
+        for (var index = 0; index < releaseBins.length; index++) {
+          expect(
+            await _snapshotTree(releaseBins[index]),
+            releaseSnapshots[index],
+          );
+        }
+        for (final releaseVersion in [_version, secondVersion]) {
+          final manifest = jsonDecode(
+            await File(
+              p.join(
+                dataDirectory.path,
+                'releases/stable-$releaseVersion-linux-x64/.wren-release.json',
+              ),
+            ).readAsString(),
+          ) as Map<String, Object?>;
+          expect(manifest['sourceNeedsRepair'], isTrue);
+        }
+        final quickOutput = StringBuffer();
+        expect(
+          await runWren(
+            ['list'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: quickOutput,
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        expect(
+          quickOutput.toString(),
+          contains('$_version  stable  linux  needs repair'),
+        );
+        expect(
+          quickOutput.toString(),
+          contains('$secondVersion  stable  linux  needs repair'),
+        );
+        expect(
+          await runWren(
+            ['--release', _version, 'flutter', '--version'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          3,
+        );
+
+        final repairOutput = StringBuffer();
+        final repairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            confirmation: (_) async => true,
+            stdoutSink: repairOutput,
+            stderrSink: repairError,
+          ),
+          0,
+          reason: repairError.toString(),
+        );
+        expect(
+          FileSystemEntity.typeSync(source.path, followLinks: false),
+          FileSystemEntityType.directory,
+        );
+        expect(
+          File(p.join(source.path, '.wren-source.json')).existsSync(),
+          isTrue,
+        );
+        for (final releaseVersion in [_version, secondVersion]) {
+          final manifest = jsonDecode(
+            await File(
+              p.join(
+                dataDirectory.path,
+                'releases/stable-$releaseVersion-linux-x64/.wren-release.json',
+              ),
+            ).readAsString(),
+          ) as Map<String, Object?>;
+          expect(manifest['sourceNeedsRepair'], isNot(true));
+        }
+        final repairedList = StringBuffer();
+        expect(
+          await runWren(
+            ['list'],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: repairedList,
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        expect(
+          repairedList.toString(),
+          contains('$_version  stable  linux  ready'),
+        );
+        expect(
+          repairedList.toString(),
+          contains('$secondVersion  stable  linux  ready'),
+        );
+      },
+    );
 
     test('seeds a second release from the retained engine source', () async {
       final environment = InstallEnvironment(
@@ -1514,6 +2399,14 @@ printf '\376\000\n' >&2
         };
         await File(p.join(release.path, 'bin/cache/$stamp'))
             .writeAsString('$_engineRevision\n');
+        if (entry.key == 'android') {
+          await File(
+            p.join(
+              release.path,
+              'bin/cache/android-internal-build-artifacts.stamp',
+            ),
+          ).writeAsString('$_engineRevision\n');
+        }
         if (entry.key == 'flutter_runner') {
           final debugSymbols = Directory(
             p.join(
@@ -1568,8 +2461,7 @@ printf '\376\000\n' >&2
         await releaseMarker.readAsString(),
       ) as Map<String, Object?>;
       expect(
-        (trustedManifest['optionalArtifactInventories']!
-                as Map<String, Object?>)
+        (trustedManifest['optionalArtifactGroups']! as Map<String, Object?>)
             .keys,
         containsAll(['ios', ...groupLocations.keys]),
       );
@@ -1626,8 +2518,7 @@ printf '\376\000\n' >&2
       final unrecordedManifest = jsonDecode(
         await releaseMarker.readAsString(),
       ) as Map<String, Object?>;
-      (unrecordedManifest['optionalArtifactInventories']!
-              as Map<String, Object?>)
+      (unrecordedManifest['optionalArtifactGroups']! as Map<String, Object?>)
           .remove('ios');
       await releaseMarker.writeAsString(jsonEncode(unrecordedManifest));
       expect(await repair(), 0);
@@ -1653,14 +2544,17 @@ printf '\376\000\n' >&2
       final invalidInventoryManifest = jsonDecode(
         await releaseMarker.readAsString(),
       ) as Map<String, Object?>;
-      (invalidInventoryManifest['optionalArtifactInventories']!
+      (invalidInventoryManifest['optionalArtifactGroups']!
               as Map<String, Object?>)['ios'] =
           <Object?>[];
       await releaseMarker.writeAsString(jsonEncode(invalidInventoryManifest));
       await optionalFile.delete();
       await File(p.join(release.path, 'bin/cache/ios-sdk.stamp')).delete();
       expect(await repair(), 4);
-      expect(lastRepairError, contains('optional artifact inventory metadata'));
+      expect(
+        lastRepairError,
+        contains('retained ios artifact inventory is invalid'),
+      );
       expect(await fetchCount.readAsString(), 'xxxxxx');
       expect(
         Directory(p.join(dataDirectory.path, 'staging')).listSync(),
@@ -1742,256 +2636,12 @@ printf '\376\000\n' >&2
         await File(p.join(release.path, '.wren-release.json')).readAsString(),
       ) as Map<String, Object?>;
       expect(
-        (manifest['optionalArtifactInventories']! as Map<String, Object?>)
+        (manifest['optionalArtifactGroups']! as Map<String, Object?>)
             .containsKey('ios'),
         isTrue,
       );
       expect(
         File(p.join(dataDirectory.path, 'ios-fetch-count')).existsSync(),
-        isTrue,
-      );
-    });
-
-    test('repairs evidenced Linux optional artifact groups', () async {
-      await _writeFixtureSdk(repositoryWorktree);
-      await File(p.join(repositoryWorktree.path, 'linux-optional-fixture'))
-          .writeAsString('Linux optional artifact fixture\n');
-      await _git(repositoryWorktree.path, ['add', '.']);
-      await _git(repositoryWorktree.path, [
-        'commit',
-        '-m',
-        'Linux optional fixture',
-      ]);
-      await _git(repositoryWorktree.path, ['tag', '-f', _version]);
-      frameworkRevision = await _git(repositoryWorktree.path, [
-        'rev-parse',
-        'HEAD',
-      ]);
-      final environment = InstallEnvironment(
-        dataDirectory: dataDirectory,
-        flutterRepository: Uri.file(repositoryWorktree.path),
-      );
-      expect(
-        await runWren(
-          ['install', _version],
-          catalogJson: _catalog(frameworkRevision),
-          host: HostPlatform.linuxX64,
-          installEnvironment: environment,
-          stderrSink: StringBuffer(),
-        ),
-        0,
-      );
-
-      final release = Directory(
-        p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
-      );
-      final externalCacheFiles = <File>[
-        File(
-          p.join(
-            dataDirectory.parent.path,
-            '.gradle/caches/modules-2/fixture.bin',
-          ),
-        ),
-        File(
-          p.join(
-            dataDirectory.parent.path,
-            '.m2/repository/fixture/artifact.jar',
-          ),
-        ),
-      ];
-      for (final file in externalCacheFiles) {
-        await file.parent.create(recursive: true);
-        await file.writeAsString('external build cache sentinel');
-      }
-      final groupLocations = <String, String>{
-        'android': 'engine/android-arm64',
-        'flutter_runner': 'flutter_runner',
-      };
-      for (final entry in groupLocations.entries) {
-        final payload = File(
-          p.join(
-            release.path,
-            'bin/cache/artifacts/${entry.value}/optional-target.bin',
-          ),
-        );
-        await payload.parent.create(recursive: true);
-        await payload.writeAsString('trusted ${entry.key} payload\n');
-        final stamp = switch (entry.key) {
-          'flutter_runner' => 'flutter_runner.stamp',
-          _ => '${entry.key}-sdk.stamp',
-        };
-        if (entry.key != 'android') {
-          await File(p.join(release.path, 'bin/cache/$stamp'))
-              .writeAsString('$_engineRevision\n');
-        }
-        if (entry.key == 'flutter_runner') {
-          final debugSymbols = Directory(
-            p.join(
-              release.path,
-              'bin/cache/artifacts/flutter_runner_debug_symbols',
-            ),
-          );
-          await debugSymbols.create(recursive: true);
-          await File(p.join(debugSymbols.path, 'optional-target.bin'))
-              .writeAsString('trusted flutter_runner payload\n');
-          await File(
-            p.join(
-              release.path,
-              'bin/cache/flutter_runner_debug_symbols.stamp',
-            ),
-          ).writeAsString('$_engineRevision\n');
-        }
-      }
-      final releaseMarker = File(p.join(release.path, '.wren-release.json'));
-      final releaseData = jsonDecode(
-        await releaseMarker.readAsString(),
-      ) as Map<String, Object?>;
-      releaseData['externalUse'] = true;
-      await releaseMarker.writeAsString(jsonEncode(releaseData));
-
-      Future<int> repair(Future<bool?> Function(String)? confirmation) =>
-          runWren(
-            ['repair', _version],
-            host: HostPlatform.linuxX64,
-            installEnvironment: environment,
-            confirmation: confirmation,
-            stdoutSink: StringBuffer(),
-            stderrSink: StringBuffer(),
-          );
-
-      expect(await repair((_) async => true), 0);
-      expect(
-        ((jsonDecode(await releaseMarker.readAsString())
-                    as Map<String, Object?>)['optionalArtifactInventories']!
-                as Map<String, Object?>)
-            .keys,
-        containsAll(['android', 'flutter_runner']),
-      );
-      for (final group in ['android', 'flutter_runner']) {
-        expect(
-          await File(p.join(dataDirectory.path, '$group-fetch-count'))
-              .readAsString(),
-          'x',
-        );
-      }
-      expect(await repair(null), 0);
-      for (final group in ['android', 'flutter_runner']) {
-        expect(
-          await File(p.join(dataDirectory.path, '$group-fetch-count'))
-              .readAsString(),
-          'x',
-        );
-      }
-      expect(
-        File(p.join(dataDirectory.path, 'fuchsia-fetch-count')).existsSync(),
-        false,
-      );
-
-      final androidPayload = File(
-        p.join(
-          release.path,
-          'bin/cache/artifacts/engine/android-arm64/optional-target.bin',
-        ),
-      );
-      await androidPayload.writeAsString('corrupted');
-      var confirmationRequested = false;
-      expect(
-        await repair((_) async {
-          confirmationRequested = true;
-          return false;
-        }),
-        6,
-      );
-      expect(confirmationRequested, isTrue);
-      expect(await androidPayload.readAsString(), 'corrupted');
-      expect(await repair((_) async => true), 0);
-      expect(await androidPayload.readAsString(), 'trusted android payload\n');
-      for (final file in externalCacheFiles) {
-        expect(await file.readAsString(), 'external build cache sentinel');
-      }
-      expect(
-        Directory(p.join(dataDirectory.path, 'staging')).listSync(),
-        isEmpty,
-      );
-    });
-
-    test('uses Flutter 3.7 Linux optional artifact layout', () async {
-      const historicalVersion = '3.7.0';
-      const historicalDartVersion = '2.19.0';
-      await _writeFixtureSdk(
-        repositoryWorktree,
-        version: historicalVersion,
-        reportedDartVersion: historicalDartVersion,
-        runtimeDartVersion: historicalDartVersion,
-      );
-      await _git(repositoryWorktree.path, ['add', '.']);
-      await _git(repositoryWorktree.path, [
-        'commit',
-        '-m',
-        'Flutter 3.7 Linux fixture',
-      ]);
-      await _git(repositoryWorktree.path, ['tag', historicalVersion]);
-      final historicalRevision = await _git(repositoryWorktree.path, [
-        'rev-parse',
-        'HEAD',
-      ]);
-      final environment = InstallEnvironment(
-        dataDirectory: dataDirectory,
-        flutterRepository: Uri.file(repositoryWorktree.path),
-      );
-      expect(
-        await runWren(
-          ['install', historicalVersion],
-          catalogJson: _catalog(
-            historicalRevision,
-            dartVersion: historicalDartVersion,
-            releaseVersion: historicalVersion,
-          ),
-          host: HostPlatform.linuxX64,
-          installEnvironment: environment,
-          stderrSink: StringBuffer(),
-        ),
-        0,
-      );
-
-      final release = Directory(
-        p.join(
-          dataDirectory.path,
-          'releases/stable-$historicalVersion-linux-x64',
-        ),
-      );
-      final optionalFile = File(
-        p.join(
-          release.path,
-          'bin/cache/artifacts/engine/android-arm64/optional-target.bin',
-        ),
-      );
-      await optionalFile.parent.create(recursive: true);
-      await optionalFile.writeAsString('trusted android payload\n');
-      await File(p.join(release.path, 'bin/cache/android-sdk.stamp'))
-          .writeAsString('$_engineRevision\n');
-      final repairStderr = StringBuffer();
-      expect(
-        await runWren(
-          ['repair', historicalVersion],
-          host: HostPlatform.linuxX64,
-          installEnvironment: environment,
-          stdoutSink: StringBuffer(),
-          stderrSink: repairStderr,
-        ),
-        0,
-        reason: repairStderr.toString(),
-      );
-      final manifest = jsonDecode(
-        await File(p.join(release.path, '.wren-release.json')).readAsString(),
-      ) as Map<String, Object?>;
-      expect(
-        (manifest['optionalArtifactInventories']! as Map<String, Object?>)
-            .containsKey('android'),
-        isTrue,
-      );
-      expect(
-        File(p.join(dataDirectory.path, 'android-fetch-count')).existsSync(),
         isTrue,
       );
     });
@@ -2361,6 +3011,390 @@ printf '\376\000\n' >&2
       },
     );
 
+    test(
+      'repairs evidenced Linux Android artifacts and retains their inventory',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        final installError = StringBuffer();
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: installError,
+          ),
+          0,
+          reason: installError.toString(),
+        );
+
+        final release = Directory(
+          p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
+        );
+        final androidRoot = Directory(
+          p.join(
+            release.path,
+            'bin/cache/artifacts/engine/android-x64-profile',
+          ),
+        );
+        await androidRoot.create(recursive: true);
+        final unusedError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: unusedError,
+          ),
+          0,
+          reason: unusedError.toString(),
+        );
+        expect(
+          File(p.join(dataDirectory.path, 'android-precache-ran')).existsSync(),
+          isFalse,
+          reason: 'an empty shared artifact directory is not evidence of use',
+        );
+
+        final stamp = File(p.join(release.path, 'bin/cache/android-sdk.stamp'));
+        final damagedArtifact = File(
+          p.join(androidRoot.path, 'linux-x64/optional-target.bin'),
+        );
+        await damagedArtifact.parent.create(recursive: true);
+        // A distinctive file without a stamp is enough evidence. Its bytes
+        // are sound, so the first repair fetches and records trusted content.
+        await damagedArtifact.writeAsString('trusted Android engine\n');
+        final externalGradleCache = Directory(
+          p.join(temp.path, 'external-gradle-cache'),
+        );
+        await externalGradleCache.create();
+        final externalMavenFile = File(
+          p.join(externalGradleCache.path, 'artifact.jar'),
+        );
+        await externalMavenFile.writeAsString('managed by Gradle');
+        final repairOutput = StringBuffer();
+        final repairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: repairOutput,
+            stderrSink: repairError,
+          ),
+          0,
+          reason: repairError.toString(),
+        );
+        expect(
+          await damagedArtifact.readAsString(),
+          'trusted Android engine\n',
+        );
+        expect(
+          repairOutput.toString(),
+          contains('Repaired optional artifacts'),
+        );
+        expect(
+          File(p.join(dataDirectory.path, 'android-precache-ran')).existsSync(),
+          isTrue,
+        );
+        expect(
+          File(p.join(dataDirectory.path, 'external-gradle-cache-modified'))
+              .existsSync(),
+          isFalse,
+          reason: 'repair must select the Android engine artifact only',
+        );
+        expect(await externalMavenFile.readAsString(), 'managed by Gradle');
+
+        final marker = File(p.join(release.path, '.wren-release.json'));
+        var manifest =
+            jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+        final records =
+            manifest['optionalArtifactGroups']! as Map<String, Object?>;
+        expect(records.containsKey('android-engine'), isTrue);
+        expect(
+          await File(p.join(dataDirectory.path, 'android-precache-ran'))
+              .readAsString(),
+          'x',
+          reason: 'the first-seen group is fetched once and recorded',
+        );
+
+        final healthyRepairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: healthyRepairError,
+          ),
+          0,
+          reason: healthyRepairError.toString(),
+        );
+        expect(
+          await File(p.join(dataDirectory.path, 'android-precache-ran'))
+              .readAsString(),
+          'x',
+          reason: 'trusted group contents make later checks download-free',
+        );
+
+        await damagedArtifact.writeAsString('corrupt editor artifact');
+        if (stamp.existsSync()) await stamp.delete();
+        final internalStamp = File(
+          p.join(
+            release.path,
+            'bin/cache/android-internal-build-artifacts.stamp',
+          ),
+        );
+        if (internalStamp.existsSync()) await internalStamp.delete();
+        final damagedRepairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: damagedRepairError,
+          ),
+          0,
+          reason: damagedRepairError.toString(),
+        );
+        expect(
+          await damagedArtifact.readAsString(),
+          'trusted Android engine\n',
+        );
+        expect(
+          await File(p.join(dataDirectory.path, 'android-precache-ran'))
+              .readAsString(),
+          'xx',
+          reason: 'a retained group identity fetches its trusted source',
+        );
+
+        await androidRoot.delete(recursive: true);
+        await stamp.delete();
+        await File(
+          p.join(
+            release.path,
+            'bin/cache/android-internal-build-artifacts.stamp',
+          ),
+        ).delete();
+        final deletedRepairError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: deletedRepairError,
+          ),
+          0,
+          reason: deletedRepairError.toString(),
+        );
+        expect(
+          await damagedArtifact.readAsString(),
+          'trusted Android engine\n',
+        );
+        manifest =
+            jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+        expect(manifest['optionalArtifactsNeedRepair'], isNull);
+      },
+    );
+
+    test('uses the Flutter 3.7 Linux artifact family for repair', () async {
+      const historicalVersion = '3.7.9';
+      await _writeFixtureSdk(repositoryWorktree, version: historicalVersion);
+      await _git(repositoryWorktree.path, ['add', '.']);
+      await _git(repositoryWorktree.path, [
+        'commit',
+        '-m',
+        'Flutter 3.7 fixture',
+      ]);
+      await _git(repositoryWorktree.path, ['tag', historicalVersion]);
+      final historicalRevision = await _git(repositoryWorktree.path, [
+        'rev-parse',
+        'HEAD',
+      ]);
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      final installError = StringBuffer();
+      expect(
+        await runWren(
+          ['install', historicalVersion],
+          catalogJson: _catalog(
+            historicalRevision,
+            releaseVersion: historicalVersion,
+          ),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: installError,
+        ),
+        0,
+        reason: installError.toString(),
+      );
+
+      final release = Directory(
+        p.join(
+          dataDirectory.path,
+          'releases/stable-$historicalVersion-linux-x64',
+        ),
+      );
+      await File(p.join(release.path, 'bin/cache/android-sdk.stamp'))
+          .writeAsString('stale\n');
+      final repairError = StringBuffer();
+      expect(
+        await runWren(
+          ['repair', historicalVersion],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: repairError,
+        ),
+        0,
+        reason: repairError.toString(),
+      );
+      expect(
+        File(p.join(dataDirectory.path, 'android-precache-ran')).existsSync(),
+        isTrue,
+      );
+      final manifest = jsonDecode(
+        await File(p.join(release.path, '.wren-release.json')).readAsString(),
+      ) as Map<String, Object?>;
+      expect(
+        (manifest['optionalArtifactGroups']! as Map<String, Object?>)
+            .containsKey('android-engine'),
+        isTrue,
+      );
+    });
+
+    test(
+      'requires editor confirmation before replacing optional artifacts',
+      () async {
+        final environment = InstallEnvironment(
+          dataDirectory: dataDirectory,
+          flutterRepository: Uri.file(repositoryWorktree.path),
+        );
+        expect(
+          await runWren(
+            ['install', _version],
+            catalogJson: _catalog(frameworkRevision),
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          ),
+          0,
+        );
+        final release = Directory(
+          p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
+        );
+        final stamp = File(p.join(release.path, 'bin/cache/android-sdk.stamp'));
+        await stamp.writeAsString('stale\n');
+        final artifact = File(
+          p.join(
+            release.path,
+            'bin/cache/artifacts/engine/android-x64-profile/linux-x64/optional-target.bin',
+          ),
+        );
+        final marker = File(p.join(release.path, '.wren-release.json'));
+        final manifest =
+            jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+        await marker.writeAsString(
+          jsonEncode({...manifest, 'externalUse': true}),
+        );
+
+        final declinedError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            confirmation: (_) async => false,
+            stdoutSink: StringBuffer(),
+            stderrSink: declinedError,
+          ),
+          6,
+        );
+        expect(artifact.existsSync(), isFalse);
+        final declinedManifest =
+            jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+        expect(declinedManifest['optionalArtifactsNeedRepair'], isTrue);
+
+        final confirmedError = StringBuffer();
+        expect(
+          await runWren(
+            ['repair', _version],
+            host: HostPlatform.linuxX64,
+            installEnvironment: environment,
+            confirmation: (_) async => true,
+            stdoutSink: StringBuffer(),
+            stderrSink: confirmedError,
+          ),
+          0,
+          reason: confirmedError.toString(),
+        );
+        expect(await artifact.readAsString(), 'trusted Android engine\n');
+      },
+    );
+
+    test('keeps an unavailable optional source marked for repair', () async {
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      expect(
+        await runWren(
+          ['install', _version],
+          catalogJson: _catalog(frameworkRevision),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+      final release = Directory(
+        p.join(dataDirectory.path, 'releases/stable-$_version-linux-x64'),
+      );
+      await File(p.join(release.path, 'bin/cache/android-sdk.stamp'))
+          .writeAsString('stale\n');
+      await File(p.join(dataDirectory.path, 'fail-android-precache'))
+          .writeAsString('');
+      final repairError = StringBuffer();
+      expect(
+        await runWren(
+          ['repair', _version],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: repairError,
+        ),
+        4,
+        reason: repairError.toString(),
+      );
+      final marker = jsonDecode(
+        await File(p.join(release.path, '.wren-release.json')).readAsString(),
+      ) as Map<String, Object?>;
+      expect(marker['optionalArtifactsNeedRepair'], isTrue);
+      final listOutput = StringBuffer();
+      expect(
+        await runWren(
+          ['list'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: listOutput,
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+      expect(listOutput.toString(), contains('needs repair'));
+    });
+
     test('rejects an ineligible release before creating storage', () async {
       final stdout = StringBuffer();
       final stderr = StringBuffer();
@@ -2492,44 +3526,71 @@ Future<void> _writeFixtureSdk(
 #!/bin/sh
 set -eu
 if [ "\$1" = "precache" ]; then
-  if [ "\$2" = "--force" ]; then
-    case "\$3" in
-      --ios)
-        group=ios
-        if [ '$legacyIos' = 'true' ]; then target=ios/Flutter.framework; else target=engine/ios-arm64; fi
-        stamp=ios-sdk
-        ;;
-      --macos)
-        group=macos
-        target=engine/darwin-arm64
-        stamp=macos-sdk
-        ;;
-      --android)
-        group=android
-        target=engine/android-arm64
-        stamp=android-sdk
-        ;;
-      --linux)
-        group=linux
-        target=engine/linux-x64
-        stamp=linux-sdk
-        ;;
-      --fuchsia)
-        group=fuchsia
-        if [ '$isLinux' = 'true' ]; then
-          target=fuchsia/sdk/core/linux-amd64
-          stamp=fuchsia-linux
-        else
-          target=fuchsia/sdk/core/mac-amd64
-          stamp=fuchsia-mac
-        fi
-        ;;
-      --flutter_runner)
-        group=flutter_runner
-        target=flutter_runner
-        stamp=flutter_runner
-        ;;
-    esac
+  if [ "\$2" = "--android" ]; then
+    touch ../../../external-gradle-cache-modified
+    exit 19
+  fi
+  if [ "\$2" = "--android_gen_snapshot" ]; then
+    printf 'x' >> ../../../android-precache-ran
+    if [ -f ../../../fail-android-precache ]; then
+      rm -f ../../../fail-android-precache
+      echo "fixture Android artifact failure" >&2
+      exit 17
+    fi
+    if [ "\$3" = "--android_internal_build" ]; then
+      if [ "\$4" != "--no-universal" ]; then exit 18; fi
+      printf '$_engineRevision\\n' > bin/cache/android-internal-build-artifacts.stamp
+    elif [ "\$3" != "--no-universal" ]; then
+      exit 18
+    fi
+    if [ '$isLinux' = 'true' ]; then
+      target=engine/android-x64-profile/linux-x64
+      mkdir -p "bin/cache/artifacts/\$target"
+      printf 'trusted Android engine\\n' > "bin/cache/artifacts/\$target/optional-target.bin"
+    else
+      target=engine/android-arm64
+      mkdir -p "bin/cache/artifacts/\$target"
+      printf 'trusted android payload\\n' > "bin/cache/artifacts/\$target/optional-target.bin"
+    fi
+    printf '$_engineRevision\\n' > bin/cache/android-sdk.stamp
+    printf x >> ../../../android-fetch-count
+    exit 0
+  fi
+  if [ "\$#" -ge 3 ] && [ "\$3" = "--no-universal" ]; then
+  group=''
+  case "\$2" in
+    --ios)
+      group=ios
+      if [ '$legacyIos' = 'true' ]; then target=ios/Flutter.framework; else target=engine/ios-arm64; fi
+      stamp=ios-sdk
+      ;;
+    --macos)
+      group=macos
+      target=engine/darwin-arm64
+      stamp=macos-sdk
+      ;;
+    --linux)
+      group=linux
+      target=engine/linux-x64
+      stamp=linux-sdk
+      ;;
+    --fuchsia)
+      group=fuchsia
+      if [ '$isLinux' = 'true' ]; then
+        target=fuchsia/sdk/core/linux-amd64
+        stamp=fuchsia-linux
+      else
+        target=fuchsia/sdk/core/mac-amd64
+        stamp=fuchsia-mac
+      fi
+      ;;
+    --flutter_runner)
+      group=flutter_runner
+      target=flutter_runner
+      stamp=flutter_runner
+      ;;
+  esac
+  if [ -n "\$group" ]; then
     mkdir -p "bin/cache/artifacts/\$target"
     printf "trusted \$group payload\\n" > "bin/cache/artifacts/\$target/optional-target.bin"
     printf '$_engineRevision\\n' > "bin/cache/\$stamp.stamp"
@@ -2538,8 +3599,19 @@ if [ "\$1" = "precache" ]; then
       printf "trusted \$group payload\\n" > bin/cache/artifacts/flutter_runner_debug_symbols/optional-target.bin
       printf '$_engineRevision\\n' > bin/cache/flutter_runner_debug_symbols.stamp
     fi
+    if [ "\$group" = "macos" ]; then
+      mkdir -p bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework
+      mkdir -p bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework
+      mkdir -p bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework/Info.plist
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework/Info.plist
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework/Info.plist
+      touch bin/cache/artifacts/engine/darwin-arm64/gen_snapshot
+      chmod +x bin/cache/artifacts/engine/darwin-arm64/gen_snapshot
+    fi
     printf x >> "../../../\$group-fetch-count"
     exit 0
+  fi
   fi
   if [ "\$2" != "$precacheFlag" ] || [ "\$3" != "--web" ]; then
     echo "unexpected precache target: \$2 \$3" >&2
@@ -2616,6 +3688,65 @@ exit 19
   await Process.run('chmod', ['+x', flutter.path]);
 }
 
+Future<Map<String, String>> _snapshotTree(Directory root) async {
+  final snapshot = <String, String>{};
+  await for (final entity in root.list(recursive: true, followLinks: false)) {
+    final relative = p.relative(entity.path, from: root.path);
+    final type = FileSystemEntity.typeSync(entity.path, followLinks: false);
+    if (type == FileSystemEntityType.file) {
+      final file = File(entity.path);
+      snapshot[relative] =
+          'file:${file.statSync().mode & 0x1ff}:'
+          '${base64.encode(await file.readAsBytes())}';
+    } else if (type == FileSystemEntityType.directory) {
+      snapshot[relative] = 'directory';
+    } else if (type == FileSystemEntityType.link) {
+      snapshot[relative] = 'link:${Link(entity.path).targetSync()}';
+    } else {
+      snapshot[relative] = type.toString();
+    }
+  }
+  return snapshot;
+}
+
+Future<T> _withGitConfigFifo<T>(
+  Directory checkout,
+  Future<T> Function() action,
+) async {
+  final commonDirectory = await Process.run('git', [
+    'rev-parse',
+    '--git-common-dir',
+  ], workingDirectory: checkout.path);
+  if (commonDirectory.exitCode != 0) {
+    throw StateError('${commonDirectory.stderr}\n${commonDirectory.stdout}');
+  }
+  final config = File(
+    p.join(
+      p.absolute(checkout.path, '${commonDirectory.stdout}'.trim()),
+      'config',
+    ),
+  );
+  if (FileSystemEntity.typeSync(config.path, followLinks: false) !=
+      FileSystemEntityType.file) {
+    throw StateError('Git common config is not a regular file: ${config.path}');
+  }
+  final original = await config.readAsBytes();
+  await config.delete();
+  try {
+    final fifo = await Process.run('mkfifo', [config.path]);
+    if (fifo.exitCode != 0) {
+      throw StateError('${fifo.stderr}\n${fifo.stdout}');
+    }
+    return await action();
+  } finally {
+    if (FileSystemEntity.typeSync(config.path, followLinks: false) !=
+        FileSystemEntityType.notFound) {
+      await config.delete();
+    }
+    await config.writeAsBytes(original, flush: true);
+  }
+}
+
 Future<String> _git(String cwd, List<String> arguments) async {
   final result = await Process.run('git', arguments, workingDirectory: cwd);
   if (result.exitCode != 0) {
@@ -2667,6 +3798,39 @@ Future<void> _waitForFile(File file) async {
     await Future<void>.delayed(const Duration(milliseconds: 10));
   }
   fail('Timed out waiting for ${file.path}.');
+}
+
+class _CancelOnDoctorIdentitySink implements StringSink {
+  new(this._cancel);
+
+  final void Function() _cancel;
+  final StringBuffer _buffer = StringBuffer();
+  var _sentCancellation = false;
+
+  @override
+  void write(Object? object) {
+    final text = object?.toString() ?? 'null';
+    _buffer.write(text);
+    if (!_sentCancellation &&
+        text.contains('Checking doctor integrity: release-identity')) {
+      _sentCancellation = true;
+      _cancel();
+    }
+  }
+
+  @override
+  void writeAll(Iterable<dynamic> objects, [String separator = '']) {
+    write(objects.join(separator));
+  }
+
+  @override
+  void writeCharCode(int charCode) => write(String.fromCharCode(charCode));
+
+  @override
+  void writeln([Object? object = '']) => write('${object ?? 'null'}\n');
+
+  @override
+  String toString() => _buffer.toString();
 }
 
 class _InstallWorker {

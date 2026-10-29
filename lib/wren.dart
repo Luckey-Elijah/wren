@@ -4,11 +4,22 @@ import 'dart:io' as io;
 
 import 'package:args/command_runner.dart';
 import 'package:pub_semver/pub_semver.dart';
+import 'package:wren/src/doctor_integrity.dart';
+import 'package:wren/src/doctor_setup.dart';
 import 'package:wren/src/installer.dart';
+import 'package:wren/src/self_upgrade.dart';
 import 'package:wren/src/tracing.dart';
 import 'package:yaml/yaml.dart';
 import 'package:yaml_edit/yaml_edit.dart';
 
+export 'src/doctor_integrity.dart'
+    show
+        DoctorCheckStatus,
+        DoctorFullIntegrityReport,
+        DoctorIntegrityCheck,
+        DoctorIntegrityStatus,
+        DoctorReleaseIntegrity,
+        DoctorScanCompletion;
 export 'src/installer.dart'
     show
         CleanupResult,
@@ -30,6 +41,10 @@ typedef SdkLauncher = Future<int> Function({
 typedef WrenConfirmation = Future<bool?> Function(String message);
 
 const _minimumDartVersion = '2.19.0';
+const _wrenVersion = String.fromEnvironment(
+  'WREN_VERSION',
+  defaultValue: '1.0.0',
+);
 const _linuxCatalog =
     'https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json';
 const _macosCatalog =
@@ -54,7 +69,12 @@ class WrenContext {
     this.installedReleasesOverride,
     this.sdkLauncher,
     this.wrenExecutable,
+    this.runningExecutablePath,
+    Map<String, String>? processEnvironment,
+    this.upgradeReleaseApiUri,
+    this.wrenVersionOverride,
     this.stdinStream,
+    this.fullDoctorCheckTimeout = const Duration(seconds: 30),
     DateTime? traceStartedAt,
     Stopwatch? traceElapsed,
   }) : _stdoutSink = stdoutSink ?? io.stdout,
@@ -65,7 +85,10 @@ class WrenContext {
        _traceStartedAt = traceStartedAt,
        // Keep this invocation timer private to the context implementation.
        // ignore: prefer_initializing_formals
-       _traceElapsed = traceElapsed;
+       _traceElapsed = traceElapsed,
+       processEnvironmentOverride = processEnvironment == null
+           ? null
+           : Map.unmodifiable(processEnvironment);
 
   final StringSink _stdoutSink;
   final StringSink _stderrSink;
@@ -106,8 +129,30 @@ class WrenContext {
   /// CLI tests to run generated shims against a controlled child process.
   final String? wrenExecutable;
 
+  /// Current executable used by upgrade-wren; injectable for CLI fixtures.
+  final String? runningExecutablePath;
+
+  /// Process environment used by this invocation.
+  ///
+  /// Production runs inherit the process environment. The override lets CLI
+  /// fixtures inspect PATH and system Git without changing the test process.
+  final Map<String, String>? processEnvironmentOverride;
+
+  /// Release API endpoint used by upgrade-wren; injectable for fixtures.
+  final Uri? upgradeReleaseApiUri;
+
+  /// Version compiled into this executable; injectable for CLI fixtures.
+  final String? wrenVersionOverride;
+
   /// Input forwarded to SDK processes; defaults to the current process stdin.
   final Stream<List<int>>? stdinStream;
+
+  /// Per-operation timeout for a full doctor scan, configurable in CLI tests.
+  final Duration fullDoctorCheckTimeout;
+
+  /// Environment visible to Wren setup diagnostics.
+  Map<String, String> get processEnvironment =>
+      processEnvironmentOverride ?? io.Platform.environment;
 
   List<String> _sdkArguments = const [];
   TraceSession? _trace;
@@ -265,56 +310,34 @@ class WrenContext {
     HostPlatform host,
     List<InstalledRelease> installed,
   ) async {
-    final project = projectDirectory ?? io.Directory.current;
-    final pubspec = io.File('${project.path}/pubspec.yaml');
-    if (pubspec.existsSync()) {
-      try {
-        final yaml = loadYaml(pubspec.readAsStringSync());
-        final environment = yaml is YamlMap ? yaml['environment'] : null;
-        final flutterText = environment is YamlMap
-            ? environment['flutter']
-            : null;
-        final dartText = environment is YamlMap ? environment['sdk'] : null;
-        if (flutterText is String && dartText is String) {
-          final flutterConstraint = VersionConstraint.parse(flutterText);
-          final dartConstraint = VersionConstraint.parse(dartText);
-          final matching =
-              installed.where((release) {
-                if (release.host != host.catalogOs ||
-                    release.dartVersion == null) {
-                  return false;
-                }
-                try {
-                  final flutterVersion = Version.parse(release.version);
-                  final dartVersion = Version.parse(release.dartVersion!);
-                  final constraintsMatch =
-                      flutterConstraint.allows(flutterVersion) &&
-                      dartConstraint.allows(dartVersion);
-                  final betaExplicitlyAllowed =
-                      release.channel != 'beta' ||
-                      (_explicitlyAllowsPrerelease(
-                            flutterText,
-                            flutterVersion,
-                          ) &&
-                          _explicitlyAllowsPrerelease(dartText, dartVersion));
-                  return constraintsMatch && betaExplicitlyAllowed;
-                } on FormatException {
-                  return false;
-                }
-              }).toList()..sort(
-                (left, right) =>
-                    Version.parse(right.version)
-                        .compareTo(Version.parse(left.version)),
-              );
-          if (matching.isNotEmpty) return matching.first.version;
-        }
-      } on Object {
-        // Missing, malformed, or invalid constraints leave fallback eligible.
-      }
-    }
+    final project = _projectReleaseConstraints();
+    final selected = project.selectRelease(host, installed);
+    if (selected != null) return selected;
     final fallback = await globalFallback;
     return fallback == null || fallback.isEmpty ? null : fallback;
   }
+
+  /// Upgrades the running Wren executable when a newer stable release exists.
+  Future<WrenUpgradeResult> upgradeWren() {
+    final targetHost = host;
+    if (targetHost == null) {
+      throw const WrenUpgradeException(
+        'self-upgrade is supported only on Linux x86_64 and macOS arm64.',
+      );
+    }
+    return WrenSelfUpgrade(
+      currentVersion: wrenVersionOverride ?? _wrenVersion,
+      hostAssetName: targetHost.nativeAssetName,
+      executablePath: runningExecutablePath ?? io.Platform.resolvedExecutable,
+      dataDirectory: installEnvironment.dataDirectory.absolute.path,
+      stdout: stdoutSink,
+      stderr: stderrSink,
+      releaseApiUri: upgradeReleaseApiUri,
+    ).run();
+  }
+
+  _ProjectReleaseConstraints _projectReleaseConstraints() =>
+      _ProjectReleaseConstraints.read(projectDirectory ?? io.Directory.current);
 
   /// Starts the selected SDK command.
   Future<int> launchSdk(
@@ -358,6 +381,104 @@ bool _explicitlyAllowsPrerelease(String constraint, Version version) {
       return false;
     }
   });
+}
+
+class _ProjectReleaseConstraints {
+  const new({
+    required this.pubspecExists,
+    this.flutterText,
+    this.dartText,
+    this.flutterConstraint,
+    this.dartConstraint,
+    this.problem,
+  });
+
+  factory read(io.Directory project) {
+    final pubspec = io.File('${project.path}/pubspec.yaml');
+    if (!pubspec.existsSync()) {
+      return const _ProjectReleaseConstraints(pubspecExists: false);
+    }
+    try {
+      final yaml = loadYaml(pubspec.readAsStringSync());
+      final environment = yaml is YamlMap ? yaml['environment'] : null;
+      final flutterText = environment is YamlMap
+          ? environment['flutter']
+          : null;
+      final dartText = environment is YamlMap ? environment['sdk'] : null;
+      if (flutterText is! String || dartText is! String) {
+        return const _ProjectReleaseConstraints(
+          pubspecExists: true,
+          problem:
+              'pubspec.yaml must define environment.flutter and '
+              'environment.sdk to compare releases',
+        );
+      }
+      return _ProjectReleaseConstraints(
+        pubspecExists: true,
+        flutterText: flutterText,
+        dartText: dartText,
+        flutterConstraint: VersionConstraint.parse(flutterText),
+        dartConstraint: VersionConstraint.parse(dartText),
+      );
+    } on Object {
+      return const _ProjectReleaseConstraints(
+        pubspecExists: true,
+        problem: 'pubspec.yaml has invalid project constraints',
+      );
+    }
+  }
+
+  final bool pubspecExists;
+  final String? flutterText;
+  final String? dartText;
+  final VersionConstraint? flutterConstraint;
+  final VersionConstraint? dartConstraint;
+  final String? problem;
+
+  String? incompatibilityFor(InstalledRelease release, HostPlatform host) {
+    if (!pubspecExists) return null;
+    final projectProblem = problem;
+    if (projectProblem != null) return projectProblem;
+    if (release.host != host.catalogOs) {
+      return 'release is for ${release.host}, not ${host.catalogOs}';
+    }
+    final dartVersionText = release.dartVersion;
+    if (dartVersionText == null) {
+      return 'bundled Dart version is unknown';
+    }
+    try {
+      final flutterVersion = Version.parse(release.version);
+      final dartVersion = Version.parse(dartVersionText);
+      final constraintsMatch =
+          flutterConstraint!.allows(flutterVersion) &&
+          dartConstraint!.allows(dartVersion);
+      final betaExplicitlyAllowed =
+          release.channel != 'beta' ||
+          (_explicitlyAllowsPrerelease(flutterText!, flutterVersion) &&
+              _explicitlyAllowsPrerelease(dartText!, dartVersion));
+      if (constraintsMatch && betaExplicitlyAllowed) return null;
+      return 'does not satisfy the project Flutter and Dart constraints';
+    } on FormatException {
+      return 'release or bundled Dart version is invalid';
+    }
+  }
+
+  String? selectRelease(HostPlatform host, List<InstalledRelease> installed) {
+    if (!pubspecExists || problem != null) return null;
+    final matching =
+        installed
+            .where((release) => incompatibilityFor(release, host) == null)
+            .toList()
+          ..sort((left, right) {
+            try {
+              return Version.parse(right.version)
+                  .compareTo(Version.parse(left.version));
+            } on FormatException {
+              return right.version.compareTo(left.version);
+            }
+          });
+    return matching.isEmpty ? null : matching.first.version;
+  }
 }
 
 /// Wren-specific command base with shared output, verbosity and context.
@@ -431,6 +552,12 @@ class WrenCommandRunner {
           context.stderrSink.writeln('wren: could not open trace file: $error');
           return 4;
         }
+      }
+      if (args.length == 1 && args.single == '--version') {
+        context.stdoutSink.writeln(
+          'wren ${context.wrenVersionOverride ?? _wrenVersion}',
+        );
+        return await _finishTrace(0, '--version');
       }
       final sdkCommandIndex = _sdkCommandIndex(args);
       if (sdkCommandIndex != null) {
@@ -507,7 +634,7 @@ class WrenCommandRunner {
       await trace.finish(
         command: command,
         host: context.host?.label,
-        wrenVersion: '1.0.0',
+        wrenVersion: context.wrenVersionOverride ?? _wrenVersion,
         exitStatus: status,
       );
       return status;
@@ -612,6 +739,7 @@ class _WrenPackageCommandRunner extends CommandRunner<int> {
         negatable: false,
         help: 'Show additional Wren diagnostic output.',
       )
+      ..addFlag('version', negatable: false, help: 'Print the Wren version.')
       ..addOption(
         'release',
         help: 'Run an SDK command with this exact installed Flutter release.',
@@ -643,6 +771,11 @@ Future<int> runWren(
   SdkLauncher? sdkLauncher,
   String? wrenExecutable,
   Stream<List<int>>? stdinStream,
+  String? runningExecutablePath,
+  Uri? upgradeReleaseApiUri,
+  String? wrenVersion,
+  Map<String, String>? processEnvironment,
+  Duration fullDoctorCheckTimeout = const Duration(seconds: 30),
 }) async {
   final tracingRequested = _traceOptionPresentBeforeCommand(arguments);
   final traceStartedAt = tracingRequested ? DateTime.now().toUtc() : null;
@@ -660,7 +793,12 @@ Future<int> runWren(
     installedReleasesOverride: installedReleases,
     sdkLauncher: sdkLauncher,
     wrenExecutable: wrenExecutable,
+    runningExecutablePath: runningExecutablePath,
+    processEnvironment: processEnvironment,
+    upgradeReleaseApiUri: upgradeReleaseApiUri,
+    wrenVersionOverride: wrenVersion,
     stdinStream: stdinStream,
+    fullDoctorCheckTimeout: fullDoctorCheckTimeout,
     traceStartedAt: traceStartedAt,
     traceElapsed: traceElapsed,
   );
@@ -670,7 +808,9 @@ Future<int> runWren(
     ..addCommand(_RemoveCommand(context))
     ..addCommand(_RepairCommand(context))
     ..addCommand(_CleanupCommand(context))
+    ..addCommand(_UpgradeWrenCommand(context))
     ..addCommand(_ListCommand(context))
+    ..addCommand(_DoctorCommand(context))
     ..addCommand(_SetCommand(context))
     ..addCommand(_SdkPathCommand(context))
     ..addCommand(_SetupCommand(context))
@@ -788,6 +928,30 @@ class _CleanupCommand extends WrenCommand {
   }
 }
 
+class _UpgradeWrenCommand extends WrenCommand {
+  new(super.context);
+
+  @override
+  String get name => 'upgrade-wren';
+
+  @override
+  String get description => 'Upgrade the Wren executable safely.';
+
+  @override
+  Future<int> run() async {
+    if (argResults!.rest.isNotEmpty) {
+      failUsage('upgrade-wren does not accept arguments.');
+    }
+    try {
+      await context.upgradeWren();
+      return 0;
+    } on WrenUpgradeException catch (error) {
+      writeError('wren: ${error.message}');
+      return 4;
+    }
+  }
+}
+
 class _RepairCommand extends WrenCommand {
   new(super.context);
 
@@ -823,11 +987,14 @@ class _RepairCommand extends WrenCommand {
       writeOut('Repaired private files for Flutter $version.');
     }
     if (result.optionalArtifactsRepaired) {
-      writeOut('Repaired optional target artifacts for Flutter $version.');
+      writeOut('Repaired optional artifacts for Flutter $version.');
+    } else if (result.optionalArtifactsValidated) {
+      writeOut('Validated optional artifacts for Flutter $version.');
     }
     if (!result.replaced &&
         !result.privateFilesRepaired &&
-        !result.optionalArtifactsRepaired) {
+        !result.optionalArtifactsRepaired &&
+        !result.optionalArtifactsValidated) {
       writeOut('The shared engine source for Flutter $version is healthy.');
     }
     return 0;
@@ -974,6 +1141,548 @@ class _ListCommand extends WrenCommand {
     return 0;
   }
 }
+
+class _DoctorCommand extends WrenCommand {
+  new(super.context) {
+    argParser
+      ..addFlag(
+        'full',
+        negatable: false,
+        help: 'Validate local integrity for every installed release.',
+      )
+      ..addFlag(
+        'json',
+        negatable: false,
+        help: 'Write a versioned JSON diagnosis to standard output.',
+      );
+  }
+
+  @override
+  String get name => 'doctor';
+
+  @override
+  String get description =>
+      'Check Wren setup, installed releases, and current project selection.';
+
+  @override
+  Future<int> run() async {
+    final cancellation = DoctorCancellation(
+      context.installEnvironment.waitCancellation ??
+          io.ProcessSignal.sigint.watch().map((_) {}),
+    );
+    try {
+      await cancellation.race(Future<void>.delayed(Duration.zero));
+      return await cancellation.race(_runDoctor(cancellation));
+    } finally {
+      await cancellation.dispose();
+    }
+  }
+
+  Future<int> _runDoctor(DoctorCancellation cancellation) async {
+    cancellation.throwIfCancelled();
+    if (argResults!.rest.isNotEmpty) {
+      failUsage('doctor does not accept positional arguments.');
+    }
+    final targetHost = context.host;
+    if (targetHost == null) {
+      throw const InstallException(
+        'this host is unsupported. Wren supports Linux x86_64 and macOS arm64.',
+      );
+    }
+
+    final fullRequested = argResults!.flag('full');
+    final jsonRequested = argResults!.flag('json');
+    DoctorFullIntegrityReport? fullReport;
+    late final List<InstalledRelease> installed;
+    Object? releaseEnumerationError;
+    if (fullRequested) {
+      try {
+        fullReport = await cancellation.race(
+          context.traceOperation(
+            'release.full_integrity',
+            () => context.installer.inspectFullIntegrity(
+              checkTimeout: context.fullDoctorCheckTimeout,
+              cancellation: cancellation,
+            ),
+          ),
+        );
+      } on InstallCancelledException {
+        rethrow;
+      } on Object catch (error) {
+        fullReport = DoctorFullIntegrityReport(
+          const [],
+          checks: [
+            DoctorIntegrityCheck(
+              id: 'full-release-integrity',
+              status: DoctorCheckStatus.incomplete,
+              detail: 'full integrity scan could not complete: $error',
+              nextStep: 'Check Wren storage and retry `wren doctor --full`.',
+            ),
+          ],
+        );
+      }
+      final report = fullReport!;
+      installed = [
+        for (final release in report.releases)
+          InstalledRelease(
+            channel: release.channel,
+            version: release.version,
+            host: release.host,
+            dartVersion: release.dartVersion,
+            needsRepair: release.integrity == DoctorIntegrityStatus.needsRepair,
+            repairReason: release.repairReason,
+          ),
+      ];
+    } else {
+      try {
+        installed =
+            context.installedReleasesOverride ??
+            await cancellation.race(
+              context.traceOperation<List<InstalledRelease>>(
+                'release.list_installed',
+                () =>
+                    context.installer.listInstalled(cancellation: cancellation),
+              ),
+            );
+      } on InstallCancelledException {
+        rethrow;
+      } on Object catch (error) {
+        installed = const [];
+        releaseEnumerationError = error;
+      }
+    }
+    final setup = await cancellation.race(
+      DoctorSetupInspector(
+        dataDirectory: context.installEnvironment.dataDirectory,
+        executablePath:
+            context.runningExecutablePath ?? io.Platform.resolvedExecutable,
+        processEnvironment: context.processEnvironment,
+        processEnvironmentOverride: context.processEnvironmentOverride,
+        globalFallbackOverride: context.globalFallbackOverride,
+      ).inspect(
+        installedReleases: installed,
+        releaseEnumerationError: releaseEnumerationError,
+      ),
+    );
+    cancellation.throwIfCancelled();
+    final exitStatus = setup.isIncomplete || (fullReport?.isIncomplete ?? false)
+        ? 4
+        : setup.hasCritical ||
+              (fullReport?.hasConfirmedDamage ??
+                  installed.any((release) => release.needsRepair))
+        ? 1
+        : 0;
+    final completion = setup.isIncomplete || (fullReport?.isIncomplete ?? false)
+        ? 'incomplete'
+        : 'complete';
+    final hasCriticalFinding =
+        setup.hasCritical ||
+        (fullReport?.hasConfirmedDamage ??
+            installed.any((release) => release.needsRepair));
+    final project = context._projectReleaseConstraints();
+    final compatibleProjectRelease = project.selectRelease(
+      targetHost,
+      installed,
+    );
+    final commandLineRelease = globalResults?.option('release')?.trim();
+    final environmentRelease =
+        context.flutterReleaseOverride ??
+        io.Platform.environment['WREN_FLUTTER_RELEASE'];
+    final normalizedEnvironmentRelease = environmentRelease?.trim();
+    String? fallback;
+    try {
+      fallback = await cancellation.race(context.globalFallback);
+    } on InstallCancelledException {
+      rethrow;
+    } on Object {
+      // Setup diagnostics report an uninspectable config as incomplete below.
+    }
+
+    late final String? selectedRelease;
+    late final String selectionSource;
+    if (commandLineRelease != null) {
+      selectedRelease = commandLineRelease;
+      selectionSource = 'command-line --release override';
+    } else if (normalizedEnvironmentRelease != null &&
+        normalizedEnvironmentRelease.isNotEmpty) {
+      selectedRelease = normalizedEnvironmentRelease;
+      selectionSource = 'WREN_FLUTTER_RELEASE environment override';
+    } else if (compatibleProjectRelease != null) {
+      selectedRelease = compatibleProjectRelease;
+      selectionSource = 'current project constraints';
+    } else if (fallback != null && fallback.isNotEmpty) {
+      selectedRelease = fallback;
+      selectionSource = 'global fallback';
+    } else {
+      selectedRelease = null;
+      selectionSource = 'none';
+    }
+
+    cancellation.throwIfCancelled();
+
+    DoctorReleaseIntegrity? fullIntegrityFor(InstalledRelease release) =>
+        fullReport?.releases
+            .where(
+              (candidate) =>
+                  candidate.channel == release.channel &&
+                  candidate.version == release.version &&
+                  candidate.host == release.host,
+            )
+            .firstOrNull;
+
+    String compatibilityStatus(InstalledRelease release) {
+      if (!project.pubspecExists) return 'not_applicable';
+      if (project.problem != null) return 'unable_to_evaluate';
+      return project.incompatibilityFor(release, targetHost) == null
+          ? 'compatible'
+          : 'incompatible';
+    }
+
+    String? compatibilityReason(InstalledRelease release) =>
+        !project.pubspecExists
+        ? null
+        : project.incompatibilityFor(release, targetHost);
+
+    Map<String, Object?> setupCheckJson(DoctorSetupCheck check) => {
+      'component': check.component,
+      'severity': switch (check.severity) {
+        DoctorCheckSeverity.ok => 'ok',
+        DoctorCheckSeverity.informational => 'informational',
+        DoctorCheckSeverity.critical => 'critical',
+        DoctorCheckSeverity.incomplete => 'incomplete',
+      },
+      'summary': check.summary,
+      if (check.nextStep != null) 'next_step': check.nextStep,
+    };
+
+    Map<String, Object?> integrityCheckJson(DoctorIntegrityCheck check) => {
+      'id': check.id,
+      'status': switch (check.status) {
+        DoctorCheckStatus.passed => 'passed',
+        DoctorCheckStatus.confirmedDamage => 'confirmed_damage',
+        DoctorCheckStatus.incomplete => 'incomplete',
+      },
+      'detail': check.detail,
+      if (check.nextStep != null) 'next_step': check.nextStep,
+    };
+
+    if (jsonRequested) {
+      if (verbose) {
+        for (final check in setup.checks) {
+          writeError(
+            'Setup ${check.component}: ${check.severity.name} — '
+            '${check.summary}',
+          );
+        }
+        for (final check
+            in fullReport?.checks ?? const <DoctorIntegrityCheck>[]) {
+          writeError(
+            'Full scan ${check.id}: ${_doctorCheckStatusLabel(check.status)} — '
+            '${check.detail}',
+          );
+        }
+        for (final release in installed) {
+          final projectProblem = compatibilityReason(release);
+          if (projectProblem != null) {
+            writeError(
+              'Project compatibility for Flutter ${release.version}: '
+              '$projectProblem.',
+            );
+          }
+          for (final check
+              in fullIntegrityFor(release)?.checks ??
+                  const <DoctorIntegrityCheck>[]) {
+            writeError(
+              'Flutter ${release.version} ${check.id}: '
+              '${_doctorCheckStatusLabel(check.status)} — ${check.detail}',
+            );
+          }
+        }
+      }
+
+      final releaseJson = [
+        for (final release in installed)
+          () {
+            final fullRelease = fullIntegrityFor(release);
+            final integrity = fullRelease == null
+                ? release.needsRepair
+                      ? 'needs_repair'
+                      : 'basic_checks_passed'
+                : switch (fullRelease.integrity) {
+                    DoctorIntegrityStatus.basicChecksPassed =>
+                      'basic_checks_passed',
+                    DoctorIntegrityStatus.fullyVerified => 'fully_verified',
+                    DoctorIntegrityStatus.needsRepair => 'needs_repair',
+                    DoctorIntegrityStatus.incomplete => 'incomplete',
+                  };
+            return <String, Object?>{
+              'channel': release.channel,
+              'version': release.version,
+              'host': release.host,
+              'dart_version': release.dartVersion,
+              'integrity': integrity,
+              'compatibility': {
+                'status': compatibilityStatus(release),
+                if (compatibilityReason(release) != null)
+                  'reason': compatibilityReason(release),
+              },
+              'integrity_checks': fullRelease == null
+                  ? null
+                  : [
+                      for (final check in fullRelease.checks)
+                        integrityCheckJson(check),
+                    ],
+            };
+          }(),
+      ];
+      final selected = selectedRelease == null
+          ? null
+          : installed
+                .where((release) => release.version == selectedRelease)
+                .firstOrNull;
+      final selectionSourceCode = switch (selectionSource) {
+        'command-line --release override' => 'command_line_override',
+        'WREN_FLUTTER_RELEASE environment override' => 'environment_override',
+        'current project constraints' => 'project_constraints',
+        'global fallback' => 'global_fallback',
+        _ => 'none',
+      };
+      final selectedIntegrity = selected == null
+          ? null
+          : fullIntegrityFor(selected)?.integrity;
+      final selectedIntegrityLabel = selected == null
+          ? null
+          : selectedIntegrity == null
+          ? selected.needsRepair
+                ? 'needs_repair'
+                : 'basic_checks_passed'
+          : switch (selectedIntegrity) {
+              DoctorIntegrityStatus.basicChecksPassed => 'basic_checks_passed',
+              DoctorIntegrityStatus.fullyVerified => 'fully_verified',
+              DoctorIntegrityStatus.needsRepair => 'needs_repair',
+              DoctorIntegrityStatus.incomplete => 'incomplete',
+            };
+      final selectedCompatibility = selected == null
+          ? selectedRelease == null
+                ? 'not_applicable'
+                : 'not_installed'
+          : compatibilityStatus(selected);
+      final report = <String, Object?>{
+        'schema_version': 1,
+        'depth': fullRequested ? 'full' : 'quick',
+        'completion': completion,
+        'exit_status': exitStatus,
+        'has_critical_findings': hasCriticalFinding,
+        'setup': {
+          'has_critical_findings': setup.hasCritical,
+          'is_incomplete': setup.isIncomplete,
+          'checks': [for (final check in setup.checks) setupCheckJson(check)],
+        },
+        'project': {
+          'pubspec_present': project.pubspecExists,
+          'flutter_constraint': project.flutterText,
+          'dart_constraint': project.dartText,
+          'compatibility': !project.pubspecExists
+              ? 'not_applicable'
+              : project.problem == null
+              ? 'evaluated'
+              : 'unable_to_evaluate',
+          'compatible_release': compatibleProjectRelease,
+          if (project.problem != null) 'problem': project.problem,
+        },
+        'selection': {
+          'release': selectedRelease,
+          'source': selectionSourceCode,
+          'source_description': selectionSource,
+          'is_installed': selectedRelease == null ? null : selected != null,
+          'integrity': selectedIntegrityLabel,
+          'compatibility': selectedCompatibility,
+        },
+        'releases': releaseJson,
+        'scan_checks': [
+          for (final check
+              in fullReport?.checks ?? const <DoctorIntegrityCheck>[])
+            integrityCheckJson(check),
+        ],
+      };
+      cancellation.throwIfCancelled();
+      writeOut(jsonEncode(report));
+      return exitStatus;
+    }
+
+    cancellation.throwIfCancelled();
+
+    writeOut(
+      fullReport == null
+          ? 'Wren quick diagnosis (offline).'
+          : 'Wren full diagnosis (offline).',
+    );
+    writeOut('Setup:');
+    for (final check in setup.checks) {
+      final severity = switch (check.severity) {
+        DoctorCheckSeverity.ok => 'ok',
+        DoctorCheckSeverity.informational => 'informational',
+        DoctorCheckSeverity.critical => 'critical',
+        DoctorCheckSeverity.incomplete => 'incomplete',
+      };
+      writeOut('  ${check.component}: $severity — ${check.summary}');
+      if (check.nextStep != null) {
+        writeOut('    Next step: ${check.nextStep}');
+      }
+    }
+    writeOut(
+      '  Persistent shell startup and editor settings were not inspected or '
+      'changed.',
+    );
+    if (fullReport != null) {
+      for (final check in fullReport.checks) {
+        writeOut(
+          'Full scan ${check.id}: ${_doctorCheckStatusLabel(check.status)} — '
+          '${check.detail}',
+        );
+        if (check.nextStep != null) {
+          writeOut('  Next step: ${check.nextStep}');
+        }
+      }
+    }
+    if (installed.isEmpty) {
+      writeOut(
+        fullReport?.isIncomplete ?? false
+            ? 'No Flutter releases were confirmed by the incomplete full scan.'
+            : 'No Flutter releases are installed.',
+      );
+    } else {
+      writeOut('Installed Flutter releases:');
+      for (final release in installed) {
+        final fullRelease = fullIntegrityFor(release);
+        final readiness = fullRelease == null
+            ? release.needsRepair
+                  ? 'needs repair'
+                  : 'ready'
+            : _doctorIntegrityLabel(fullRelease.integrity);
+        final projectProblem = project.incompatibilityFor(release, targetHost);
+        final compatibility = !project.pubspecExists
+            ? 'not applicable'
+            : projectProblem == null
+            ? 'compatible'
+            : 'incompatible';
+        final dart = release.dartVersion == null
+            ? 'Dart unknown'
+            : 'Dart ${release.dartVersion}';
+        final reason = release.repairReason == null
+            ? ''
+            : ' — ${release.repairReason}';
+        writeOut(
+          '  Flutter ${release.version}  ${release.channel}  ${release.host}  '
+          '$dart  $readiness$reason; project: $compatibility',
+        );
+        if (fullRelease != null) {
+          for (final check in fullRelease.checks) {
+            if (check.status == DoctorCheckStatus.passed && !verbose) continue;
+            writeOut(
+              '    ${check.id}: ${_doctorCheckStatusLabel(check.status)} — '
+              '${check.detail}',
+            );
+            if (check.nextStep != null) {
+              writeOut('      Next step: ${check.nextStep}');
+            }
+          }
+        }
+        if (verbose) {
+          writeOut(
+            '    Quick readiness uses the same inexpensive checks as '
+            '`wren list` and SDK prelaunch.',
+          );
+          if (projectProblem != null) {
+            writeOut('    Project compatibility: $projectProblem.');
+          }
+        }
+        if (release.needsRepair && fullRelease == null) {
+          writeOut('    Next step: run `wren repair ${release.version}`.');
+        }
+      }
+    }
+
+    if (!project.pubspecExists) {
+      writeOut(
+        'Project compatibility: not applicable (no pubspec.yaml in the '
+        'current directory).',
+      );
+    } else if (project.problem != null) {
+      writeOut(
+        'Project compatibility could not be evaluated: ${project.problem}.',
+      );
+    } else if (compatibleProjectRelease == null) {
+      writeOut(
+        'No installed release satisfies the current project constraints.',
+      );
+    } else {
+      writeOut(
+        'Project-compatible release: Flutter $compatibleProjectRelease.',
+      );
+    }
+
+    if (selectedRelease == null) {
+      writeOut(
+        'Effective selection: none. Run `wren install <release>` and '
+        '`wren set <release>` to choose a release.',
+      );
+      return exitStatus;
+    }
+    writeOut(
+      'Effective selection: Flutter $selectedRelease '
+      '(source: $selectionSource).',
+    );
+    final selected = installed.where(
+      (release) => release.version == selectedRelease,
+    );
+    if (selected.isEmpty) {
+      writeOut(
+        'Finding: Flutter $selectedRelease is not installed; install it '
+        'before running SDK commands.',
+      );
+    } else {
+      final release = selected.first;
+      if (release.needsRepair) {
+        writeOut(
+          'Finding: the effective selection needs repair. Run '
+          '`wren repair $selectedRelease`.',
+        );
+      }
+      if (project.pubspecExists &&
+          project.incompatibilityFor(release, targetHost) != null) {
+        writeOut(
+          'Finding: the effective selection is incompatible with the current '
+          'project constraints (informational).',
+        );
+      }
+    }
+    if (commandLineRelease == null &&
+        normalizedEnvironmentRelease == null &&
+        compatibleProjectRelease == null &&
+        selectedRelease == fallback &&
+        project.pubspecExists) {
+      writeOut(
+        'Finding: the global fallback is used because no installed release '
+        'matches the current project (informational).',
+      );
+    }
+    return exitStatus;
+  }
+}
+
+String _doctorIntegrityLabel(DoctorIntegrityStatus status) => switch (status) {
+  DoctorIntegrityStatus.basicChecksPassed => 'basic checks passed',
+  DoctorIntegrityStatus.fullyVerified => 'fully verified',
+  DoctorIntegrityStatus.needsRepair => 'needs repair',
+  DoctorIntegrityStatus.incomplete => 'incomplete',
+};
+
+String _doctorCheckStatusLabel(DoctorCheckStatus status) => switch (status) {
+  DoctorCheckStatus.passed => 'passed',
+  DoctorCheckStatus.confirmedDamage => 'confirmed damage',
+  DoctorCheckStatus.incomplete => 'incomplete',
+};
 
 class _SetCommand extends WrenCommand {
   new(super.context) {
@@ -1415,6 +2124,7 @@ enum HostPlatform {
     catalogUrl: _linuxCatalog,
     catalogOs: 'linux',
     catalogArchitecture: 'x64',
+    nativeAssetName: 'linux-x64',
   ),
 
   /// macOS on Apple Silicon.
@@ -1423,6 +2133,7 @@ enum HostPlatform {
     catalogUrl: _macosCatalog,
     catalogOs: 'macos',
     catalogArchitecture: 'arm64',
+    nativeAssetName: 'macos-arm64',
   );
 
   /// Creates a host platform from catalog identifiers.
@@ -1431,6 +2142,7 @@ enum HostPlatform {
     required this.catalogUrl,
     required this.catalogOs,
     required this.catalogArchitecture,
+    required this.nativeAssetName,
   });
 
   /// User-facing host name.
@@ -1444,6 +2156,9 @@ enum HostPlatform {
 
   /// Architecture identifier used by the catalog.
   final String catalogArchitecture;
+
+  /// Host suffix used by Wren's standalone native release archives.
+  final String nativeAssetName;
 
   /// Detects the current supported host.
   static HostPlatform? get current {
