@@ -1445,6 +1445,117 @@ printf '\376\000\n' >&2
       },
     );
 
+    test('validates and repairs evidenced macOS optional artifacts', () async {
+      await _writeFixtureSdk(repositoryWorktree, host: HostPlatform.macosArm64);
+      await _git(repositoryWorktree.path, ['add', '.']);
+      await _git(repositoryWorktree.path, [
+        'commit',
+        '-m',
+        'macOS optional fixture',
+      ]);
+      await _git(repositoryWorktree.path, ['tag', '-f', _version]);
+      frameworkRevision = await _git(repositoryWorktree.path, [
+        'rev-parse',
+        'HEAD',
+      ]);
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      final stderr = StringBuffer();
+      expect(
+        await runWren(
+          ['install', _version],
+          catalogJson: _catalog(
+            frameworkRevision,
+            host: HostPlatform.macosArm64,
+          ),
+          host: HostPlatform.macosArm64,
+          installEnvironment: environment,
+          stderrSink: stderr,
+        ),
+        0,
+        reason: stderr.toString(),
+      );
+
+      final release = Directory(
+        p.join(dataDirectory.path, 'releases/stable-$_version-darwin-arm64'),
+      );
+      final optionalFile = File(
+        p.join(
+          release.path,
+          'bin/cache/artifacts/engine/ios-arm64/optional-target.bin',
+        ),
+      );
+      await optionalFile.parent.create(recursive: true);
+      await optionalFile.writeAsString('trusted ios payload\n');
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp'))
+          .writeAsString('$_engineRevision\n');
+      final releaseMarker = File(p.join(release.path, '.wren-release.json'));
+      final releaseData = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      releaseData['externalUse'] = true;
+      await releaseMarker.writeAsString(jsonEncode(releaseData));
+
+      Future<int> repair({Future<bool?> Function(String)? confirmation}) =>
+          runWren(
+            ['repair', _version],
+            host: HostPlatform.macosArm64,
+            installEnvironment: environment,
+            confirmation: confirmation,
+            stdoutSink: StringBuffer(),
+            stderrSink: StringBuffer(),
+          );
+
+      expect(await repair(), 0);
+      final fetchCount = File(p.join(dataDirectory.path, 'ios-fetch-count'));
+      expect(await fetchCount.readAsString(), 'x');
+      final trustedManifest = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      expect(
+        (trustedManifest['optionalArtifactInventories']!
+                as Map<String, Object?>)
+            .containsKey('ios'),
+        isTrue,
+      );
+      expect(await repair(), 0);
+      expect(await fetchCount.readAsString(), 'x');
+
+      await optionalFile.writeAsString('corrupted');
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp')).delete();
+      var askedToCloseEditors = false;
+      expect(
+        await repair(
+          confirmation: (_) async {
+            askedToCloseEditors = true;
+            return false;
+          },
+        ),
+        6,
+      );
+      expect(askedToCloseEditors, isTrue);
+      expect(await optionalFile.readAsString(), 'corrupted');
+      expect(await fetchCount.readAsString(), 'xx');
+
+      expect(await repair(confirmation: (_) async => true), 0);
+      expect(await optionalFile.readAsString(), 'trusted ios payload\n');
+      expect(await fetchCount.readAsString(), 'xxx');
+      expect(
+        File(p.join(release.path, 'bin/cache/android-sdk.stamp')).existsSync(),
+        isFalse,
+      );
+      await optionalFile.delete();
+      expect(await repair(confirmation: (_) async => true), 0);
+      expect(await optionalFile.readAsString(), 'trusted ios payload\n');
+      expect(await fetchCount.readAsString(), 'xxxx');
+      expect(
+        Directory(p.join(dataDirectory.path, 'staging')).listSync(),
+        isEmpty,
+      );
+    });
+
     test('rejects an Intel-only macOS catalog entry before staging', () async {
       final intelCatalog = jsonDecode(
         _catalog(frameworkRevision, host: HostPlatform.macosArm64),
@@ -1939,6 +2050,21 @@ Future<void> _writeFixtureSdk(
 #!/bin/sh
 set -eu
 if [ "\$1" = "precache" ]; then
+  if [ "\$2" = "--force" ]; then
+    case "\$3" in
+      --ios)
+        mkdir -p bin/cache/artifacts/engine/ios-arm64
+        printf 'trusted ios payload\\n' > bin/cache/artifacts/engine/ios-arm64/optional-target.bin
+        printf '$_engineRevision\\n' > bin/cache/ios-sdk.stamp
+        printf x >> ../../../ios-fetch-count
+        exit 0
+        ;;
+      --android|--linux|--windows|--fuchsia)
+        echo "fixture optional target not implemented: \$3" >&2
+        exit 18
+        ;;
+    esac
+  fi
   if [ "\$2" != "$precacheFlag" ] || [ "\$3" != "--web" ]; then
     echo "unexpected precache target: \$2 \$3" >&2
     exit 18
