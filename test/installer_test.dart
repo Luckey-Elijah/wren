@@ -2330,6 +2330,399 @@ printf '\376\000\n' >&2
       },
     );
 
+    test('validates and repairs evidenced macOS optional artifacts', () async {
+      await _writeFixtureSdk(repositoryWorktree, host: HostPlatform.macosArm64);
+      await _git(repositoryWorktree.path, ['add', '.']);
+      await _git(repositoryWorktree.path, [
+        'commit',
+        '-m',
+        'macOS optional fixture',
+      ]);
+      await _git(repositoryWorktree.path, ['tag', '-f', _version]);
+      frameworkRevision = await _git(repositoryWorktree.path, [
+        'rev-parse',
+        'HEAD',
+      ]);
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      final stderr = StringBuffer();
+      expect(
+        await runWren(
+          ['install', _version],
+          catalogJson: _catalog(
+            frameworkRevision,
+            host: HostPlatform.macosArm64,
+          ),
+          host: HostPlatform.macosArm64,
+          installEnvironment: environment,
+          stderrSink: stderr,
+        ),
+        0,
+        reason: stderr.toString(),
+      );
+
+      final release = Directory(
+        p.join(dataDirectory.path, 'releases/stable-$_version-darwin-arm64'),
+      );
+      final initialRepairError = StringBuffer();
+      expect(
+        await runWren(
+          ['repair', _version],
+          host: HostPlatform.macosArm64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: initialRepairError,
+        ),
+        0,
+        reason: initialRepairError.toString(),
+      );
+      expect(
+        File(p.join(dataDirectory.path, 'macos-fetch-count')).existsSync(),
+        isFalse,
+      );
+      final optionalFile = File(
+        p.join(
+          release.path,
+          'bin/cache/artifacts/engine/ios-arm64/optional-target.bin',
+        ),
+      );
+      await optionalFile.parent.create(recursive: true);
+      await optionalFile.writeAsString('trusted ios payload\n');
+      final optionalLink = Link(
+        p.join(optionalFile.parent.path, 'optional-framework-link'),
+      );
+      await optionalLink.create('optional-target.bin');
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp'))
+          .writeAsString('$_engineRevision\n');
+      final groupLocations = <String, String>{
+        'android': 'engine/android-arm64',
+        'macos': 'macos',
+        'linux': 'engine/linux-x64',
+        'fuchsia': 'fuchsia/sdk/core/mac-amd64',
+        'flutter_runner': 'flutter_runner',
+      };
+      for (final entry in groupLocations.entries) {
+        final payload = File(
+          p.join(
+            release.path,
+            'bin/cache/artifacts/${entry.value}/optional-target.bin',
+          ),
+        );
+        await payload.parent.create(recursive: true);
+        await payload.writeAsString('trusted ${entry.key} payload\n');
+        final stamp = switch (entry.key) {
+          'fuchsia' => 'fuchsia-mac.stamp',
+          'flutter_runner' => 'flutter_runner.stamp',
+          _ => '${entry.key}-sdk.stamp',
+        };
+        await File(p.join(release.path, 'bin/cache/$stamp'))
+            .writeAsString('$_engineRevision\n');
+        if (entry.key == 'android') {
+          await File(
+            p.join(
+              release.path,
+              'bin/cache/android-internal-build-artifacts.stamp',
+            ),
+          ).writeAsString('$_engineRevision\n');
+        }
+        if (entry.key == 'flutter_runner') {
+          final debugSymbols = Directory(
+            p.join(
+              release.path,
+              'bin/cache/artifacts/flutter_runner_debug_symbols',
+            ),
+          );
+          await debugSymbols.create(recursive: true);
+          await File(p.join(debugSymbols.path, 'optional-target.bin'))
+              .writeAsString('trusted flutter_runner payload\n');
+          await File(
+            p.join(
+              release.path,
+              'bin/cache/flutter_runner_debug_symbols.stamp',
+            ),
+          ).writeAsString('$_engineRevision\n');
+        }
+      }
+      final releaseMarker = File(p.join(release.path, '.wren-release.json'));
+      final releaseData = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      releaseData['externalUse'] = true;
+      await releaseMarker.writeAsString(jsonEncode(releaseData));
+
+      var lastRepairError = '';
+      Future<int> repair({Future<bool?> Function(String)? confirmation}) async {
+        final repairStderr = StringBuffer();
+        final status = await runWren(
+          ['repair', _version],
+          host: HostPlatform.macosArm64,
+          installEnvironment: environment,
+          confirmation: confirmation,
+          stdoutSink: StringBuffer(),
+          stderrSink: repairStderr,
+        );
+        lastRepairError = repairStderr.toString();
+        return status;
+      }
+
+      expect(await repair(), 0, reason: lastRepairError);
+      final fetchCount = File(p.join(dataDirectory.path, 'ios-fetch-count'));
+      expect(await fetchCount.readAsString(), 'x');
+      for (final group in groupLocations.keys) {
+        expect(
+          await File(p.join(dataDirectory.path, '$group-fetch-count'))
+              .readAsString(),
+          'x',
+        );
+      }
+      final trustedManifest = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      expect(
+        (trustedManifest['optionalArtifactGroups']! as Map<String, Object?>)
+            .keys,
+        containsAll(['ios', ...groupLocations.keys]),
+      );
+      expect(
+        (trustedManifest['optionalArtifactGroups']! as Map<String, Object?>)
+            .keys,
+        contains('macos'),
+      );
+      expect(
+        File(p.join(dataDirectory.path, 'macos-fetch-count')).existsSync(),
+        isTrue,
+      );
+      expect(await repair(), 0);
+      expect(await fetchCount.readAsString(), 'x');
+      expect(optionalLink.targetSync(), 'optional-target.bin');
+      for (final group in groupLocations.keys) {
+        expect(
+          await File(p.join(dataDirectory.path, '$group-fetch-count'))
+              .readAsString(),
+          'x',
+        );
+      }
+
+      await optionalFile.writeAsString('corrupted');
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp')).delete();
+      var askedToCloseEditors = false;
+      expect(
+        await repair(
+          confirmation: (_) async {
+            askedToCloseEditors = true;
+            return false;
+          },
+        ),
+        6,
+      );
+      expect(askedToCloseEditors, isTrue);
+      expect(await optionalFile.readAsString(), 'corrupted');
+      expect(await fetchCount.readAsString(), 'xx');
+      for (final group in groupLocations.keys) {
+        expect(
+          await File(p.join(dataDirectory.path, '$group-fetch-count'))
+              .readAsString(),
+          'x',
+        );
+      }
+
+      expect(
+        await repair(confirmation: (_) async => true),
+        0,
+        reason: lastRepairError,
+      );
+      expect(await optionalFile.readAsString(), 'trusted ios payload\n');
+      expect(await fetchCount.readAsString(), 'xxx');
+      for (final group in groupLocations.keys) {
+        expect(
+          await File(p.join(dataDirectory.path, '$group-fetch-count'))
+              .readAsString(),
+          'x',
+        );
+      }
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp'))
+          .writeAsString('corrupt stamp');
+      expect(
+        await repair(confirmation: (_) async => true),
+        0,
+        reason: lastRepairError,
+      );
+      expect(await fetchCount.readAsString(), 'xxxx');
+
+      await optionalFile.delete();
+      await optionalLink.delete();
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp')).delete();
+      final unrecordedManifest = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      (unrecordedManifest['optionalArtifactGroups']! as Map<String, Object?>)
+          .remove('ios');
+      await releaseMarker.writeAsString(jsonEncode(unrecordedManifest));
+      expect(await repair(), 0);
+      expect(await fetchCount.readAsString(), 'xxxx');
+
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp'))
+          .writeAsString('$_engineRevision\n');
+      expect(await repair(confirmation: (_) async => true), 0);
+      expect(await optionalFile.readAsString(), 'trusted ios payload\n');
+      expect(optionalLink.targetSync(), 'optional-target.bin');
+      expect(await fetchCount.readAsString(), 'xxxxx');
+      await optionalFile.delete();
+      await optionalLink.delete();
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp')).delete();
+      expect(await repair(confirmation: (_) async => true), 0);
+      expect(await optionalFile.readAsString(), 'trusted ios payload\n');
+      expect(optionalLink.targetSync(), 'optional-target.bin');
+      expect(await fetchCount.readAsString(), 'xxxxxx');
+      for (final group in groupLocations.keys) {
+        expect(
+          await File(p.join(dataDirectory.path, '$group-fetch-count'))
+              .readAsString(),
+          'x',
+        );
+      }
+
+      final androidFile = File(
+        p.join(
+          release.path,
+          'bin/cache/artifacts/engine/android-arm64/optional-target.bin',
+        ),
+      );
+      await optionalFile.writeAsString('damaged ios payload');
+      await androidFile.writeAsString('damaged android payload');
+      final manifestBeforeFailedRepair = await releaseMarker.readAsString();
+      final inventoryBeforeFailedRepair = (jsonDecode(
+        manifestBeforeFailedRepair,
+      ) as Map<String, Object?>)['optionalArtifactGroups'];
+      await File(p.join(dataDirectory.path, 'fail-android-precache')).create();
+      expect(await repair(confirmation: (_) async => true), 4);
+      expect(await optionalFile.readAsString(), 'damaged ios payload');
+      expect(await androidFile.readAsString(), 'damaged android payload');
+      final failedManifest = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      expect(
+        failedManifest['optionalArtifactGroups'],
+        inventoryBeforeFailedRepair,
+      );
+      expect(failedManifest['optionalArtifactsNeedRepair'], isTrue);
+      expect(await repair(confirmation: (_) async => true), 0);
+      expect(await optionalFile.readAsString(), 'trusted ios payload\n');
+      expect(await androidFile.readAsString(), 'trusted android payload\n');
+      expect(await fetchCount.readAsString(), 'xxxxxxxx');
+      expect(
+        await File(p.join(dataDirectory.path, 'android-fetch-count'))
+            .readAsString(),
+        'xx',
+      );
+
+      final invalidInventoryManifest = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      (invalidInventoryManifest['optionalArtifactGroups']!
+              as Map<String, Object?>)['ios'] =
+          <Object?>[];
+      await releaseMarker.writeAsString(jsonEncode(invalidInventoryManifest));
+      await optionalFile.delete();
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp')).delete();
+      expect(await repair(), 4);
+      expect(
+        lastRepairError,
+        contains('retained ios artifact inventory is invalid'),
+      );
+      expect(await fetchCount.readAsString(), 'xxxxxxxx');
+      expect(
+        Directory(p.join(dataDirectory.path, 'staging')).listSync(),
+        isEmpty,
+      );
+    });
+
+    test('uses Flutter 3.7 macOS optional artifact layout', () async {
+      const historicalVersion = '3.7.0';
+      const historicalDartVersion = '2.19.0';
+      await _writeFixtureSdk(
+        repositoryWorktree,
+        version: historicalVersion,
+        reportedDartVersion: historicalDartVersion,
+        runtimeDartVersion: historicalDartVersion,
+        host: HostPlatform.macosArm64,
+        legacyIosArchiveLayout: true,
+      );
+      await _git(repositoryWorktree.path, ['add', '.']);
+      await _git(repositoryWorktree.path, [
+        'commit',
+        '-m',
+        'Flutter 3.7 fixture',
+      ]);
+      await _git(repositoryWorktree.path, ['tag', historicalVersion]);
+      final historicalRevision = await _git(repositoryWorktree.path, [
+        'rev-parse',
+        'HEAD',
+      ]);
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      expect(
+        await runWren(
+          ['install', historicalVersion],
+          catalogJson: _catalog(
+            historicalRevision,
+            dartVersion: historicalDartVersion,
+            releaseVersion: historicalVersion,
+            host: HostPlatform.macosArm64,
+          ),
+          host: HostPlatform.macosArm64,
+          installEnvironment: environment,
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+
+      final release = Directory(
+        p.join(
+          dataDirectory.path,
+          'releases/stable-$historicalVersion-darwin-arm64',
+        ),
+      );
+      final optionalFile = File(
+        p.join(
+          release.path,
+          'bin/cache/artifacts/ios/Flutter.framework/optional-target.bin',
+        ),
+      );
+      await optionalFile.parent.create(recursive: true);
+      await optionalFile.writeAsString('trusted ios payload\n');
+      await File(p.join(release.path, 'bin/cache/ios-sdk.stamp'))
+          .writeAsString('$_engineRevision\n');
+      final repairStderr = StringBuffer();
+      expect(
+        await runWren(
+          ['repair', historicalVersion],
+          host: HostPlatform.macosArm64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: repairStderr,
+        ),
+        0,
+        reason: repairStderr.toString(),
+      );
+      final manifest = jsonDecode(
+        await File(p.join(release.path, '.wren-release.json')).readAsString(),
+      ) as Map<String, Object?>;
+      expect(
+        (manifest['optionalArtifactGroups']! as Map<String, Object?>)
+            .containsKey('ios'),
+        isTrue,
+      );
+      expect(
+        File(p.join(dataDirectory.path, 'ios-fetch-count')).existsSync(),
+        isTrue,
+      );
+    });
+
     test('rejects an Intel-only macOS catalog entry before staging', () async {
       final intelCatalog = jsonDecode(
         _catalog(frameworkRevision, host: HostPlatform.macosArm64),
@@ -2779,7 +3172,7 @@ printf '\376\000\n' >&2
         );
         expect(
           repairOutput.toString(),
-          contains('Validated optional artifacts'),
+          contains('Repaired optional artifacts'),
         );
         expect(
           File(p.join(dataDirectory.path, 'android-precache-ran')).existsSync(),
@@ -3173,6 +3566,7 @@ Future<void> _writeFixtureSdk(
   String? runtimeArchitecture,
   HostPlatform host = HostPlatform.linuxX64,
   bool omitMacReleaseArtifact = false,
+  bool legacyIosArchiveLayout = false,
 }) async {
   final isLinux = host == HostPlatform.linuxX64;
   final hostArtifactRoot = isLinux ? 'linux-x64' : 'darwin-arm64';
@@ -3184,6 +3578,7 @@ Future<void> _writeFixtureSdk(
       : 'darwin-arm64-release';
   final hostStamp = isLinux ? 'linux-sdk.stamp' : 'macos-sdk.stamp';
   final omitMacRelease = omitMacReleaseArtifact ? 'true' : 'false';
+  final legacyIos = legacyIosArchiveLayout ? 'true' : 'false';
   final dartHost =
       runtimeArchitecture ?? (isLinux ? 'linux_x64' : 'macos_arm64');
   final precacheFlag = isLinux ? '--linux' : '--macos';
@@ -3221,14 +3616,82 @@ if [ "\$1" = "precache" ]; then
     fi
     if [ "\$3" = "--android_internal_build" ]; then
       if [ "\$4" != "--no-universal" ]; then exit 18; fi
-      printf '$_engineRevision\n' > bin/cache/android-internal-build-artifacts.stamp
+      printf '$_engineRevision\\n' > bin/cache/android-internal-build-artifacts.stamp
     elif [ "\$3" != "--no-universal" ]; then
       exit 18
     fi
-    mkdir -p bin/cache/artifacts/engine/android-x64-profile/linux-x64
-    printf 'trusted Android engine\n' > bin/cache/artifacts/engine/android-x64-profile/linux-x64/optional-target.bin
-    printf '$_engineRevision\n' > bin/cache/android-sdk.stamp
+    if [ '$isLinux' = 'true' ]; then
+      target=engine/android-x64-profile/linux-x64
+      mkdir -p "bin/cache/artifacts/\$target"
+      printf 'trusted Android engine\\n' > "bin/cache/artifacts/\$target/optional-target.bin"
+    else
+      target=engine/android-arm64
+      mkdir -p "bin/cache/artifacts/\$target"
+      printf 'trusted android payload\\n' > "bin/cache/artifacts/\$target/optional-target.bin"
+    fi
+    printf '$_engineRevision\\n' > bin/cache/android-sdk.stamp
+    printf x >> ../../../android-fetch-count
     exit 0
+  fi
+  if [ "\$#" -ge 3 ] && [ "\$3" = "--no-universal" ]; then
+  group=''
+  case "\$2" in
+    --ios)
+      group=ios
+      if [ '$legacyIos' = 'true' ]; then target=ios/Flutter.framework; else target=engine/ios-arm64; fi
+      stamp=ios-sdk
+      ;;
+    --macos)
+      group=macos
+      target=macos
+      stamp=macos-sdk
+      ;;
+    --linux)
+      group=linux
+      target=engine/linux-x64
+      stamp=linux-sdk
+      ;;
+    --fuchsia)
+      group=fuchsia
+      if [ '$isLinux' = 'true' ]; then
+        target=fuchsia/sdk/core/linux-amd64
+        stamp=fuchsia-linux
+      else
+        target=fuchsia/sdk/core/mac-amd64
+        stamp=fuchsia-mac
+      fi
+      ;;
+    --flutter_runner)
+      group=flutter_runner
+      target=flutter_runner
+      stamp=flutter_runner
+      ;;
+  esac
+  if [ -n "\$group" ]; then
+    mkdir -p "bin/cache/artifacts/\$target"
+    printf "trusted \$group payload\\n" > "bin/cache/artifacts/\$target/optional-target.bin"
+    if [ "\$group" = "ios" ]; then
+      ln -s optional-target.bin "bin/cache/artifacts/\$target/optional-framework-link"
+    fi
+    printf '$_engineRevision\\n' > "bin/cache/\$stamp.stamp"
+    if [ "\$group" = "flutter_runner" ]; then
+      mkdir -p bin/cache/artifacts/flutter_runner_debug_symbols
+      printf "trusted \$group payload\\n" > bin/cache/artifacts/flutter_runner_debug_symbols/optional-target.bin
+      printf '$_engineRevision\\n' > bin/cache/flutter_runner_debug_symbols.stamp
+    fi
+    if [ "\$group" = "macos" ]; then
+      mkdir -p bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework
+      mkdir -p bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework
+      mkdir -p bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework/Info.plist
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework/Info.plist
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework/Info.plist
+      touch bin/cache/artifacts/engine/darwin-arm64/gen_snapshot
+      chmod +x bin/cache/artifacts/engine/darwin-arm64/gen_snapshot
+    fi
+    printf x >> "../../../\$group-fetch-count"
+    exit 0
+  fi
   fi
   if [ "\$2" != "$precacheFlag" ] || [ "\$3" != "--web" ]; then
     echo "unexpected precache target: \$2 \$3" >&2

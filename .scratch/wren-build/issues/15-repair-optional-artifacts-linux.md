@@ -16,4 +16,6 @@ Linux x86_64 repair validates and restores optional device or build-target artif
 - [x] Changed or missing group files are restored through a private stage under existing lease and editor-confirmation rules; unavailable trusted sources cannot be reported healthy.
 - [x] Tests cover historical Linux release families, stamp and file permutations, never-used groups, first-seen editor downloads, corruption, and untouched external Gradle/Maven caches.
 
-Verification: `tool/verify.sh` passed (formatting clean, analysis clean, 76 tests passed).
+## Implementation progress
+
+The Linux-host inventory uses Flutter's exact version-specific Android precache arguments and separate Fuchsia/Flutter runner footprints. Host Linux files remain in required-source validation. Tests cover Flutter 3.7 and 3.47 layouts, direct editor evidence, never-used groups, confirmation, corruption and complete deletion, plus external Gradle/Maven cache sentinels. After merging current `main`, `tool/verify.sh` passed formatting, analysis, and all 109 tests.
