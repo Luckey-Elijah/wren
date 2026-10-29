@@ -2366,6 +2366,22 @@ printf '\376\000\n' >&2
       final release = Directory(
         p.join(dataDirectory.path, 'releases/stable-$_version-darwin-arm64'),
       );
+      final initialRepairError = StringBuffer();
+      expect(
+        await runWren(
+          ['repair', _version],
+          host: HostPlatform.macosArm64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: initialRepairError,
+        ),
+        0,
+        reason: initialRepairError.toString(),
+      );
+      expect(
+        File(p.join(dataDirectory.path, 'macos-fetch-count')).existsSync(),
+        isFalse,
+      );
       final optionalFile = File(
         p.join(
           release.path,
@@ -2374,11 +2390,15 @@ printf '\376\000\n' >&2
       );
       await optionalFile.parent.create(recursive: true);
       await optionalFile.writeAsString('trusted ios payload\n');
+      final optionalLink = Link(
+        p.join(optionalFile.parent.path, 'optional-framework-link'),
+      );
+      await optionalLink.create('optional-target.bin');
       await File(p.join(release.path, 'bin/cache/ios-sdk.stamp'))
           .writeAsString('$_engineRevision\n');
       final groupLocations = <String, String>{
         'android': 'engine/android-arm64',
-        'macos': 'engine/darwin-arm64',
+        'macos': 'macos',
         'linux': 'engine/linux-x64',
         'fuchsia': 'fuchsia/sdk/core/mac-amd64',
         'flutter_runner': 'flutter_runner',
@@ -2465,8 +2485,18 @@ printf '\376\000\n' >&2
             .keys,
         containsAll(['ios', ...groupLocations.keys]),
       );
+      expect(
+        (trustedManifest['optionalArtifactGroups']! as Map<String, Object?>)
+            .keys,
+        contains('macos'),
+      );
+      expect(
+        File(p.join(dataDirectory.path, 'macos-fetch-count')).existsSync(),
+        isTrue,
+      );
       expect(await repair(), 0);
       expect(await fetchCount.readAsString(), 'x');
+      expect(optionalLink.targetSync(), 'optional-target.bin');
       for (final group in groupLocations.keys) {
         expect(
           await File(p.join(dataDirectory.path, '$group-fetch-count'))
@@ -2498,7 +2528,11 @@ printf '\376\000\n' >&2
         );
       }
 
-      expect(await repair(confirmation: (_) async => true), 0);
+      expect(
+        await repair(confirmation: (_) async => true),
+        0,
+        reason: lastRepairError,
+      );
       expect(await optionalFile.readAsString(), 'trusted ios payload\n');
       expect(await fetchCount.readAsString(), 'xxx');
       for (final group in groupLocations.keys) {
@@ -2510,10 +2544,15 @@ printf '\376\000\n' >&2
       }
       await File(p.join(release.path, 'bin/cache/ios-sdk.stamp'))
           .writeAsString('corrupt stamp');
-      expect(await repair(confirmation: (_) async => true), 0);
+      expect(
+        await repair(confirmation: (_) async => true),
+        0,
+        reason: lastRepairError,
+      );
       expect(await fetchCount.readAsString(), 'xxxx');
 
       await optionalFile.delete();
+      await optionalLink.delete();
       await File(p.join(release.path, 'bin/cache/ios-sdk.stamp')).delete();
       final unrecordedManifest = jsonDecode(
         await releaseMarker.readAsString(),
@@ -2528,11 +2567,14 @@ printf '\376\000\n' >&2
           .writeAsString('$_engineRevision\n');
       expect(await repair(confirmation: (_) async => true), 0);
       expect(await optionalFile.readAsString(), 'trusted ios payload\n');
+      expect(optionalLink.targetSync(), 'optional-target.bin');
       expect(await fetchCount.readAsString(), 'xxxxx');
       await optionalFile.delete();
+      await optionalLink.delete();
       await File(p.join(release.path, 'bin/cache/ios-sdk.stamp')).delete();
       expect(await repair(confirmation: (_) async => true), 0);
       expect(await optionalFile.readAsString(), 'trusted ios payload\n');
+      expect(optionalLink.targetSync(), 'optional-target.bin');
       expect(await fetchCount.readAsString(), 'xxxxxx');
       for (final group in groupLocations.keys) {
         expect(
@@ -2541,6 +2583,41 @@ printf '\376\000\n' >&2
           'x',
         );
       }
+
+      final androidFile = File(
+        p.join(
+          release.path,
+          'bin/cache/artifacts/engine/android-arm64/optional-target.bin',
+        ),
+      );
+      await optionalFile.writeAsString('damaged ios payload');
+      await androidFile.writeAsString('damaged android payload');
+      final manifestBeforeFailedRepair = await releaseMarker.readAsString();
+      final inventoryBeforeFailedRepair = (jsonDecode(
+        manifestBeforeFailedRepair,
+      ) as Map<String, Object?>)['optionalArtifactGroups'];
+      await File(p.join(dataDirectory.path, 'fail-android-precache')).create();
+      expect(await repair(confirmation: (_) async => true), 4);
+      expect(await optionalFile.readAsString(), 'damaged ios payload');
+      expect(await androidFile.readAsString(), 'damaged android payload');
+      final failedManifest = jsonDecode(
+        await releaseMarker.readAsString(),
+      ) as Map<String, Object?>;
+      expect(
+        failedManifest['optionalArtifactGroups'],
+        inventoryBeforeFailedRepair,
+      );
+      expect(failedManifest['optionalArtifactsNeedRepair'], isTrue);
+      expect(await repair(confirmation: (_) async => true), 0);
+      expect(await optionalFile.readAsString(), 'trusted ios payload\n');
+      expect(await androidFile.readAsString(), 'trusted android payload\n');
+      expect(await fetchCount.readAsString(), 'xxxxxxxx');
+      expect(
+        await File(p.join(dataDirectory.path, 'android-fetch-count'))
+            .readAsString(),
+        'xx',
+      );
+
       final invalidInventoryManifest = jsonDecode(
         await releaseMarker.readAsString(),
       ) as Map<String, Object?>;
@@ -2555,7 +2632,7 @@ printf '\376\000\n' >&2
         lastRepairError,
         contains('retained ios artifact inventory is invalid'),
       );
-      expect(await fetchCount.readAsString(), 'xxxxxx');
+      expect(await fetchCount.readAsString(), 'xxxxxxxx');
       expect(
         Directory(p.join(dataDirectory.path, 'staging')).listSync(),
         isEmpty,
@@ -3566,7 +3643,7 @@ if [ "\$1" = "precache" ]; then
       ;;
     --macos)
       group=macos
-      target=engine/darwin-arm64
+      target=macos
       stamp=macos-sdk
       ;;
     --linux)
@@ -3593,6 +3670,9 @@ if [ "\$1" = "precache" ]; then
   if [ -n "\$group" ]; then
     mkdir -p "bin/cache/artifacts/\$target"
     printf "trusted \$group payload\\n" > "bin/cache/artifacts/\$target/optional-target.bin"
+    if [ "\$group" = "ios" ]; then
+      ln -s optional-target.bin "bin/cache/artifacts/\$target/optional-framework-link"
+    fi
     printf '$_engineRevision\\n' > "bin/cache/\$stamp.stamp"
     if [ "\$group" = "flutter_runner" ]; then
       mkdir -p bin/cache/artifacts/flutter_runner_debug_symbols
