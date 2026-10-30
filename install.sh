@@ -40,13 +40,60 @@ newer_version() {
   ((10#$c > 10#$z))
 }
 
+stable_release_tags() {
+  awk '
+    function brace_delta(line, i, character, quoted, escaped, delta) {
+      quoted = 0
+      escaped = 0
+      delta = 0
+      for (i = 1; i <= length(line); i++) {
+        character = substr(line, i, 1)
+        if (quoted) {
+          if (escaped) escaped = 0
+          else if (character == "\\") escaped = 1
+          else if (character == "\"") quoted = 0
+        } else if (character == "\"") quoted = 1
+        else if (character == "{") delta++
+        else if (character == "}") delta--
+      }
+      return delta
+    }
+    {
+      if (depth == 1 && /"tag_name"[[:space:]]*:/) {
+        tag = $0
+        sub(/^[^:]*:[[:space:]]*"/, "", tag)
+        sub(/".*$/, "", tag)
+      }
+      if (depth == 1 && /"prerelease"[[:space:]]*:/) {
+        prerelease = $0
+        sub(/^[^:]*:[[:space:]]*/, "", prerelease)
+        sub(/[,[:space:]].*$/, "", prerelease)
+      }
+      if (depth == 1 && /"draft"[[:space:]]*:/) {
+        draft = $0
+        sub(/^[^:]*:[[:space:]]*/, "", draft)
+        sub(/[,[:space:]].*$/, "", draft)
+      }
+      change = brace_delta($0)
+      if (depth == 1 && depth + change == 0) {
+        if (prerelease == "false" && draft == "false" && tag != "") print tag
+        tag = ""
+        prerelease = ""
+        draft = ""
+      }
+      depth += change
+    }
+  '
+}
+
 printf 'Finding the highest stable Wren release...\n'
 latest=''
 for page in {1..20}; do
   response=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' "$api?per_page=100&page=$page") \
     || fail 'could not read Wren releases from GitHub.'
-  tags=$(printf '%s\n' "$response" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"wren-v\([^"]*\)".*/\1/p')
+  tags=$(printf '%s\n' "$response" | stable_release_tags | \
+    sed -n 's/^wren-v//p')
   [[ -n $tags ]] || break
   while IFS= read -r version; do
     [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
