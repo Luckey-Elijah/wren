@@ -812,7 +812,6 @@ class FlutterInstaller {
         checkTimeout: checkTimeout,
         cancellation: cancellation,
       ),
-      checkTimeout,
       nextStep: 'Run `wren repair $version`.',
       cancellation: cancellation,
     );
@@ -857,7 +856,6 @@ class FlutterInstaller {
             releaseVersion: version,
             checkTimeout: checkTimeout,
           ),
-          checkTimeout,
           nextStep: 'Run `wren repair $version`.',
           cancellation: cancellation,
         ),
@@ -884,7 +882,6 @@ class FlutterInstaller {
             host: host!,
             checkTimeout: checkTimeout,
           ),
-          checkTimeout,
           nextStep: 'Run `wren repair $version`.',
           cancellation: cancellation,
         ),
@@ -1015,14 +1012,15 @@ class FlutterInstaller {
   Future<DoctorIntegrityCheck> _runDoctorCheck(
     String id,
     String passedDetail,
-    Future<void> Function() validate,
-    Duration timeout, {
+    Future<void> Function() validate, {
     String? nextStep,
     DoctorCancellation? cancellation,
   }) async {
     _progress('Checking doctor integrity: $id');
     try {
-      final operation = validate().timeout(timeout);
+      // Each local read and process wait bounds its own idle time. A whole
+      // scan can take longer while files continue to be read successfully.
+      final operation = validate();
       if (cancellation == null) {
         await operation;
       } else {
@@ -1209,7 +1207,7 @@ class FlutterInstaller {
         'rev-parse',
         '--verify',
         'HEAD',
-      ], workingDirectory: workingDirectory);
+      ], workingDirectory: workingDirectory).timeout(checkTimeout);
     } on ProcessException {
       rethrow;
     }
@@ -1573,7 +1571,7 @@ class FlutterInstaller {
           id: 'optional-artifacts',
           status: DoctorCheckStatus.incomplete,
           detail:
-              'the Linux optional artifact inventory is unavailable: '
+              'the ${host.label} optional artifact inventory is unavailable: '
               '${error.message}',
           nextStep: 'Run `wren repair $version`.',
         ),
@@ -1631,7 +1629,6 @@ class FlutterInstaller {
             version: version,
             checkTimeout: checkTimeout,
           ),
-          checkTimeout,
           nextStep: 'Run `wren repair $version`.',
           cancellation: cancellation,
         ),
@@ -4382,8 +4379,14 @@ class FlutterInstaller {
     for (final entry in expectedStamps.entries) {
       final stamp = File(p.join(release.path, 'bin/cache', entry.key));
       if (FileSystemEntity.typeSync(stamp.path, followLinks: false) !=
-              FileSystemEntityType.file ||
-          await stamp.readAsString() != entry.value) {
+          FileSystemEntityType.file) {
+        return false;
+      }
+      final contents = stamp.readAsString();
+      if ((readTimeout == null
+              ? await contents
+              : await contents.timeout(readTimeout)) !=
+          entry.value) {
         return false;
       }
     }

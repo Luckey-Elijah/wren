@@ -293,7 +293,7 @@ class DoctorSetupInspector {
     }
     final variant = switch ((host, architecture)) {
       ('linux', 'x64') => 'linux-x64',
-      ('macos', 'arm64') => 'macos-arm64',
+      ('macos', 'arm64') => 'darwin-arm64',
       _ => null,
     };
     if (variant == null ||
