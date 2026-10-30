@@ -1099,6 +1099,66 @@ printf '\376\000\n' >&2
       },
     );
 
+    test('full doctor lets advancing scans outlast the idle timeout', () async {
+      final flutter = File(p.join(repositoryWorktree.path, 'bin/flutter'));
+      await flutter.writeAsString(
+        (await flutter.readAsString()).replaceFirst(
+          'mkdir -p bin/cache/dart-sdk/bin',
+          r'''
+  mkdir -p bin/cache/dart-sdk/bin
+  index=0
+  while [ "$index" -lt 64 ]; do
+    printf 'trusted source file' > "bin/cache/dart-sdk/scan-$index.txt"
+    index=$((index + 1))
+  done''',
+        ),
+      );
+      await _git(repositoryWorktree.path, ['add', '.']);
+      await _git(repositoryWorktree.path, [
+        'commit',
+        '-m',
+        'long scan fixture',
+      ]);
+      await _git(repositoryWorktree.path, ['tag', '-f', _version]);
+      final revision = await _git(repositoryWorktree.path, [
+        'rev-parse',
+        'HEAD',
+      ]);
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      expect(
+        await runWren(
+          ['install', _version],
+          catalogJson: _catalog(revision),
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: StringBuffer(),
+          stderrSink: StringBuffer(),
+        ),
+        0,
+      );
+      final output = StringBuffer();
+      final progress = _SlowDoctorProgressSink();
+      expect(
+        await runWren(
+          ['doctor', '--full', '--verbose'],
+          host: HostPlatform.linuxX64,
+          installEnvironment: environment,
+          stdoutSink: output,
+          stderrSink: progress,
+          fullDoctorCheckTimeout: const Duration(milliseconds: 250),
+        ),
+        0,
+        reason: '$output\n$progress',
+      );
+      expect(progress.delayedReports, greaterThanOrEqualTo(4));
+      expect(output.toString(), contains('retained-source: passed'));
+      expect(output.toString(), contains('fully verified'));
+      expect(output.toString(), isNot(contains('timed out')));
+    });
+
     test(
       'full doctor cancellation leaves unfinished releases unmarked',
       () async {
@@ -2446,6 +2506,72 @@ printf '\376\000\n' >&2
         }
       }
       final releaseMarker = File(p.join(release.path, '.wren-release.json'));
+      Future<String> doctor(int expectedStatus) async {
+        final output = StringBuffer();
+        final progress = StringBuffer();
+        final releaseBefore = await _snapshotTree(
+          Directory(p.join(release.path, 'bin')),
+        );
+        final sourcesBefore = await _snapshotTree(
+          Directory(p.join(dataDirectory.path, 'sources')),
+        );
+        final dataBefore = await _snapshotTree(dataDirectory);
+        var sdkLaunches = 0;
+        expect(
+          await runWren(
+            ['doctor', '--full', '--verbose'],
+            host: HostPlatform.macosArm64,
+            installEnvironment: environment,
+            stdoutSink: output,
+            stderrSink: progress,
+            sdkLauncher:
+                ({
+                  required release,
+                  required executable,
+                  required arguments,
+                }) async {
+                  sdkLaunches++;
+                  return 0;
+                },
+          ),
+          expectedStatus,
+          reason: '$output\n$progress',
+        );
+        expect(sdkLaunches, 0);
+        expect(progress.toString(), contains('Checking doctor integrity'));
+        expect(
+          await _snapshotTree(Directory(p.join(release.path, 'bin'))),
+          releaseBefore,
+        );
+        expect(
+          await _snapshotTree(Directory(p.join(dataDirectory.path, 'sources'))),
+          sourcesBefore,
+        );
+        final dataAfter = await _snapshotTree(dataDirectory);
+        final manifestPath = p.relative(
+          releaseMarker.path,
+          from: dataDirectory.path,
+        );
+        dataBefore.remove(manifestPath);
+        dataAfter.remove(manifestPath);
+        expect(dataAfter, dataBefore);
+        return output.toString();
+      }
+
+      final unverifiedManifest = await releaseMarker.readAsString();
+      final unverifiedDoctor = await doctor(4);
+      for (final group in ['ios', ...groupLocations.keys]) {
+        expect(
+          unverifiedDoctor,
+          contains('optional-artifacts-$group: incomplete'),
+        );
+      }
+      expect(unverifiedDoctor, contains('wren repair $_version'));
+      expect(await releaseMarker.readAsString(), unverifiedManifest);
+      expect(
+        File(p.join(dataDirectory.path, 'ios-fetch-count')).existsSync(),
+        isFalse,
+      );
       final releaseData = jsonDecode(
         await releaseMarker.readAsString(),
       ) as Map<String, Object?>;
@@ -2505,8 +2631,33 @@ printf '\376\000\n' >&2
         );
       }
 
+      final verifiedManifest = await releaseMarker.readAsString();
+      final verifiedDoctor = await doctor(0);
+      expect(verifiedDoctor, contains('fully verified'));
+      for (final check in [
+        'release-identity',
+        'retained-source',
+        'release-private-files',
+        for (final group in ['ios', ...groupLocations.keys])
+          'optional-artifacts-$group',
+      ]) {
+        expect(verifiedDoctor, contains('$check: passed'));
+      }
+      expect(await releaseMarker.readAsString(), verifiedManifest);
+
       await optionalFile.writeAsString('corrupted');
       await File(p.join(release.path, 'bin/cache/ios-sdk.stamp')).delete();
+      final damagedDoctor = await doctor(1);
+      expect(damagedDoctor, contains('needs repair'));
+      expect(
+        damagedDoctor,
+        contains('optional-artifacts-ios: confirmed damage'),
+      );
+      expect(
+        (jsonDecode(await releaseMarker.readAsString())
+            as Map<String, Object?>)['optionalArtifactsNeedRepair'],
+        isTrue,
+      );
       var askedToCloseEditors = false;
       expect(
         await repair(
@@ -2720,6 +2871,33 @@ printf '\376\000\n' >&2
       expect(
         File(p.join(dataDirectory.path, 'ios-fetch-count')).existsSync(),
         isTrue,
+      );
+      final sdkBeforeDoctor = await _snapshotTree(
+        Directory(p.join(release.path, 'bin')),
+      );
+      final fetchCount = File(p.join(dataDirectory.path, 'ios-fetch-count'));
+      final fetchesBeforeDoctor = await fetchCount.readAsString();
+      final doctorOutput = StringBuffer();
+      expect(
+        await runWren(
+          ['doctor', '--full', '--verbose'],
+          host: HostPlatform.macosArm64,
+          installEnvironment: environment,
+          stdoutSink: doctorOutput,
+          stderrSink: StringBuffer(),
+        ),
+        0,
+        reason: doctorOutput.toString(),
+      );
+      expect(doctorOutput.toString(), contains('fully verified'));
+      expect(
+        doctorOutput.toString(),
+        contains('optional-artifacts-ios: passed'),
+      );
+      expect(await fetchCount.readAsString(), fetchesBeforeDoctor);
+      expect(
+        await _snapshotTree(Directory(p.join(release.path, 'bin'))),
+        sdkBeforeDoctor,
       );
     });
 
@@ -3878,6 +4056,34 @@ Future<void> _waitForFile(File file) async {
     await Future<void>.delayed(const Duration(milliseconds: 10));
   }
   fail('Timed out waiting for ${file.path}.');
+}
+
+class _SlowDoctorProgressSink implements StringSink {
+  final StringBuffer _buffer = StringBuffer();
+  int delayedReports = 0;
+
+  @override
+  void write(Object? object) {
+    final text = object?.toString() ?? 'null';
+    _buffer.write(text);
+    if (text.startsWith('Hashed ') && text.contains('retained source files')) {
+      delayedReports++;
+      sleep(const Duration(milliseconds: 150));
+    }
+  }
+
+  @override
+  void writeAll(Iterable<dynamic> objects, [String separator = '']) =>
+      write(objects.join(separator));
+
+  @override
+  void writeCharCode(int charCode) => write(String.fromCharCode(charCode));
+
+  @override
+  void writeln([Object? object = '']) => write('${object ?? 'null'}\n');
+
+  @override
+  String toString() => _buffer.toString();
 }
 
 class _CancelOnDoctorIdentitySink implements StringSink {

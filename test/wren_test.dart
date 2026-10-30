@@ -1052,16 +1052,25 @@ environment:
     test(
       'SDK commands suggest set or install when no release is selected',
       () async {
+        final temporaryDirectory = await Directory.systemTemp.createTemp(
+          'wren-no-selection-',
+        );
+        addTearDown(() => temporaryDirectory.delete(recursive: true));
         final stderr = StringBuffer();
 
         final status = await runWren(
           ['flutter', '--version'],
           host: HostPlatform.linuxX64,
+          stdinStream: const Stream.empty(),
+          installEnvironment: InstallEnvironment(
+            dataDirectory: Directory(p.join(temporaryDirectory.path, 'data')),
+          ),
+          projectDirectory: temporaryDirectory,
           stdoutSink: StringBuffer(),
           stderrSink: stderr,
         );
 
-        expect(status, 3);
+        expect(status, 3, reason: stderr.toString());
         expect(
           stderr.toString(),
           contains('No installed Flutter release matches this project'),
@@ -1074,17 +1083,26 @@ environment:
     test(
       'missing exact CLI selection does not fall back to environment',
       () async {
+        final temporaryDirectory = await Directory.systemTemp.createTemp(
+          'wren-exact-selection-',
+        );
+        addTearDown(() => temporaryDirectory.delete(recursive: true));
         final stderr = StringBuffer();
 
         final status = await runWren(
           ['--release', '9.9.9', 'flutter', '--version'],
           flutterReleaseOverride: '3.47.8',
           host: HostPlatform.linuxX64,
+          stdinStream: const Stream.empty(),
+          installEnvironment: InstallEnvironment(
+            dataDirectory: Directory(p.join(temporaryDirectory.path, 'data')),
+          ),
+          projectDirectory: temporaryDirectory,
           stdoutSink: StringBuffer(),
           stderrSink: stderr,
         );
 
-        expect(status, 3);
+        expect(status, 3, reason: stderr.toString());
         expect(stderr.toString(), contains('Flutter 9.9.9 is not installed'));
       },
     );
