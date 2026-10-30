@@ -1104,11 +1104,12 @@ printf '\376\000\n' >&2
       await flutter.writeAsString(
         (await flutter.readAsString()).replaceFirst(
           'mkdir -p bin/cache/dart-sdk/bin',
-          '''mkdir -p bin/cache/dart-sdk/bin
+          r'''
+  mkdir -p bin/cache/dart-sdk/bin
   index=0
-  while [ "\$index" -lt 64 ]; do
-    printf 'trusted source file' > "bin/cache/dart-sdk/scan-\$index.txt"
-    index=\$((index + 1))
+  while [ "$index" -lt 64 ]; do
+    printf 'trusted source file' > "bin/cache/dart-sdk/scan-$index.txt"
+    index=$((index + 1))
   done''',
         ),
       );
@@ -4059,7 +4060,7 @@ Future<void> _waitForFile(File file) async {
 
 class _SlowDoctorProgressSink implements StringSink {
   final StringBuffer _buffer = StringBuffer();
-  var delayedReports = 0;
+  int delayedReports = 0;
 
   @override
   void write(Object? object) {
