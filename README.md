@@ -6,6 +6,17 @@ Wren supports Linux x86_64 and macOS on Apple Silicon.
 
 ## Install a release
 
+On Linux x86_64 or Apple Silicon macOS, install the highest stable release with
+the one-line installer:
+
+```sh
+curl -fsSL https://github.com/Luckey-Elijah/wren/releases/latest/download/install.sh | bash
+```
+
+It verifies the selected release archive and installs Wren in `~/.local/bin`.
+See the [one-line installer details](packaging/INSTALL.md#one-line-installer)
+for PATH guidance and safe replacement behavior.
+
 Wren release archives contain a standalone native executable, so a separate
 Dart SDK is not required. Download the archive for Linux x86_64 or Apple
 Silicon macOS from the project's GitHub Releases, verify its SHA-256 checksum,

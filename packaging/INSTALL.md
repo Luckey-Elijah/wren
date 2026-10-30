@@ -4,6 +4,28 @@ Wren is distributed as a standalone native executable. A separately installed
 Dart SDK is not required. Wren does require the system `git` command for
 installing Flutter releases.
 
+### One-line installer
+
+On Linux x86_64 or Apple Silicon macOS, install the highest stable Wren release
+with:
+
+```sh
+curl -fsSL https://github.com/Luckey-Elijah/wren/releases/latest/download/install.sh | bash
+```
+
+The release URL provides the version-independent installer. It queries GitHub's
+release API and selects the highest stable SemVer before downloading the matching
+host archive and checksum. It verifies the checksum, staged executable version,
+and `--help` output before installing to `~/.local/bin/wren`. It does not use
+`sudo`, change shell startup files, or install Git. Add `~/.local/bin` to `PATH`
+when prompted. Install Git separately before using Wren to install Flutter.
+
+The installer replaces only a recognized regular Wren executable. It refuses
+symbolic links and unknown files and preserves an existing executable until the
+new one passes its final checks.
+
+### Manual installation
+
 Choose the archive matching your host:
 
 - `wren-<version>-linux-x64.tar.gz` for Linux x86_64.
