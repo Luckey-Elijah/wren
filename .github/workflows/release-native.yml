@@ -46,6 +46,9 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
       - uses: actions/download-artifact@v4
         with:
           pattern: wren-*
