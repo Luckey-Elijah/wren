@@ -2333,6 +2333,208 @@ printf '\376\000\n' >&2
       },
     );
 
+    for (final releaseVersion in ['3.7.0', _version]) {
+      test(
+        'macOS $releaseVersion doctor JSON preserves diagnostic states',
+        () async {
+          final legacy = releaseVersion == '3.7.0';
+          final dartVersion = legacy ? '2.19.0' : _dartVersion;
+          await _writeFixtureSdk(
+            repositoryWorktree,
+            version: releaseVersion,
+            reportedDartVersion: dartVersion,
+            runtimeDartVersion: dartVersion,
+            host: HostPlatform.macosArm64,
+            legacyIosArchiveLayout: legacy,
+          );
+          await _git(repositoryWorktree.path, ['add', '.']);
+          await _git(repositoryWorktree.path, [
+            'commit',
+            '-m',
+            'macOS doctor JSON fixture',
+          ]);
+          await _git(repositoryWorktree.path, ['tag', '-f', releaseVersion]);
+          final revision = await _git(repositoryWorktree.path, [
+            'rev-parse',
+            'HEAD',
+          ]);
+          final environment = InstallEnvironment(
+            dataDirectory: dataDirectory,
+            flutterRepository: Uri.file(repositoryWorktree.path),
+          );
+          final installError = StringBuffer();
+          expect(
+            await runWren(
+              ['install', releaseVersion],
+              catalogJson: _catalog(
+                revision,
+                releaseVersion: releaseVersion,
+                dartVersion: dartVersion,
+                host: HostPlatform.macosArm64,
+              ),
+              host: HostPlatform.macosArm64,
+              installEnvironment: environment,
+              stdoutSink: StringBuffer(),
+              stderrSink: installError,
+            ),
+            0,
+            reason: installError.toString(),
+          );
+          final release = Directory(
+            p.join(
+              dataDirectory.path,
+              'releases/stable-$releaseVersion-darwin-arm64',
+            ),
+          );
+          final project = Directory(p.join(temp.path, 'project'));
+          await project.create();
+          await File(p.join(project.path, 'pubspec.yaml')).writeAsString('''
+environment:
+  flutter: ^$releaseVersion
+  sdk: ^$dartVersion
+''');
+
+          Future<Map<String, Object?>> diagnose({
+            required bool full,
+            required int expectedStatus,
+            required String integrity,
+            Map<String, String>? processEnvironment,
+          }) async {
+            final output = StringBuffer();
+            final errors = StringBuffer();
+            final status = await runWren(
+              ['doctor', if (full) '--full', '--json', '--verbose'],
+              host: HostPlatform.macosArm64,
+              installEnvironment: environment,
+              projectDirectory: project,
+              processEnvironment: processEnvironment,
+              stdoutSink: output,
+              stderrSink: errors,
+            );
+            expect(status, expectedStatus, reason: errors.toString());
+            expect(output.toString().trim().split('\n'), hasLength(1));
+            final report =
+                jsonDecode(output.toString()) as Map<String, Object?>;
+            expect(report['schema_version'], 1);
+            expect(report['depth'], full ? 'full' : 'quick');
+            expect(report['exit_status'], expectedStatus);
+            expect(
+              report['completion'],
+              expectedStatus == 4 ? 'incomplete' : 'complete',
+            );
+            final releaseReport =
+                (report['releases']! as List<Object?>).single!
+                    as Map<String, Object?>;
+            expect(releaseReport['host'], 'macos');
+            expect(releaseReport['integrity'], integrity);
+            expect(
+              (releaseReport['compatibility']!
+                  as Map<String, Object?>)['status'],
+              'compatible',
+            );
+            expect(
+              (report['project']! as Map<String, Object?>)['compatibility'],
+              'evaluated',
+            );
+            final selection = report['selection']! as Map<String, Object?>;
+            expect(selection['release'], releaseVersion);
+            expect(selection['source'], 'project_constraints');
+            expect(selection['integrity'], integrity);
+            expect(report['setup'], isA<Map<String, Object?>>());
+            expect(errors.toString(), contains('Setup Storage:'));
+            if (full) {
+              expect(errors.toString(), contains('Checking doctor integrity'));
+              expect(releaseReport['integrity_checks'], isNotEmpty);
+            } else {
+              expect(releaseReport['integrity_checks'], isNull);
+            }
+            return report;
+          }
+
+          await diagnose(
+            full: false,
+            expectedStatus: 0,
+            integrity: 'basic_checks_passed',
+          );
+          await File(p.join(release.path, 'bin/cache/ios-sdk.stamp'))
+              .writeAsString('$_engineRevision\n');
+          final incomplete = await diagnose(
+            full: true,
+            expectedStatus: 4,
+            integrity: 'incomplete',
+          );
+          expect(incomplete['has_critical_findings'], isFalse);
+          final incompleteRelease =
+              (incomplete['releases']! as List<Object?>).single!
+                  as Map<String, Object?>;
+          expect(
+            (incompleteRelease['integrity_checks']! as List<Object?>)
+                .cast<Map<String, Object?>>()
+                .singleWhere(
+                  (check) => check['id'] == 'optional-artifacts-ios',
+                ),
+            containsPair('status', 'incomplete'),
+          );
+          expect(
+            await runWren(
+              ['repair', releaseVersion],
+              host: HostPlatform.macosArm64,
+              installEnvironment: environment,
+              stdoutSink: StringBuffer(),
+              stderrSink: StringBuffer(),
+            ),
+            0,
+          );
+          final healthy = await diagnose(
+            full: true,
+            expectedStatus: 0,
+            integrity: 'fully_verified',
+          );
+          expect(healthy['has_critical_findings'], isFalse);
+
+          final optionalFile = File(
+            p.join(
+              release.path,
+              legacy
+                  ? 'bin/cache/artifacts/ios/Flutter.framework/optional-target.bin'
+                  : 'bin/cache/artifacts/engine/ios-arm64/optional-target.bin',
+            ),
+          );
+          await optionalFile.writeAsString('corrupt iOS payload\n');
+          final damaged = await diagnose(
+            full: true,
+            expectedStatus: 1,
+            integrity: 'needs_repair',
+          );
+          expect(damaged['has_critical_findings'], isTrue);
+          await diagnose(
+            full: false,
+            expectedStatus: 1,
+            integrity: 'needs_repair',
+          );
+
+          final slowGit = File(p.join(temp.path, 'slow-git/git'));
+          await slowGit.parent.create();
+          await slowGit.writeAsString('#!/bin/sh\nexec /bin/sleep 10\n');
+          expect(
+            (await Process.run('chmod', ['+x', slowGit.path])).exitCode,
+            0,
+          );
+          final partial = await diagnose(
+            full: false,
+            expectedStatus: 4,
+            integrity: 'needs_repair',
+            processEnvironment: {'PATH': slowGit.parent.path},
+          );
+          expect(partial['has_critical_findings'], isTrue);
+          expect(
+            partial['setup']! as Map<String, Object?>,
+            containsPair('is_incomplete', true),
+          );
+        },
+      );
+    }
+
     test(
       'failed macOS artifact validation publishes no installed release',
       () async {
