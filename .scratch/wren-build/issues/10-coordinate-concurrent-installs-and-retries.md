@@ -15,3 +15,5 @@ Several Wren processes can install releases safely at once: identical requests c
 - [x] Different releases sharing one source join a single source download; cancellation while waiting returns `6` without stopping the holder.
 - [x] Interrupted or failed stages remain invisible; retry discards the affected incomplete stage and starts from scratch.
 - [x] Controlled multi-process tests cover contention, joined work, cancellation, failure, and clean retry.
+
+Verification update: A macOS Actions run exposed a signal-registration race during a shared-source lock wait. The cancellation listener is now installed before the wait notification is printed. The focused multi-process cancellation test and `tool/verify.sh` pass.

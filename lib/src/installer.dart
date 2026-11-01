@@ -5498,12 +5498,12 @@ Future<Directory> _acquireLock(
         }
         if (!reportedWait) {
           reportedWait = true;
-          onWait?.call();
           if (cancellation != null) {
             cancellationSubscription = cancellation.listen((_) {
               if (!cancelled.isCompleted) cancelled.complete();
             });
           }
+          onWait?.call();
         }
         if (cancellationSubscription == null) {
           await Future<void>.delayed(const Duration(milliseconds: 100));
