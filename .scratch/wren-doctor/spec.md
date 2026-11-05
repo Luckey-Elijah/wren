@@ -54,7 +54,7 @@ Add bare **wren doctor** as an offline diagnostic command. Its default mode quic
 
 ## Implementation Decisions
 
-- The command surface for this spec is bare **wren doctor**, optionally with **--full**, **--json**, and the existing global **--verbose** option. **--full** controls scan depth; **--verbose** controls detail. A release argument is not defined here.
+- The command surface is **wren doctor [<release>]**, optionally with **--full**, **--json**, and the existing global **--verbose** option. **--full** controls scan depth; **--verbose** controls detail. The named-release extension follows the targeted diagnosis contract below.
 - Quick mode scans all registered installed releases using the same cheap readiness criteria as list and prelaunch. Those checks include recorded identity, source readiness metadata, required files and executable modes, the cache boundary, and stamp coherence. Passing them means basic checks passed, not fully verified.
 - Full mode scans all registered installed releases against the complete integrity criteria that repair can check using local evidence. It validates the release checkout, retained shared source, release-private host artifacts, and optional SDK artifact groups evidenced as present. It does not fetch a source or perform repair.
 - Optional group presence follows the version-aware repair inventory: a current or stale group stamp, distinctive group-owned files, or a retained Wren inventory record is evidence. A shared parent directory alone is not. If a present group lacks trusted local expected contents, full doctor reports incomplete and points to repair, which may establish and retain that evidence.
@@ -81,7 +81,6 @@ Add bare **wren doctor** as an offline diagnostic command. Its default mode quic
 
 ## Out of Scope
 
-- Targeted **wren doctor <release>** behavior; it was deferred to a separate design task.
 - Running Flutter or Dart as a health probe, contacting the release catalog, downloading artifacts, or automatically repairing files.
 - Persistent shell startup or editor settings validation or modification. Doctor reports only the current process's PATH and Wren-owned shim state.
 - A detailed prediction of repair steps. The actionable suggestion is the relevant repair command.
@@ -94,3 +93,42 @@ Add bare **wren doctor** as an offline diagnostic command. Its default mode quic
 - The accepted decision record is in the broader version-manager initiative's doctor decision. Its main specification defines the shared release, readiness, selection, and repair contracts.
 - The optional-artifact repair guarantee permits repair to obtain trusted validation data for a first-seen present group and retain it for later offline checks. Until that data exists, full doctor must report incomplete rather than fully verified.
 - The local repository guidance keeps this specification under the local scratch initiative. No external issue tracker or triage label is configured for this repository.
+
+## Targeted diagnosis contract
+
+Approved design for [GitHub #7](https://github.com/Luckey-Elijah/wren/issues/7).
+This section specifies future implementation. Bare doctor retains its existing behavior.
+
+### Release resolution
+
+- Accept zero or one positional argument. A supplied argument must be an exact canonical Flutter version, including a prerelease suffix when applicable. Reject ranges, channels, aliases, malformed versions, and extra arguments with usage status 2.
+- Resolve the version only against registered installations for the current supported host. Do not contact the catalog or install a missing release. A valid version absent from an inspectable registry is a usage error with status 2 and an instruction to run `wren list` or `wren install <release>`.
+- A registered damaged or unavailable release remains a valid target. Report its confirmed damage and repair guidance rather than rejecting it as an unknown version.
+- If registry access cannot establish whether the target exists, report an incomplete diagnosis with status 4. Preserve available setup findings. Do not misreport the target as uninstalled.
+- The positional target controls inspection only. Environment overrides, project constraints, and global fallback cannot replace it.
+
+### Inspection and context
+
+- Check Wren setup and the named release at the requested depth. Keep global setup checks, including registry and fallback validity. Inspect a retained source when the target depends on it.
+- Evaluate current-directory project compatibility for the target. Report the effective selection and its source using normal selection precedence across all installed releases. When another release is selected, describe it as context without adding its integrity scan to the target report.
+- `--full` uses the same local evidence, operation timeouts, optional-group rules, and confirmed-damage markers as bare full doctor. Missing trusted evidence remains incomplete.
+- Preserve shared-source safety propagation to every dependent release when damage is confirmed. Report affected dependent identities as consequences of the shared-source finding without claiming those releases received a full scan.
+- Remain offline. Do not launch SDKs, fetch artifacts, repair files, change constraints, or change the fallback. Only confirmed-damage safety markers may be persisted.
+
+### Output and statuses
+
+- Human output identifies the requested target and scan depth, then reports setup, target integrity, target compatibility, and normal effective selection.
+- JSON retains the existing dimensions and contains only the target in `releases`. Add a top-level `scope` object with `kind: "release"` and `requested_release: "<version>"`. Bare doctor emits `scope: {"kind": "all"}`. This additive metadata retains schema version 1. An unreadable registry produces an empty `releases` list and incomplete findings with the requested scope preserved.
+- Successful, critical, and incomplete diagnoses emit exactly one JSON document on stdout. Progress and verbose detail use stderr. Syntax and missing-target usage errors use the existing usage-error output, with no diagnosis document promised.
+- Preserve statuses: 0 for complete without critical findings, 1 for complete with critical findings, 4 for incomplete even with confirmed damage, 2 for usage, and 6 for cancellation. Never launch an SDK or return status 5. No selection or incompatibility alone remains informational.
+
+### Examples and implementation acceptance
+
+Given healthy installed releases 3.27.4 and 3.29.3, with a project selecting 3.29.3:
+
+- `wren doctor 3.27.4` checks setup and 3.27.4, reports compatibility and effective selection 3.29.3, and exits 0 when checks complete without critical findings.
+- `wren doctor 3.27.4 --full --json --verbose` emits one versioned document with release scope, one release entry, normal selection context, and stderr progress. An evidenced optional group without trusted contents makes it exit 4.
+- `wren doctor 3.29.3` reports confirmed target damage and exits 1 when diagnosis completes, with `wren repair 3.29.3` guidance.
+- `wren doctor 9.99.99` exits 2 when that version is absent from an inspectable registry. `wren doctor stable` and `wren doctor 3.27.4 3.29.3` also exit 2.
+
+Implementation must verify these examples through `runWren`, plus prerelease targets, a conflicting environment override, absent project and selection, unreadable registry, broken global fallback, cancellation, and mixed incomplete/confirmed damage. Snapshot non-target SDK payloads and count source/SDK launches to prove scan scope and offline behavior. Verify shared-source marker propagation separately from non-target payload scans. Existing bare-doctor tests must continue to pass.
