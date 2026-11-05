@@ -145,3 +145,9 @@ The `wren setup` PATH shims expect Wren to run as its own executable. Listing el
 ## Verify this checkout
 
 Run `tool/verify.sh` to check Dart formatting, analysis, and tests. To use a specific Dart SDK, set `DART_BIN` to its executable path.
+
+To check an extracted macOS release executable against real Flutter SDKs, run
+`python3 tool/smoke-macos.py /path/to/wren`. The check uses an isolated temporary
+store with Flutter 3.47.8 and 3.47.9, exercises targeted diagnosis and ordinary
+SDK commands, and prints the location of retained logs. It does not use your
+projects or existing Wren store.

@@ -158,6 +158,66 @@ environment:
     },
   );
 
+  test(
+    'stalled quick release check is incomplete without recording damage',
+    () async {
+      final record = File(
+        p.join(
+          data.path,
+          'releases/stable-3.27.4-darwin-arm64/.wren-release.json',
+        ),
+      );
+      await record.parent.create(recursive: true);
+      final engine = 'e' * 40;
+      final contents = jsonEncode({
+        'state': 'ready',
+        'channel': 'stable',
+        'version': '3.27.4',
+        'host': 'macos',
+        'architecture': 'arm64',
+        'canonicalDartVersion': '3.6.2',
+        'frameworkRevision': 'a' * 40,
+        'engineRevision': engine,
+        'sourceKey': '$engine-macos-arm64',
+      });
+      await record.writeAsString(contents);
+      await File(p.join(data.path, 'config.json'))
+          .writeAsString(jsonEncode({'globalFallback': '3.27.4'}));
+      final git = File(p.join(temp.path, 'tools/git'));
+      await git.parent.create();
+      await git.writeAsString(
+        '#!/bin/sh\nif [ "\$1" = "--version" ]; then echo "git version fixture"; exit 0; fi\nexec /bin/sleep 30\n',
+      );
+      await Process.run('chmod', ['+x', git.path]);
+      final process = await Process.start(
+        Platform.resolvedExecutable,
+        [p.absolute('bin/wren.dart'), 'doctor', '3.27.4', '--json'],
+        workingDirectory: project.path,
+        environment: {
+          'PATH': git.parent.path,
+          'WREN_DATA_DIR': data.path,
+          'WREN_FLUTTER_RELEASE': '',
+        },
+      );
+      final output = utf8.decoder.bind(process.stdout).join();
+      final errors = utf8.decoder.bind(process.stderr).join();
+      try {
+        final status = await process.exitCode.timeout(
+          const Duration(seconds: 8),
+        );
+        expect(status, 4, reason: await errors);
+        final report = jsonDecode(await output) as Map<String, Object?>;
+        expect(report['completion'], 'incomplete');
+        expect(report['has_critical_findings'], false);
+        expect(report['selection'], containsPair('integrity', isNull));
+        expect(await record.readAsString(), contents);
+      } finally {
+        process.kill(ProcessSignal.sigkill);
+      }
+    },
+    skip: !Platform.isMacOS,
+  );
+
   test('targeted cancellation returns 6 without a JSON diagnosis', () async {
     final (status, output, _) = await diagnose([
       'doctor',

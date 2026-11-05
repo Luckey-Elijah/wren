@@ -14,19 +14,94 @@ import 'package:wren/wren.dart' show FlutterRelease, HostPlatform;
 const _flutterGitUrl = 'https://github.com/flutter/flutter.git';
 const _engineRevisionPattern = r'^[a-fA-F0-9]{40}$';
 const _dartExecutable = 'bin/cache/dart-sdk/bin/dart';
+
+/// Required artifacts are selected from pinned Flutter source, including betas.
+class _ArtifactLayout {
+  const new({
+    required this.flutterGpu,
+    required this.engineCacheIdentity,
+    required this.framework,
+    required this.snapshot,
+  });
+
+  factory fromRecord(Map<String, Object?> record) {
+    final value = record['artifactLayout'];
+    if (value is! Map<String, Object?> ||
+        value['flutterGpu'] is! bool ||
+        value['engineCacheIdentity'] is! bool ||
+        !{
+          'FlutterMacOS.framework',
+          'FlutterMacOS.xcframework',
+        }.contains(value['framework']) ||
+        !{'gen_snapshot', 'gen_snapshot_arm64'}.contains(value['snapshot'])) {
+      throw const InstallException(
+        'required artifact layout metadata is invalid; '
+        'reinstall this development-release SDK.',
+      );
+    }
+    return _ArtifactLayout(
+      flutterGpu: value['flutterGpu']! as bool,
+      engineCacheIdentity: value['engineCacheIdentity']! as bool,
+      framework: value['framework']! as String,
+      snapshot: value['snapshot']! as String,
+    );
+  }
+
+  static Future<_ArtifactLayout> read(Directory checkout) async {
+    final cache = await File(
+      p.join(
+        checkout.path,
+        'packages/flutter_tools/lib/src/flutter_cache.dart',
+      ),
+    ).readAsString();
+    final artifacts = await File(
+      p.join(checkout.path, 'packages/flutter_tools/lib/src/artifacts.dart'),
+    ).readAsString();
+    final engineUpdater = File(
+      p.join(checkout.path, 'bin/internal/update_engine_version.sh'),
+    );
+    final engineSource = engineUpdater.existsSync()
+        ? await engineUpdater.readAsString()
+        : '';
+    return _ArtifactLayout(
+      engineCacheIdentity:
+          engineSource.contains('bin/cache/engine.stamp') &&
+          engineSource.contains('bin/cache/engine.realm'),
+      flutterGpu: cache.contains("'flutter_gpu'"),
+      framework: artifacts.contains('FlutterMacOS.xcframework')
+          ? 'FlutterMacOS.xcframework'
+          : 'FlutterMacOS.framework',
+      snapshot: artifacts.contains('gen_snapshot_arm64')
+          ? 'gen_snapshot_arm64'
+          : 'gen_snapshot',
+    );
+  }
+
+  final bool flutterGpu;
+  final bool engineCacheIdentity;
+  final String framework;
+  final String snapshot;
+  String get frameworkInfo => framework == 'FlutterMacOS.xcframework'
+      ? '$framework/Info.plist'
+      : '$framework/Resources/Info.plist';
+  Map<String, Object?> toJson() => {
+    'flutterGpu': flutterGpu,
+    'engineCacheIdentity': engineCacheIdentity,
+    'framework': framework,
+    'snapshot': snapshot,
+  };
+}
+
 const _commonRequiredDirectories = <String>[
   'bin/cache/artifacts/engine/common/flutter_patched_sdk',
   'bin/cache/artifacts/engine/common/flutter_patched_sdk_product',
   'bin/cache/flutter_web_sdk',
   'bin/cache/pkg/sky_engine',
-  'bin/cache/pkg/flutter_gpu',
 ];
 const _commonSourceStampFiles = <String>[
   'engine-dart-sdk.stamp',
-  'engine.stamp',
   'flutter_sdk.stamp',
   'flutter_web_sdk.stamp',
-  'engine.realm',
 ];
 const _dartRequiredFiles = <String>[_dartExecutable];
 const _linuxRequiredFiles = <String>[
@@ -37,53 +112,57 @@ const _linuxRequiredFiles = <String>[
   'bin/cache/artifacts/engine/linux-x64-release/flutter_linux/libflutter_linux_gtk.so',
 ];
 
-List<String> _requiredDirectories(HostPlatform host) => [
-  ..._commonRequiredDirectories,
-  if (host == HostPlatform.linuxX64)
-    'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux',
-  if (host == HostPlatform.linuxX64)
-    'bin/cache/artifacts/engine/linux-x64-release/flutter_linux',
-  if (host == HostPlatform.macosArm64)
-    'bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework',
-  if (host == HostPlatform.macosArm64)
-    'bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework',
-  if (host == HostPlatform.macosArm64)
-    'bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework',
-];
+List<String> _requiredDirectories(HostPlatform host, _ArtifactLayout layout) =>
+    [
+      ..._commonRequiredDirectories,
+      if (layout.flutterGpu) 'bin/cache/pkg/flutter_gpu',
+      if (host == HostPlatform.linuxX64)
+        'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux',
+      if (host == HostPlatform.linuxX64)
+        'bin/cache/artifacts/engine/linux-x64-release/flutter_linux',
+      if (host == HostPlatform.macosArm64)
+        'bin/cache/artifacts/engine/darwin-x64/${layout.framework}',
+      if (host == HostPlatform.macosArm64)
+        'bin/cache/artifacts/engine/darwin-x64-profile/${layout.framework}',
+      if (host == HostPlatform.macosArm64)
+        'bin/cache/artifacts/engine/darwin-x64-release/${layout.framework}',
+    ];
 
-List<String> _requiredFiles(HostPlatform host) => [
+List<String> _requiredFiles(HostPlatform host, _ArtifactLayout layout) => [
   ..._dartRequiredFiles,
   if (host == HostPlatform.linuxX64) ..._linuxRequiredFiles,
   if (host == HostPlatform.macosArm64) ...[
-    'bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64',
-    'bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework/Info.plist',
-    'bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework/Info.plist',
-    'bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework/Info.plist',
+    'bin/cache/artifacts/engine/darwin-x64/${layout.snapshot}',
+    'bin/cache/artifacts/engine/darwin-x64/${layout.frameworkInfo}',
+    'bin/cache/artifacts/engine/darwin-x64-profile/${layout.frameworkInfo}',
+    'bin/cache/artifacts/engine/darwin-x64-release/${layout.frameworkInfo}',
   ],
 ];
 
-List<String> _sourceStampFiles(HostPlatform host) => [
+List<String> _sourceStampFiles(HostPlatform host, _ArtifactLayout layout) => [
   ..._commonSourceStampFiles,
+  if (layout.engineCacheIdentity) ...['engine.stamp', 'engine.realm'],
   if (host == HostPlatform.linuxX64) 'linux-sdk.stamp' else 'macos-sdk.stamp',
 ];
 
-List<String> _sourceArtifactPaths(HostPlatform host) => [
-  'bin/cache/dart-sdk',
-  'bin/cache/artifacts/engine/common',
-  if (host == HostPlatform.linuxX64) ...[
-    'bin/cache/artifacts/engine/linux-x64',
-    'bin/cache/artifacts/engine/linux-x64-profile',
-    'bin/cache/artifacts/engine/linux-x64-release',
-  ],
-  if (host == HostPlatform.macosArm64) ...[
-    'bin/cache/artifacts/engine/darwin-x64',
-    'bin/cache/artifacts/engine/darwin-x64-profile',
-    'bin/cache/artifacts/engine/darwin-x64-release',
-  ],
-  'bin/cache/flutter_web_sdk',
-  'bin/cache/pkg/sky_engine',
-  'bin/cache/pkg/flutter_gpu',
-];
+List<String> _sourceArtifactPaths(HostPlatform host, _ArtifactLayout layout) =>
+    [
+      'bin/cache/dart-sdk',
+      'bin/cache/artifacts/engine/common',
+      if (host == HostPlatform.linuxX64) ...[
+        'bin/cache/artifacts/engine/linux-x64',
+        'bin/cache/artifacts/engine/linux-x64-profile',
+        'bin/cache/artifacts/engine/linux-x64-release',
+      ],
+      if (host == HostPlatform.macosArm64) ...[
+        'bin/cache/artifacts/engine/darwin-x64',
+        'bin/cache/artifacts/engine/darwin-x64-profile',
+        'bin/cache/artifacts/engine/darwin-x64-release',
+      ],
+      'bin/cache/flutter_web_sdk',
+      'bin/cache/pkg/sky_engine',
+      if (layout.flutterGpu) 'bin/cache/pkg/flutter_gpu',
+    ];
 
 String _archiveVariant(HostPlatform host) =>
     host == HostPlatform.linuxX64 ? 'linux-x64' : 'darwin-arm64';
@@ -606,6 +685,7 @@ class FlutterInstaller {
   Future<List<InstalledRelease>> listInstalled({
     ({String version, HostPlatform host})? target,
     DoctorCancellation? cancellation,
+    Duration? checkTimeout,
   }) async {
     cancellation?.throwIfCancelled();
     final releasesDirectory = Directory(
@@ -614,7 +694,11 @@ class FlutterInstaller {
     if (!releasesDirectory.existsSync()) return const [];
 
     final installed = <InstalledRelease>[];
-    await for (final entity in releasesDirectory.list(followLinks: false)) {
+    final entries = releasesDirectory.list(followLinks: false);
+    final bounded = checkTimeout == null
+        ? entries
+        : entries.timeout(checkTimeout);
+    await for (final entity in bounded) {
       cancellation?.throwIfCancelled();
       if (entity is! Directory ||
           FileSystemEntity.typeSync(entity.path, followLinks: false) !=
@@ -631,6 +715,7 @@ class FlutterInstaller {
         entity,
         releasesDirectory.parent,
         cancellation: cancellation,
+        checkTimeout: checkTimeout,
       );
       final result = cancellation == null
           ? await readiness
@@ -950,6 +1035,7 @@ class FlutterInstaller {
             engineRevision: engineRevision,
             host: host,
             releaseVersion: version,
+            layout: _ArtifactLayout.fromRecord(data),
             checkTimeout: checkTimeout,
           ),
           nextStep: 'Run `wren repair $version`.',
@@ -1363,6 +1449,7 @@ class FlutterInstaller {
 
   Future<void> _validateDoctorSource(
     Directory source, {
+    required _ArtifactLayout layout,
     required String engineRevision,
     required HostPlatform host,
     required String releaseVersion,
@@ -1408,8 +1495,9 @@ class FlutterInstaller {
         data['host'] != host.catalogOs ||
         data['architecture'] != host.catalogArchitecture ||
         data['archiveVariant'] != _archiveVariant(host) ||
+        jsonEncode(data['artifactLayout']) != jsonEncode(layout.toJson()) ||
         jsonEncode(data['artifacts']) !=
-            jsonEncode(_sourceArtifactPaths(host))) {
+            jsonEncode(_sourceArtifactPaths(host, layout))) {
       throw const _DoctorConfirmedDamage(
         'the retained shared artifact source identity or artifact list is '
         'incoherent.',
@@ -1426,12 +1514,12 @@ class FlutterInstaller {
         'the retained shared source has no trusted cache-stamp inventory.',
       );
     }
-    final stampFiles = _sourceStampFiles(host);
+    final stampFiles = _sourceStampFiles(host, layout);
     if (stamps.keys.any((stamp) => !stampFiles.contains(stamp)) ||
         stampFiles
             .where((stamp) => stamp != 'engine.realm')
             .any((stamp) => stamps[stamp] is! String) ||
-        stamps['engine.realm'] is! String) {
+        (layout.engineCacheIdentity && stamps['engine.realm'] is! String)) {
       throw const _DoctorEvidenceUnavailable(
         'the retained shared source has incomplete cache-stamp evidence.',
       );
@@ -1445,7 +1533,7 @@ class FlutterInstaller {
       }
     }
 
-    for (final artifact in _sourceArtifactPaths(host)) {
+    for (final artifact in _sourceArtifactPaths(host, layout)) {
       if (FileSystemEntity.typeSync(
             p.join(source.path, artifact),
             followLinks: false,
@@ -1456,7 +1544,7 @@ class FlutterInstaller {
         );
       }
     }
-    final missingArtifact = _readinessMissingArtifact(source.path, host);
+    final missingArtifact = _missingRequiredArtifact(source.path, host, layout);
     if (missingArtifact != null) {
       throw _DoctorConfirmedDamage(
         'retained shared source required artifact is missing: '
@@ -1465,7 +1553,7 @@ class FlutterInstaller {
     }
     for (final executable in [
       _dartExecutable,
-      ..._readinessHostExecutables(host),
+      ..._hostExecutables(host, layout),
     ]) {
       final file = File(p.join(source.path, executable));
       if ((file.statSync().mode & 0x49) == 0) {
@@ -1481,6 +1569,7 @@ class FlutterInstaller {
       actualInventory = await _sourceInventory(
         source,
         host,
+        layout,
         readTimeout: checkTimeout,
         onHashedFile: (_) {
           hashedFiles++;
@@ -1519,7 +1608,12 @@ class FlutterInstaller {
     required HostPlatform host,
     required Duration checkTimeout,
   }) async {
-    final missingArtifact = _readinessMissingArtifact(release.path, host);
+    final layout = _ArtifactLayout.fromRecord(releaseManifest);
+    final missingArtifact = _missingRequiredArtifact(
+      release.path,
+      host,
+      layout,
+    );
     if (missingArtifact != null) {
       throw _DoctorConfirmedDamage(
         'release-private required artifact is missing: $missingArtifact.',
@@ -1561,7 +1655,7 @@ class FlutterInstaller {
     for (final executable in [
       'bin/flutter',
       _dartExecutable,
-      ..._readinessHostExecutables(host),
+      ..._hostExecutables(host, layout),
     ]) {
       final file = File(p.join(release.path, executable));
       if (FileSystemEntity.typeSync(file.path, followLinks: false) !=
@@ -2291,6 +2385,7 @@ class FlutterInstaller {
         try {
           await _validateSource(
             source,
+            layout: _ArtifactLayout.fromRecord(releaseManifest),
             engineRevision: engineRevision,
             host: host,
           );
@@ -2437,6 +2532,7 @@ class FlutterInstaller {
           );
           await _validateSource(
             sourceStage,
+            layout: _ArtifactLayout.fromRecord(releaseManifest),
             engineRevision: engineRevision,
             host: host,
           );
@@ -2452,6 +2548,7 @@ class FlutterInstaller {
           // Recheck the published copy before discarding the damaged backup.
           await _validateSource(
             source,
+            layout: _ArtifactLayout.fromRecord(releaseManifest),
             engineRevision: engineRevision,
             host: host,
           );
@@ -3019,6 +3116,7 @@ class FlutterInstaller {
     Directory release,
     Directory root, {
     DoctorCancellation? cancellation,
+    Duration? checkTimeout,
   }) async {
     cancellation?.throwIfCancelled();
     final doctorSafetyMarker = File(
@@ -3045,7 +3143,12 @@ class FlutterInstaller {
     Map<String, Object?>? releaseData;
     var reason = 'release metadata is invalid';
     try {
-      final data = jsonDecode(await marker.readAsString());
+      final markerRead = marker.readAsString();
+      final data = jsonDecode(
+        checkTimeout == null
+            ? await markerRead
+            : await markerRead.timeout(checkTimeout),
+      );
       if (data is! Map<String, Object?>) {
         return _invalidRelease(release, 'release metadata is invalid');
       }
@@ -3081,14 +3184,30 @@ class FlutterInstaller {
             ['rev-parse', 'HEAD'],
             userMessage: 'could not read framework identity',
             cancellation: cancellation,
+            checkTimeout: checkTimeout,
           );
           if (actualFramework.toLowerCase() !=
               frameworkRevision.toLowerCase()) {
             reason = 'framework checkout does not match its recorded identity';
           } else {
-            final actualEngine = (await File(
+            final engineFile = File(
               p.join(release.path, 'bin/internal/engine.version'),
-            ).readAsString()).trim();
+            );
+            if (FileSystemEntity.typeSync(
+                  engineFile.path,
+                  followLinks: false,
+                ) !=
+                FileSystemEntityType.file) {
+              throw const InstallException(
+                'required engine revision file is missing or not regular',
+              );
+            }
+            final engineRead = engineFile.readAsString();
+            final actualEngine =
+                (checkTimeout == null
+                        ? await engineRead
+                        : await engineRead.timeout(checkTimeout))
+                    .trim();
             if (actualEngine.toLowerCase() != engineRevision.toLowerCase()) {
               reason = 'engine revision does not match its recorded identity';
             } else {
@@ -3103,6 +3222,7 @@ class FlutterInstaller {
                           data,
                           engineRevision,
                           host,
+                          checkTimeout: checkTimeout,
                         ) ??
                         '';
               if (reason.isEmpty &&
@@ -3118,6 +3238,11 @@ class FlutterInstaller {
       }
     } on InstallCancelledException {
       rethrow;
+    } on TimeoutException {
+      rethrow;
+    } on FileSystemException {
+      if (checkTimeout != null) rethrow;
+      reason = 'could not inspect installed release files';
     } on Object catch (error) {
       reason = 'could not validate installed release: $error';
     }
@@ -3165,21 +3290,28 @@ class FlutterInstaller {
     Directory source,
     Map<String, Object?> releaseData,
     String engineRevision,
-    HostPlatform host,
-  ) async {
-    final missing = _readinessMissingArtifact(release.path, host);
+    HostPlatform host, {
+    Duration? checkTimeout,
+  }) async {
+    final layout = _ArtifactLayout.fromRecord(releaseData);
+    final missing = _missingRequiredArtifact(release.path, host, layout);
     if (missing != null) return 'required artifact is missing: $missing';
     for (final executable in [
       'bin/flutter',
       _dartExecutable,
-      ..._readinessHostExecutables(host),
+      ..._hostExecutables(host, layout),
     ]) {
       final file = File(p.join(release.path, executable));
       if ((file.statSync().mode & 0x49) == 0) {
         return 'required executable is not runnable: $executable';
       }
     }
-    final stampReason = _stampReadinessReason(release, engineRevision, host);
+    final stampReason = _stampReadinessReason(
+      release,
+      engineRevision,
+      host,
+      layout,
+    );
     if (stampReason != null) return stampReason;
     final cache = Directory(p.join(release.path, 'bin/cache'));
     final sourcesPath = p.join(
@@ -3207,7 +3339,12 @@ class FlutterInstaller {
       return 'shared artifact source is missing';
     }
     try {
-      final metadata = jsonDecode(await sourceMarker.readAsString());
+      final sourceRead = sourceMarker.readAsString();
+      final metadata = jsonDecode(
+        checkTimeout == null
+            ? await sourceRead
+            : await sourceRead.timeout(checkTimeout),
+      );
       if (metadata is! Map<String, Object?> ||
           metadata['state'] != 'ready' ||
           metadata['engineRevision'] != engineRevision ||
@@ -3215,22 +3352,22 @@ class FlutterInstaller {
           metadata['architecture'] != host.catalogArchitecture ||
           metadata['archiveVariant'] != _readinessVariant(host) ||
           jsonEncode(metadata['artifacts']) !=
-              jsonEncode(_readinessSourceArtifacts(host)) ||
+              jsonEncode(_sourceArtifactPaths(host, layout)) ||
           !_hasValidSourceInventory(metadata['inventory'])) {
         return 'shared artifact source metadata is incoherent';
       }
-      for (final path in _readinessSourceArtifacts(host)) {
+      for (final path in _sourceArtifactPaths(host, layout)) {
         if (!Directory(p.join(source.path, path)).existsSync()) {
           return 'shared artifact source is missing: $path';
         }
       }
-      final sourceMissing = _readinessMissingArtifact(source.path, host);
+      final sourceMissing = _missingRequiredArtifact(source.path, host, layout);
       if (sourceMissing != null) {
         return 'shared artifact source is missing: $sourceMissing';
       }
       for (final executable in [
         _dartExecutable,
-        ..._readinessHostExecutables(host),
+        ..._hostExecutables(host, layout),
       ]) {
         final file = File(p.join(source.path, executable));
         if ((file.statSync().mode & 0x49) == 0) {
@@ -3239,12 +3376,12 @@ class FlutterInstaller {
         }
       }
       final stamps = metadata['stamps'];
-      final stampFiles = _readinessStampFiles(host);
+      final stampFiles = _sourceStampFiles(host, layout);
       if (stamps is! Map<String, Object?> ||
           stampFiles
               .where((path) => path != 'engine.realm')
               .any((path) => '${stamps[path]}'.trim() != engineRevision) ||
-          stamps['engine.realm'] == null) {
+          (layout.engineCacheIdentity && stamps['engine.realm'] == null)) {
         return 'shared artifact source stamps are incoherent';
       }
       for (final stamp in stampFiles) {
@@ -3253,6 +3390,11 @@ class FlutterInstaller {
           return 'release cache stamps do not match shared source metadata';
         }
       }
+    } on TimeoutException {
+      rethrow;
+    } on FileSystemException {
+      if (checkTimeout != null) rethrow;
+      return 'shared artifact source metadata is unreadable';
     } on Object {
       return 'shared artifact source metadata is invalid';
     }
@@ -3267,8 +3409,9 @@ class FlutterInstaller {
     Directory release,
     String engineRevision,
     HostPlatform host,
+    _ArtifactLayout layout,
   ) {
-    for (final stamp in _readinessStampFiles(host)) {
+    for (final stamp in _sourceStampFiles(host, layout)) {
       final file = File(p.join(release.path, 'bin/cache', stamp));
       if (!file.existsSync()) return 'Flutter cache stamp is missing: $stamp';
       if (stamp != 'engine.realm' &&
@@ -3291,89 +3434,6 @@ class FlutterInstaller {
 
   String _readinessVariant(HostPlatform host) =>
       host == HostPlatform.linuxX64 ? 'linux-x64' : 'darwin-arm64';
-
-  List<String> _readinessStampFiles(HostPlatform host) => [
-    'engine-dart-sdk.stamp',
-    'engine.stamp',
-    'flutter_sdk.stamp',
-    if (host == HostPlatform.linuxX64) 'linux-sdk.stamp',
-    if (host == HostPlatform.macosArm64) 'macos-sdk.stamp',
-    'flutter_web_sdk.stamp',
-    'engine.realm',
-  ];
-
-  List<String> _readinessSourceArtifacts(HostPlatform host) => [
-    'bin/cache/dart-sdk',
-    'bin/cache/artifacts/engine/common',
-    if (host == HostPlatform.linuxX64) ...[
-      'bin/cache/artifacts/engine/linux-x64',
-      'bin/cache/artifacts/engine/linux-x64-profile',
-      'bin/cache/artifacts/engine/linux-x64-release',
-    ],
-    if (host == HostPlatform.macosArm64) ...[
-      'bin/cache/artifacts/engine/darwin-x64',
-      'bin/cache/artifacts/engine/darwin-x64-profile',
-      'bin/cache/artifacts/engine/darwin-x64-release',
-    ],
-    'bin/cache/flutter_web_sdk',
-    'bin/cache/pkg/sky_engine',
-    'bin/cache/pkg/flutter_gpu',
-  ];
-
-  List<String> _readinessHostExecutables(HostPlatform host) =>
-      host == HostPlatform.linuxX64
-      ? const [
-          'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
-          'bin/cache/artifacts/engine/linux-x64/flutter_tester',
-        ]
-      : const ['bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64'];
-
-  String? _readinessMissingArtifact(String rootPath, HostPlatform host) {
-    final directories = <String>[
-      'bin/cache/artifacts/engine/common/flutter_patched_sdk',
-      'bin/cache/artifacts/engine/common/flutter_patched_sdk_product',
-      'bin/cache/flutter_web_sdk',
-      'bin/cache/pkg/sky_engine',
-      'bin/cache/pkg/flutter_gpu',
-      if (host == HostPlatform.linuxX64)
-        'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux',
-      if (host == HostPlatform.linuxX64)
-        'bin/cache/artifacts/engine/linux-x64-release/flutter_linux',
-      if (host == HostPlatform.macosArm64)
-        'bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework',
-      if (host == HostPlatform.macosArm64) 'bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework',
-      if (host == HostPlatform.macosArm64) 'bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework',
-    ];
-    final files = <String>[
-      _dartExecutable,
-      if (host == HostPlatform.linuxX64) ...[
-        'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
-        'bin/cache/artifacts/engine/linux-x64/flutter_tester',
-        'bin/cache/artifacts/engine/linux-x64/libflutter_linux_gtk.so',
-        'bin/cache/artifacts/engine/linux-x64-profile/flutter_linux/libflutter_linux_gtk.so',
-        'bin/cache/artifacts/engine/linux-x64-release/flutter_linux/libflutter_linux_gtk.so',
-      ],
-      if (host == HostPlatform.macosArm64) ...[
-        'bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64',
-        'bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework/Info.plist',
-        'bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework/Info.plist',
-        'bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework/Info.plist',
-      ],
-    ];
-    for (final path in directories) {
-      if (FileSystemEntity.typeSync(p.join(rootPath, path)) !=
-          FileSystemEntityType.directory) {
-        return path;
-      }
-    }
-    for (final path in files) {
-      if (FileSystemEntity.typeSync(p.join(rootPath, path)) !=
-          FileSystemEntityType.file) {
-        return path;
-      }
-    }
-    return null;
-  }
 
   bool _hasValidSourceInventory(Object? value) {
     if (value is! List<Object?>) return false;
@@ -3519,6 +3579,7 @@ class FlutterInstaller {
             'revision.',
           );
         }
+        final layout = await _ArtifactLayout.read(checkoutStage);
         final resolvedSourceKey = _sourceKey(engineRevision, host);
         final resolvedSourcePath = p.join(
           root.path,
@@ -3536,6 +3597,7 @@ class FlutterInstaller {
         if (sourceDirectory.existsSync()) {
           await _validateSource(
             sourceDirectory,
+            layout: layout,
             engineRevision: engineRevision,
             host: host,
           );
@@ -3622,6 +3684,7 @@ class FlutterInstaller {
           'canonicalDartVersion': release.dartVersion,
           'archive': release.archive,
           'archiveSha256': release.archiveSha256,
+          'artifactLayout': layout.toJson(),
           'sourceKey': resolvedSourceKey,
           'checkoutFiles': await _checkoutFileRecords(Directory(releasePath)),
           'state': 'ready',
@@ -3741,7 +3804,12 @@ class FlutterInstaller {
     required String engineRevision,
     required HostPlatform host,
   }) async {
-    final missingArtifact = _missingRequiredArtifact(checkout.path, host);
+    final layout = await _ArtifactLayout.read(checkout);
+    final missingArtifact = _missingRequiredArtifact(
+      checkout.path,
+      host,
+      layout,
+    );
     if (missingArtifact != null) {
       throw InstallException(
         'required Flutter artifact is missing: $missingArtifact.',
@@ -3752,7 +3820,7 @@ class FlutterInstaller {
     final dartExecutable = File(p.join(checkout.path, _dartExecutable));
     _requireExecutable(flutterExecutable, 'Flutter');
     _requireExecutable(dartExecutable, 'Dart');
-    for (final artifact in _hostExecutables(host)) {
+    for (final artifact in _hostExecutables(host, layout)) {
       _requireExecutable(File(p.join(checkout.path, artifact)), artifact);
     }
 
@@ -3829,6 +3897,7 @@ class FlutterInstaller {
     try {
       final data =
           jsonDecode(await marker.readAsString()) as Map<String, Object?>;
+      final layout = _ArtifactLayout.fromRecord(data);
       if (data['state'] != 'ready' ||
           data['channel'] != release.channel ||
           data['version'] != release.version ||
@@ -3837,7 +3906,7 @@ class FlutterInstaller {
           data['architecture'] != host.catalogArchitecture) {
         return _ExistingInstall.damaged;
       }
-      if (_missingRequiredArtifact(releasePath, host) != null) {
+      if (_missingRequiredArtifact(releasePath, host, layout) != null) {
         return _ExistingInstall.damaged;
       }
       return _ExistingInstall.healthy;
@@ -3852,11 +3921,12 @@ class FlutterInstaller {
     required String engineRevision,
     required HostPlatform host,
   }) async {
+    final layout = await _ArtifactLayout.read(checkout);
     await sourceStage.create(recursive: true);
     // Keep immutable artifact payloads in the source; stamps, tool snapshots,
     // downloads, and other mutable cache state stay in the release checkout.
-    final artifactPaths = _sourceArtifactPaths(host);
-    final stampFiles = _sourceStampFiles(host);
+    final artifactPaths = _sourceArtifactPaths(host, layout);
+    final stampFiles = _sourceStampFiles(host, layout);
     for (final relativePath in artifactPaths) {
       final source = Directory(p.join(checkout.path, relativePath));
       if (!source.existsSync()) {
@@ -3893,7 +3963,7 @@ class FlutterInstaller {
         );
       }
     }
-    if (stamps['engine.realm'] == null) {
+    if ((layout.engineCacheIdentity && stamps['engine.realm'] == null)) {
       throw const InstallException('Flutter cache is missing engine.realm.');
     }
     await _publishManifest(sourceStage.path, {
@@ -3903,14 +3973,16 @@ class FlutterInstaller {
       'architecture': host.catalogArchitecture,
       'archiveVariant': _archiveVariant(host),
       'artifacts': artifactPaths,
+      'artifactLayout': layout.toJson(),
       'stamps': stamps,
-      'inventory': await _sourceInventory(sourceStage, host),
+      'inventory': await _sourceInventory(sourceStage, host, layout),
       'state': 'ready',
     }, filename: '.wren-source.json');
   }
 
   Future<void> _validateSource(
     Directory source, {
+    required _ArtifactLayout layout,
     required String engineRevision,
     required HostPlatform host,
   }) async {
@@ -3927,8 +3999,8 @@ class FlutterInstaller {
         'the retained host artifact source record is missing or not regular.',
       );
     }
-    final artifactPaths = _sourceArtifactPaths(host);
-    final stampFiles = _sourceStampFiles(host);
+    final artifactPaths = _sourceArtifactPaths(host, layout);
+    final stampFiles = _sourceStampFiles(host, layout);
     try {
       final data =
           jsonDecode(await marker.readAsString()) as Map<String, Object?>;
@@ -3937,6 +4009,7 @@ class FlutterInstaller {
           data['host'] != host.catalogOs ||
           data['architecture'] != host.catalogArchitecture ||
           data['archiveVariant'] != _archiveVariant(host) ||
+          jsonEncode(data['artifactLayout']) != jsonEncode(layout.toJson()) ||
           jsonEncode(data['artifacts']) != jsonEncode(artifactPaths)) {
         throw const InstallException(
           'the retained host artifact source is damaged.',
@@ -3949,7 +4022,11 @@ class FlutterInstaller {
           );
         }
       }
-      final missingArtifact = _readinessMissingArtifact(source.path, host);
+      final missingArtifact = _missingRequiredArtifact(
+        source.path,
+        host,
+        layout,
+      );
       if (missingArtifact != null) {
         throw InstallException(
           'the retained host artifact source is missing: $missingArtifact.',
@@ -3957,7 +4034,7 @@ class FlutterInstaller {
       }
       for (final executable in [
         _dartExecutable,
-        ..._readinessHostExecutables(host),
+        ..._hostExecutables(host, layout),
       ]) {
         final file = File(p.join(source.path, executable));
         if ((file.statSync().mode & 0x49) == 0) {
@@ -3968,7 +4045,7 @@ class FlutterInstaller {
         }
       }
       if (jsonEncode(data['inventory']) !=
-          jsonEncode(await _sourceInventory(source, host))) {
+          jsonEncode(await _sourceInventory(source, host, layout))) {
         throw const InstallException(
           'the retained host artifact source is damaged.',
         );
@@ -3982,7 +4059,7 @@ class FlutterInstaller {
           stampFiles
               .where((path) => path != 'engine.realm')
               .any((path) => '${stamps[path]}'.trim() != engineRevision) ||
-          stamps['engine.realm'] == null) {
+          (layout.engineCacheIdentity && stamps['engine.realm'] == null)) {
         throw const InstallException(
           'the retained host artifact source is damaged.',
         );
@@ -4004,7 +4081,8 @@ class FlutterInstaller {
     final data = jsonDecode(
       await File(p.join(source.path, '.wren-source.json')).readAsString(),
     ) as Map<String, Object?>;
-    for (final relativePath in _sourceArtifactPaths(host)) {
+    final layout = _ArtifactLayout.fromRecord(data);
+    for (final relativePath in _sourceArtifactPaths(host, layout)) {
       final destination = Directory(p.join(checkout.path, relativePath));
       if (destination.existsSync()) await destination.delete(recursive: true);
       await _copyTree(
@@ -4966,7 +5044,10 @@ class FlutterInstaller {
     );
     final checkoutModes = _readReleaseCheckoutModes(releaseManifest);
     final changed = <String>[];
-    final privateRoot = await release.resolveSymbolicLinks();
+    final rootResolution = release.resolveSymbolicLinks();
+    final privateRoot = readTimeout == null
+        ? await rootResolution
+        : await rootResolution.timeout(readTimeout);
     for (final entry in expected.entries) {
       final path = entry.key;
       final sourceFile = File(p.join(source.path, path));
@@ -4976,7 +5057,11 @@ class FlutterInstaller {
         continue;
       }
       final releaseFile = File(releasePath);
-      if (!p.isWithin(privateRoot, await releaseFile.resolveSymbolicLinks())) {
+      final resolution = releaseFile.resolveSymbolicLinks();
+      final resolved = readTimeout == null
+          ? await resolution
+          : await resolution.timeout(readTimeout);
+      if (!p.isWithin(privateRoot, resolved)) {
         changed.add(path);
         continue;
       }
@@ -5310,8 +5395,9 @@ class FlutterInstaller {
     List<String> arguments, {
     required String userMessage,
     DoctorCancellation? cancellation,
+    Duration? checkTimeout,
   }) async {
-    if (cancellation == null) {
+    if (cancellation == null && checkTimeout == null) {
       final result = await Process.run(
         'git',
         arguments,
@@ -5338,10 +5424,17 @@ class FlutterInstaller {
     final exitCode = process.exitCode;
     late final List<Object> results;
     try {
-      results = await cancellation.race(
-        Future.wait<Object>([stdout, stderr, exitCode]),
-      );
+      final completion = Future.wait<Object>([stdout, stderr, exitCode]);
+      final bounded = checkTimeout == null
+          ? completion
+          : completion.timeout(checkTimeout);
+      results = await (cancellation == null
+          ? bounded
+          : cancellation.race(bounded));
     } on InstallCancelledException {
+      await _terminateDoctorProcess(process);
+      rethrow;
+    } on TimeoutException {
       await _terminateDoctorProcess(process);
       rethrow;
     }
@@ -5487,22 +5580,26 @@ class _PublishedOptionalArtifactGroup {
 
 enum _ExistingInstall { incomplete, healthy, damaged }
 
-List<String> _hostExecutables(HostPlatform host) =>
+List<String> _hostExecutables(HostPlatform host, _ArtifactLayout layout) =>
     host == HostPlatform.linuxX64
     ? const [
         'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
         'bin/cache/artifacts/engine/linux-x64/flutter_tester',
       ]
-    : const ['bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64'];
+    : ['bin/cache/artifacts/engine/darwin-x64/${layout.snapshot}'];
 
-String? _missingRequiredArtifact(String rootPath, HostPlatform host) {
-  for (final relativePath in _requiredDirectories(host)) {
+String? _missingRequiredArtifact(
+  String rootPath,
+  HostPlatform host,
+  _ArtifactLayout layout,
+) {
+  for (final relativePath in _requiredDirectories(host, layout)) {
     if (FileSystemEntity.typeSync(p.join(rootPath, relativePath)) !=
         FileSystemEntityType.directory) {
       return relativePath;
     }
   }
-  for (final relativePath in _requiredFiles(host)) {
+  for (final relativePath in _requiredFiles(host, layout)) {
     if (FileSystemEntity.typeSync(p.join(rootPath, relativePath)) !=
         FileSystemEntityType.file) {
       return relativePath;
@@ -5513,12 +5610,13 @@ String? _missingRequiredArtifact(String rootPath, HostPlatform host) {
 
 Future<List<Map<String, String>>> _sourceInventory(
   Directory source,
-  HostPlatform host, {
+  HostPlatform host,
+  _ArtifactLayout layout, {
   Duration? readTimeout,
   void Function(String path)? onHashedFile,
 }) async {
   final inventory = <Map<String, String>>[];
-  for (final relativePath in _sourceArtifactPaths(host)) {
+  for (final relativePath in _sourceArtifactPaths(host, layout)) {
     final root = Directory(p.join(source.path, relativePath));
     final stream = root.list(recursive: true, followLinks: false);
     final boundedEntries = readTimeout == null

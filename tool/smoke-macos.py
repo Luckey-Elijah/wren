@@ -78,7 +78,10 @@ def snapshot(directory):
 version = run("version", ["--version"], (0,)).strip()
 assert version == "wren 0.0.1", version
 for release in (target, other):
-    run(f"install-{release}", ["install", release], (0,))
+    run(f"install-{release}", ["install", release], (0, 4))
+    if results[-1]["status"] == 4:
+        run(f"repair-{release}", ["repair", release], (0,))
+        run(f"retry-install-{release}", ["install", release], (0,))
 (project / "pubspec.yaml").write_text(
     f"name: wren_smoke\nenvironment:\n  flutter: ^{target}\n  sdk: ^3.13.7\n")
 run("flutter-version", ["flutter", "--version"], (0,))

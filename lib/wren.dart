@@ -1298,6 +1298,7 @@ class _DoctorCommand extends WrenCommand {
                       ? null
                       : (version: requestedRelease, host: targetHost),
                   cancellation: cancellation,
+                  checkTimeout: const Duration(seconds: 1),
                 ),
               ),
             );
@@ -1524,7 +1525,11 @@ class _DoctorCommand extends WrenCommand {
           : fullIntegrityFor(selected)?.integrity;
       final selectedIntegrityLabel =
           selected == null ||
-              (requestedRelease != null && selected.version != requestedRelease)
+              !installed.any(
+                (release) =>
+                    release.version == selected.version &&
+                    release.host == selected.host,
+              )
           ? null
           : selectedIntegrity == null
           ? selected.needsRepair

@@ -2436,6 +2436,18 @@ printf '\376\000\n' >&2
       await diagnose(false, 0);
       await diagnose(true, 0);
       expect(await _snapshotTree(other), otherBefore);
+      final engineFile = File(
+        p.join(target.path, 'bin/internal/engine.version'),
+      );
+      final engineContents = await engineFile.readAsString();
+      await engineFile.delete();
+      final missingEngine = await diagnose(false, 1);
+      expect(missingEngine['releases'], [
+        containsPair('integrity', 'needs_repair'),
+      ]);
+      await engineFile.writeAsString(engineContents);
+      await diagnose(false, 0);
+
       await File(p.join(source.path, 'bin/cache/dart-sdk/bin/dart'))
           .writeAsString('damaged shared source');
       final binsBefore = await _snapshotTree(
@@ -2467,12 +2479,19 @@ printf '\376\000\n' >&2
       (_version, false),
       ('3.7.0', true),
       (_version, true),
+      ('3.22.0', false),
+      ('3.27.4', true),
     ]) {
       test(
         'macOS $releaseVersion doctor JSON states, targeted=$targeted',
         () async {
           final legacy = releaseVersion == '3.7.0';
-          final dartVersion = legacy ? '2.19.0' : _dartVersion;
+          final dartVersion = switch (releaseVersion) {
+            '3.7.0' => '2.19.0',
+            '3.22.0' => '3.4.0',
+            '3.27.4' => '3.6.2',
+            _ => _dartVersion,
+          };
           await _writeFixtureSdk(
             repositoryWorktree,
             version: releaseVersion,
@@ -2621,15 +2640,17 @@ environment:
                 ),
             containsPair('status', 'incomplete'),
           );
+          final repairError = StringBuffer();
           expect(
             await runWren(
               ['repair', releaseVersion],
               host: HostPlatform.macosArm64,
               installEnvironment: environment,
               stdoutSink: StringBuffer(),
-              stderrSink: StringBuffer(),
+              stderrSink: repairError,
             ),
             0,
+            reason: repairError.toString(),
           );
           final healthy = await diagnose(
             full: true,
@@ -4098,7 +4119,43 @@ Future<void> _writeFixtureSdk(
   final hostArtifactRoot = isLinux ? 'linux-x64' : 'darwin-x64';
   final hostProfileRoot = isLinux ? 'linux-x64-profile' : 'darwin-x64-profile';
   final hostReleaseRoot = isLinux ? 'linux-x64-release' : 'darwin-x64-release';
-  final snapshotName = isLinux ? 'gen_snapshot' : 'gen_snapshot_arm64';
+  final minor = int.parse(version.split('.')[1]);
+  final hasGpu = minor >= 24;
+  final engineCacheIdentity = minor >= 32;
+  final engineUpdater = File(
+    p.join(root.path, 'bin/internal/update_engine_version.sh'),
+  );
+  if (engineCacheIdentity) {
+    await engineUpdater.parent.create(recursive: true);
+    await engineUpdater.writeAsString(
+      'bin/cache/engine.stamp bin/cache/engine.realm',
+    );
+  } else if (engineUpdater.existsSync()) {
+    await engineUpdater.delete();
+  }
+
+  final frameworkBundle = minor >= 22
+      ? 'FlutterMacOS.xcframework'
+      : 'FlutterMacOS.framework';
+  final frameworkInfo = minor >= 22
+      ? '$frameworkBundle/Info.plist'
+      : '$frameworkBundle/Resources/Info.plist';
+  final frameworkNativeBundle = minor >= 22
+      ? '$frameworkBundle/macos-arm64_x86_64/FlutterMacOS.framework'
+      : frameworkBundle;
+  final snapshotName = isLinux || minor < 32
+      ? 'gen_snapshot'
+      : 'gen_snapshot_arm64';
+  final toolsSource = Directory(
+    p.join(root.path, 'packages/flutter_tools/lib/src'),
+  );
+  await toolsSource.create(recursive: true);
+  await File(p.join(toolsSource.path, 'flutter_cache.dart')).writeAsString(
+    "const packages = ['sky_engine'${hasGpu ? ", 'flutter_gpu'" : ''}];",
+  );
+  await File(
+    p.join(toolsSource.path, 'artifacts.dart'),
+  ).writeAsString("const artifacts = ['$frameworkBundle', '$snapshotName'];");
   final hostStamp = isLinux ? 'linux-sdk.stamp' : 'macos-sdk.stamp';
   final omitMacRelease = omitMacReleaseArtifact ? 'true' : 'false';
   final legacyIos = legacyIosArchiveLayout ? 'true' : 'false';
@@ -4107,13 +4164,13 @@ Future<void> _writeFixtureSdk(
   final precacheFlag = isLinux ? '--linux' : '--macos';
   final profileArtifact = isLinux
       ? 'bin/cache/artifacts/engine/$hostProfileRoot/flutter_linux/libflutter_linux_gtk.so'
-      : 'bin/cache/artifacts/engine/$hostProfileRoot/FlutterMacOS.xcframework/Info.plist';
+      : 'bin/cache/artifacts/engine/$hostProfileRoot/$frameworkInfo';
   final releaseArtifact = isLinux
       ? 'bin/cache/artifacts/engine/$hostReleaseRoot/flutter_linux/libflutter_linux_gtk.so'
-      : 'bin/cache/artifacts/engine/$hostReleaseRoot/FlutterMacOS.xcframework/Info.plist';
+      : 'bin/cache/artifacts/engine/$hostReleaseRoot/$frameworkInfo';
   final frameworkArtifact = isLinux
       ? 'bin/cache/artifacts/engine/$hostArtifactRoot/libflutter_linux_gtk.so'
-      : 'bin/cache/artifacts/engine/$hostArtifactRoot/FlutterMacOS.xcframework/Info.plist';
+      : 'bin/cache/artifacts/engine/$hostArtifactRoot/$frameworkInfo';
   if (Directory(p.join(root.path, 'bin/cache')).existsSync()) {
     await Directory(p.join(root.path, 'bin/cache')).delete(recursive: true);
   }
@@ -4203,12 +4260,13 @@ if [ "\$1" = "precache" ]; then
       printf '$_engineRevision\\n' > bin/cache/flutter_runner_debug_symbols.stamp
     fi
     if [ "\$group" = "macos" ]; then
-      mkdir -p bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework
-      mkdir -p bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework
-      mkdir -p bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework
-      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework/Info.plist
-      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework/Info.plist
-      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework/Info.plist
+      mkdir -p bin/cache/artifacts/engine/darwin-x64/$frameworkBundle
+      mkdir -p bin/cache/artifacts/engine/darwin-x64-profile/$frameworkBundle
+      mkdir -p bin/cache/artifacts/engine/darwin-x64-release/$frameworkBundle
+      mkdir -p "\$(dirname 'bin/cache/artifacts/engine/darwin-x64/$frameworkInfo')" "\$(dirname 'bin/cache/artifacts/engine/darwin-x64-profile/$frameworkInfo')" "\$(dirname 'bin/cache/artifacts/engine/darwin-x64-release/$frameworkInfo')"
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-x64/$frameworkInfo
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-x64-profile/$frameworkInfo
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-x64-release/$frameworkInfo
       touch bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64
       chmod +x bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64
     fi
@@ -4246,25 +4304,29 @@ if [ "\$1" = "precache" ]; then
     mkdir -p bin/cache/artifacts/engine/$hostProfileRoot/flutter_linux
     mkdir -p bin/cache/artifacts/engine/$hostReleaseRoot/flutter_linux
   else
-    mkdir -p bin/cache/artifacts/engine/$hostArtifactRoot/FlutterMacOS.xcframework
-    mkdir -p bin/cache/artifacts/engine/$hostProfileRoot/FlutterMacOS.xcframework
-    if [ '$omitMacRelease' = 'false' ]; then mkdir -p bin/cache/artifacts/engine/$hostReleaseRoot/FlutterMacOS.xcframework; fi
+    mkdir -p bin/cache/artifacts/engine/$hostArtifactRoot/$frameworkBundle
+    mkdir -p bin/cache/artifacts/engine/$hostProfileRoot/$frameworkBundle
+    if [ '$omitMacRelease' = 'false' ]; then mkdir -p bin/cache/artifacts/engine/$hostReleaseRoot/$frameworkBundle; fi
+  fi
+  if [ '$isLinux' = 'false' ]; then
+    mkdir -p "\$(dirname '$frameworkArtifact')" "\$(dirname '$profileArtifact')"
+    if [ '$omitMacRelease' = 'false' ]; then mkdir -p "\$(dirname '$releaseArtifact')"; fi
   fi
   mkdir -p bin/cache/flutter_web_sdk
   mkdir -p bin/cache/pkg/sky_engine
-  mkdir -p bin/cache/pkg/flutter_gpu
+  if [ '$hasGpu' = 'true' ]; then mkdir -p bin/cache/pkg/flutter_gpu; fi
   touch bin/cache/flutter_tools.snapshot
   touch bin/cache/flutter_tools.stamp
   printf '$_engineRevision\\n' > bin/cache/engine-dart-sdk.stamp
-  printf '$_engineRevision\\n' > bin/cache/engine.stamp
+  if [ '$engineCacheIdentity' = 'true' ]; then printf '$_engineRevision\\n' > bin/cache/engine.stamp; fi
   printf '$_engineRevision\\n' > bin/cache/flutter_sdk.stamp
   printf '$_engineRevision\\n' > bin/cache/$hostStamp
   printf '$_engineRevision\\n' > bin/cache/flutter_web_sdk.stamp
-  printf 'main\\n' > bin/cache/engine.realm
+  if [ '$engineCacheIdentity' = 'true' ]; then printf 'main\\n' > bin/cache/engine.realm; fi
   if [ '$isLinux' = 'true' ]; then touch $frameworkArtifact $profileArtifact; else printf 'fixture framework\\n' > $frameworkArtifact; printf 'fixture framework\\n' > $profileArtifact; fi
   if [ '$omitMacRelease' = 'false' ] || [ '$isLinux' = 'true' ]; then if [ '$isLinux' = 'true' ]; then touch $releaseArtifact; else printf 'fixture framework\\n' > $releaseArtifact; fi; fi
   if [ '$isLinux' = 'false' ]; then
-    framework=bin/cache/artifacts/engine/$hostProfileRoot/FlutterMacOS.xcframework/macos-arm64_x86_64/FlutterMacOS.framework
+    framework=bin/cache/artifacts/engine/$hostProfileRoot/$frameworkNativeBundle
     mkdir -p "\$framework/Versions/A"
     printf 'native framework payload' > "\$framework/Versions/A/FlutterMacOS"
     rm -rf "\$framework/Versions/Current"
@@ -4276,7 +4338,7 @@ if [ "\$1" = "precache" ]; then
   if [ '$isLinux' = 'true' ]; then touch bin/cache/artifacts/engine/$hostArtifactRoot/flutter_tester; fi
   touch bin/cache/flutter_web_sdk/version.txt
   touch bin/cache/pkg/sky_engine/pubspec.yaml
-  touch bin/cache/pkg/flutter_gpu/pubspec.yaml
+  if [ '$hasGpu' = 'true' ]; then touch bin/cache/pkg/flutter_gpu/pubspec.yaml; fi
   cat > bin/cache/dart-sdk/bin/dart <<'DART'
 #!/bin/sh
 printf 'Dart SDK version: $runtimeDartVersion (stable) on "%s"\\n' "$dartHost" >&2
