@@ -2,6 +2,8 @@
 
 Decision record for 2026-10-28 (America/New_York). This page records the implementation decisions and verified delivery for tickets #22, #23, and #24. The specs and tickets remain the current contracts.
 
+The [2026-10-30 follow-up](2026-10-30-doctor-completion.md) supersedes this page's local-only and excluded-#16 scope decisions. It records #16's integration and the user's request for GitHub PRs for the remaining doctor work. The statements below preserve the 2026-10-28 delivery history.
+
 ## User decisions
 
 - Keep the work local. Do not push or publish it.

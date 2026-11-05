@@ -3,6 +3,7 @@
 ## Decisions
 
 - On 2026-10-28, the user asked to complete the remaining Wren implementation tickets, keep changes on this device, skip work requiring unavailable platforms or external platforms, and put each ticket's work in one commit so it can be rolled back independently. Source: user instruction in the Wren implementation session on 2026-10-28.
+- On 2026-10-30, the user requested separate worktrees and GitHub PRs for review of the remaining tickets. This supersedes the earlier local-only publication restriction. The [doctor completion record](../wren-wiki/2026-10-30-doctor-completion.md) links the resulting work and acceptance evidence.
 
 ## Repository history
 
