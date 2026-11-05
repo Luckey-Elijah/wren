@@ -44,21 +44,21 @@ List<String> _requiredDirectories(HostPlatform host) => [
   if (host == HostPlatform.linuxX64)
     'bin/cache/artifacts/engine/linux-x64-release/flutter_linux',
   if (host == HostPlatform.macosArm64)
-    'bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework',
+    'bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework',
   if (host == HostPlatform.macosArm64)
-    'bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework',
+    'bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework',
   if (host == HostPlatform.macosArm64)
-    'bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework',
+    'bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework',
 ];
 
 List<String> _requiredFiles(HostPlatform host) => [
   ..._dartRequiredFiles,
   if (host == HostPlatform.linuxX64) ..._linuxRequiredFiles,
   if (host == HostPlatform.macosArm64) ...[
-    'bin/cache/artifacts/engine/darwin-arm64/gen_snapshot',
-    'bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework/Info.plist',
-    'bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework/Info.plist',
-    'bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework/Info.plist',
+    'bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64',
+    'bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework/Info.plist',
+    'bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework/Info.plist',
+    'bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework/Info.plist',
   ],
 ];
 
@@ -76,9 +76,9 @@ List<String> _sourceArtifactPaths(HostPlatform host) => [
     'bin/cache/artifacts/engine/linux-x64-release',
   ],
   if (host == HostPlatform.macosArm64) ...[
-    'bin/cache/artifacts/engine/darwin-arm64',
-    'bin/cache/artifacts/engine/darwin-arm64-profile',
-    'bin/cache/artifacts/engine/darwin-arm64-release',
+    'bin/cache/artifacts/engine/darwin-x64',
+    'bin/cache/artifacts/engine/darwin-x64-profile',
+    'bin/cache/artifacts/engine/darwin-x64-release',
   ],
   'bin/cache/flutter_web_sdk',
   'bin/cache/pkg/sky_engine',
@@ -538,10 +538,73 @@ class FlutterInstaller {
     return CleanupResult(stages: stages, sources: sources);
   }
 
+  /// Reads release identities for selection without inspecting SDK payloads.
+  Future<List<InstalledRelease>> listRegistered({
+    required HostPlatform host,
+    DoctorCancellation? cancellation,
+    Duration checkTimeout = const Duration(seconds: 1),
+  }) async {
+    final releases = Directory(
+      p.join(environment.dataDirectory.absolute.path, 'releases'),
+    );
+    final type = FileSystemEntity.typeSync(releases.path, followLinks: false);
+    if (type == FileSystemEntityType.notFound) return const [];
+    if (type != FileSystemEntityType.directory) {
+      throw const FileSystemException(
+        'release registry is not a regular directory',
+      );
+    }
+    final registered = <InstalledRelease>[];
+    await for (final entity
+        in releases.list(followLinks: false).timeout(checkTimeout)) {
+      cancellation?.throwIfCancelled();
+      if (entity is! Directory) continue;
+      final identity = RegExp(
+        '^(stable|beta)-(.+)-${RegExp.escape(_readinessVariant(host))}'
+        r'$',
+      ).firstMatch(p.basename(entity.path));
+      if (identity == null) continue;
+      final marker = p.join(entity.path, '.wren-release.json');
+      if (FileSystemEntity.typeSync(marker, followLinks: false) ==
+          FileSystemEntityType.notFound) {
+        continue;
+      }
+      final read = await _readDoctorReleaseManifest(entity, checkTimeout);
+      if (read.check.status == DoctorCheckStatus.incomplete) {
+        throw FileSystemException(read.check.detail, marker);
+      }
+      final data = read.data;
+      registered.add(
+        InstalledRelease(
+          channel: identity.group(1)!,
+          version: identity.group(2)!,
+          host: host.catalogOs,
+          dartVersion: data?['canonicalDartVersion'] is String
+              ? data!['canonicalDartVersion']! as String
+              : null,
+          needsRepair: data == null || data['readiness'] == 'needs-repair',
+        ),
+      );
+    }
+    return registered;
+  }
+
+  bool _matchesDoctorTarget(
+    Directory release,
+    ({String version, HostPlatform host})? target,
+  ) =>
+      target == null ||
+      ['stable', 'beta'].any(
+        (channel) =>
+            p.basename(release.path) ==
+            '$channel-${target.version}-${_readinessVariant(target.host)}',
+      );
+
   /// Lists published releases and performs the inexpensive launch-readiness
   /// checks used by Wren before selecting an SDK.
   /// Lists published releases and checks their launch readiness.
   Future<List<InstalledRelease>> listInstalled({
+    ({String version, HostPlatform host})? target,
     DoctorCancellation? cancellation,
   }) async {
     cancellation?.throwIfCancelled();
@@ -558,6 +621,7 @@ class FlutterInstaller {
               FileSystemEntityType.directory) {
         continue;
       }
+      if (!_matchesDoctorTarget(entity, target)) continue;
       final marker = File(p.join(entity.path, '.wren-release.json'));
       if (FileSystemEntity.typeSync(marker.path, followLinks: false) ==
           FileSystemEntityType.notFound) {
@@ -572,7 +636,20 @@ class FlutterInstaller {
           ? await readiness
           : await cancellation.race(readiness);
       if (result == null) continue;
-      installed.add(result);
+      installed.add(
+        target == null
+            ? result
+            : InstalledRelease(
+                channel: p.basename(entity.path).startsWith('beta-')
+                    ? 'beta'
+                    : 'stable',
+                version: target.version,
+                host: target.host.catalogOs,
+                dartVersion: result.dartVersion,
+                needsRepair: result.needsRepair,
+                repairReason: result.repairReason,
+              ),
+      );
     }
     cancellation?.throwIfCancelled();
     installed.sort((left, right) {
@@ -596,6 +673,7 @@ class FlutterInstaller {
   /// damage. Checks which time out or lack trusted expected contents remain
   /// incomplete and do not create a damage marker.
   Future<DoctorFullIntegrityReport> inspectFullIntegrity({
+    ({String version, HostPlatform host})? target,
     Duration checkTimeout = const Duration(seconds: 30),
     DoctorCancellation? cancellation,
   }) async {
@@ -649,6 +727,7 @@ class FlutterInstaller {
                 FileSystemEntityType.directory) {
           continue;
         }
+        if (!_matchesDoctorTarget(entity, target)) continue;
         final markerPath = p.join(entity.path, '.wren-release.json');
         if (FileSystemEntity.typeSync(markerPath, followLinks: false) !=
             FileSystemEntityType.notFound) {
@@ -675,6 +754,7 @@ class FlutterInstaller {
     );
     final sourceChecks = <String, Future<DoctorIntegrityCheck>>{};
     final results = <DoctorReleaseIntegrity>[];
+    final affectedReleases = <String>{};
     for (final release in registered) {
       cancellation?.throwIfCancelled();
       late final DoctorReleaseIntegrity result;
@@ -703,22 +783,37 @@ class FlutterInstaller {
         );
       }
       cancellation?.throwIfCancelled();
-      results.add(result);
+      final targetIdentity = target == null
+          ? null
+          : RegExp('^(stable|beta)-').firstMatch(p.basename(release.path));
+      results.add(
+        targetIdentity == null
+            ? result
+            : DoctorReleaseIntegrity(
+                channel: targetIdentity.group(1)!,
+                version: target!.version,
+                host: target.host.catalogOs,
+                dartVersion: result.dartVersion,
+                checks: result.checks,
+              ),
+      );
       if (result.hasConfirmedDamage) {
         try {
           cancellation?.throwIfCancelled();
-          await _persistFullDoctorNeedsRepair(
-            release,
-            result,
-            cancellation: cancellation,
-          ).timeout(checkTimeout);
+          affectedReleases.addAll(
+            await _persistFullDoctorNeedsRepair(
+              release,
+              result,
+              cancellation: cancellation,
+            ).timeout(checkTimeout),
+          );
         } on InstallCancelledException {
           rethrow;
         } on Object catch (error) {
           results[results.length - 1] = DoctorReleaseIntegrity(
-            channel: result.channel,
-            version: result.version,
-            host: result.host,
+            channel: results.last.channel,
+            version: results.last.version,
+            host: results.last.host,
             dartVersion: result.dartVersion,
             checks: [
               ...result.checks,
@@ -737,6 +832,7 @@ class FlutterInstaller {
 
     return DoctorFullIntegrityReport(
       results,
+      sourceAffectedReleases: affectedReleases.toList()..sort(),
       checks: registryCheck == null ? const [] : [registryCheck],
     );
   }
@@ -1733,12 +1829,13 @@ class FlutterInstaller {
     return false;
   }
 
-  Future<void> _persistFullDoctorNeedsRepair(
+  Future<List<String>> _persistFullDoctorNeedsRepair(
     Directory release,
     DoctorReleaseIntegrity result, {
     DoctorCancellation? cancellation,
   }) async {
     cancellation?.throwIfCancelled();
+    var affected = <String>[];
     final sourceDamage = result.checks.any(
       (check) =>
           check.id == 'retained-source' &&
@@ -1753,9 +1850,8 @@ class FlutterInstaller {
       cancellation?.throwIfCancelled();
       final sourceKey = decoded?.sourceKey;
       if (sourceKey != null) {
-        var sourceMarked = false;
         try {
-          sourceMarked = await _persistSharedSourceNeedsRepair(
+          await _persistSharedSourceNeedsRepair(
             sourceKey,
             cancellation: cancellation,
           );
@@ -1765,13 +1861,11 @@ class FlutterInstaller {
           // Fall back to dependent release safety markers if this path cannot
           // be safely updated or is not writable.
         }
-        if (!sourceMarked) {
-          await _markDependentReleasesForSourceRepair(
-            sourceKey,
-            result.repairReason ?? 'shared artifact source needs repair',
-            cancellation: cancellation,
-          );
-        }
+        affected = await _markDependentReleasesForSourceRepair(
+          sourceKey,
+          result.repairReason ?? 'shared artifact source needs repair',
+          cancellation: cancellation,
+        );
       }
     }
 
@@ -1797,7 +1891,7 @@ class FlutterInstaller {
           check.status == DoctorCheckStatus.confirmedDamage,
     );
     if (!privateDamage && !optionalDamage && !checkoutDamage && !recordDamage) {
-      return;
+      return affected;
     }
 
     final marker = File(p.join(release.path, '.wren-release.json'));
@@ -1808,7 +1902,7 @@ class FlutterInstaller {
         result.repairReason ?? 'release metadata needs repair',
         cancellation: cancellation,
       );
-      return;
+      return affected;
     }
     final decoded = await _readDoctorReleaseIdentity(
       marker,
@@ -1820,7 +1914,7 @@ class FlutterInstaller {
         result.repairReason ?? 'release metadata needs repair',
         cancellation: cancellation,
       );
-      return;
+      return affected;
     }
     final updated = Map<String, Object?>.from(decoded.data);
     if (privateDamage || checkoutDamage) {
@@ -1832,6 +1926,7 @@ class FlutterInstaller {
         result.repairReason ?? 'full integrity check failed';
     cancellation?.throwIfCancelled();
     await _publishManifest(release.path, updated, cancellation: cancellation);
+    return affected;
   }
 
   Future<_DoctorReleaseIdentity?> _readDoctorReleaseIdentity(
@@ -1937,7 +2032,7 @@ class FlutterInstaller {
     return true;
   }
 
-  Future<void> _markDependentReleasesForSourceRepair(
+  Future<List<String>> _markDependentReleasesForSourceRepair(
     String sourceKey,
     String reason, {
     DoctorCancellation? cancellation,
@@ -1951,6 +2046,7 @@ class FlutterInstaller {
         'could not locate releases that depend on the damaged shared source.',
       );
     }
+    final affected = <String>[];
     await for (final entity in releases.list(followLinks: false)) {
       cancellation?.throwIfCancelled();
       if (entity is! Directory ||
@@ -1968,6 +2064,7 @@ class FlutterInstaller {
         cancellation: cancellation,
       );
       if (identity?.sourceKey != sourceKey) continue;
+      affected.add(p.basename(entity.path));
       final updated = Map<String, Object?>.from(identity!.data)
         ..['sourceNeedsRepair'] = true
         ..['readiness'] = 'needs-repair'
@@ -1975,6 +2072,7 @@ class FlutterInstaller {
       cancellation?.throwIfCancelled();
       await _publishManifest(entity.path, updated, cancellation: cancellation);
     }
+    return affected;
   }
 
   Future<void> _clearDependentSourceRepairMarkers(
@@ -3213,9 +3311,9 @@ class FlutterInstaller {
       'bin/cache/artifacts/engine/linux-x64-release',
     ],
     if (host == HostPlatform.macosArm64) ...[
-      'bin/cache/artifacts/engine/darwin-arm64',
-      'bin/cache/artifacts/engine/darwin-arm64-profile',
-      'bin/cache/artifacts/engine/darwin-arm64-release',
+      'bin/cache/artifacts/engine/darwin-x64',
+      'bin/cache/artifacts/engine/darwin-x64-profile',
+      'bin/cache/artifacts/engine/darwin-x64-release',
     ],
     'bin/cache/flutter_web_sdk',
     'bin/cache/pkg/sky_engine',
@@ -3228,7 +3326,7 @@ class FlutterInstaller {
           'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
           'bin/cache/artifacts/engine/linux-x64/flutter_tester',
         ]
-      : const ['bin/cache/artifacts/engine/darwin-arm64/gen_snapshot'];
+      : const ['bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64'];
 
   String? _readinessMissingArtifact(String rootPath, HostPlatform host) {
     final directories = <String>[
@@ -3242,9 +3340,9 @@ class FlutterInstaller {
       if (host == HostPlatform.linuxX64)
         'bin/cache/artifacts/engine/linux-x64-release/flutter_linux',
       if (host == HostPlatform.macosArm64)
-        'bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework',
-      if (host == HostPlatform.macosArm64) 'bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework',
-      if (host == HostPlatform.macosArm64) 'bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework',
+        'bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework',
+      if (host == HostPlatform.macosArm64) 'bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework',
+      if (host == HostPlatform.macosArm64) 'bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework',
     ];
     final files = <String>[
       _dartExecutable,
@@ -3256,10 +3354,10 @@ class FlutterInstaller {
         'bin/cache/artifacts/engine/linux-x64-release/flutter_linux/libflutter_linux_gtk.so',
       ],
       if (host == HostPlatform.macosArm64) ...[
-        'bin/cache/artifacts/engine/darwin-arm64/gen_snapshot',
-        'bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework/Info.plist',
-        'bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework/Info.plist',
-        'bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework/Info.plist',
+        'bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64',
+        'bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework/Info.plist',
+        'bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework/Info.plist',
+        'bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework/Info.plist',
       ],
     ];
     for (final path in directories) {
@@ -4868,16 +4966,20 @@ class FlutterInstaller {
     );
     final checkoutModes = _readReleaseCheckoutModes(releaseManifest);
     final changed = <String>[];
+    final privateRoot = await release.resolveSymbolicLinks();
     for (final entry in expected.entries) {
       final path = entry.key;
       final sourceFile = File(p.join(source.path, path));
       final releasePath = p.join(release.path, path);
-      if (FileSystemEntity.typeSync(releasePath, followLinks: false) !=
-          FileSystemEntityType.file) {
+      if (FileSystemEntity.typeSync(releasePath) != FileSystemEntityType.file) {
         changed.add(path);
         continue;
       }
       final releaseFile = File(releasePath);
+      if (!p.isWithin(privateRoot, await releaseFile.resolveSymbolicLinks())) {
+        changed.add(path);
+        continue;
+      }
       final digest = await _hashFile(releaseFile, readTimeout);
       onHashedFile?.call(path);
       final actualMode = releaseFile.statSync().mode & 0x1ff;
@@ -5391,7 +5493,7 @@ List<String> _hostExecutables(HostPlatform host) =>
         'bin/cache/artifacts/engine/linux-x64/gen_snapshot',
         'bin/cache/artifacts/engine/linux-x64/flutter_tester',
       ]
-    : const ['bin/cache/artifacts/engine/darwin-arm64/gen_snapshot'];
+    : const ['bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64'];
 
 String? _missingRequiredArtifact(String rootPath, HostPlatform host) {
   for (final relativePath in _requiredDirectories(host)) {

@@ -30,6 +30,7 @@ cleanup() {
   rm -rf "$stage"
 }
 trap cleanup EXIT HUP INT TERM
+export WREN_DATA_DIR="$stage/smoke-store"
 
 package_dir="$stage/wren-$release_version-$host"
 mkdir -p "$package_dir"
@@ -40,6 +41,7 @@ chmod 755 "$package_dir/wren"
 cp packaging/INSTALL.md "$package_dir/INSTALL.md"
 
 # Smoke the executable and an ordinary offline command before and after packing.
+test "$("$package_dir/wren" --version)" = "wren $release_version"
 "$package_dir/wren" --help >/dev/null
 "$package_dir/wren" list >/dev/null
 
@@ -48,6 +50,7 @@ mkdir -p "$repo_root/dist"
 tar -C "$stage" -czf "$repo_root/dist/$archive" "wren-$release_version-$host"
 mkdir "$stage/archive-smoke"
 tar -xzf "$repo_root/dist/$archive" -C "$stage/archive-smoke"
+test "$("$stage/archive-smoke/wren-$release_version-$host/wren" --version)" = "wren $release_version"
 "$stage/archive-smoke/wren-$release_version-$host/wren" --help >/dev/null
 "$stage/archive-smoke/wren-$release_version-$host/wren" list >/dev/null
 if command -v sha256sum >/dev/null 2>&1; then

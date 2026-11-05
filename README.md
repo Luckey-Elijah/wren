@@ -2,11 +2,14 @@
 
 Wren manages Flutter releases and the Dart SDK bundled with each release. Install a release once, then run Flutter and Dart commands through Wren. In a project, Wren can select an installed release that matches the Flutter and Dart constraints in `pubspec.yaml`.
 
-Wren supports Linux x86_64 and macOS on Apple Silicon.
+Wren 0.0.x development releases are available for Apple Silicon macOS only.
+Every 0.0.x release may contain breaking changes. Linux release qualification
+is tracked in [#11](https://github.com/Luckey-Elijah/wren/issues/11).
+The first milestone after this development phase is 0.1.0.
 
 ## Install a release
 
-On Linux x86_64 or Apple Silicon macOS, install the highest stable release with
+On Apple Silicon macOS, install the newest published release with
 the one-line installer:
 
 ```sh
@@ -18,7 +21,7 @@ See the [one-line installer details](packaging/INSTALL.md#one-line-installer)
 for PATH guidance and safe replacement behavior.
 
 Wren release archives contain a standalone native executable, so a separate
-Dart SDK is not required. Download the archive for Linux x86_64 or Apple
+Dart SDK is not required. Download the archive for Apple
 Silicon macOS from the project's GitHub Releases, verify its SHA-256 checksum,
 and follow the included [manual installation guide](packaging/INSTALL.md).
 Wren requires system Git to install Flutter releases. The initial unsigned
@@ -83,17 +86,36 @@ WREN_FLUTTER_RELEASE=3.27.4 wren flutter test
 | `wren releases <version>`                    | Checks whether a release can be installed on this machine and shows its bundled Dart version. |
 | `wren install <version>`                     | Downloads and installs an eligible Flutter release.                                           |
 | `wren list` or `wren ls`                     | Lists installed releases and whether each is ready to use.                                    |
-| `wren doctor`                                 | Quickly checks installed releases, project compatibility, and the effective release selection. |
+| `wren doctor [<version>]`                                 | Checks all installed releases or one named release, plus setup and project selection. |
 | `wren set <version>` or `wren use <version>` | Updates existing Flutter and Dart constraints in the current project's `pubspec.yaml`.        |
 | `wren set -g <version>`                      | Also sets the global fallback.                                                                |
 | `wren flutter ...` or `wren dart ...`        | Runs a command with the selected release and forwards its output and exit status.             |
 | `wren sdk-path [<version>]`                  | Prints the fixed SDK directory for the active or named release.                               |
 | `wren setup`                                 | Creates optional `flutter` and `dart` PATH shims and prints shell and editor setup steps.     |
-| `wren repair <version>`                      | Checks or restores the retained shared engine source used by a release.                       |
+| `wren repair <version>`                      | Checks or repairs a release’s SDK files and retained shared source.                       |
 | `wren remove <version>`                      | Removes an installed release.                                                                 |
 | `wren cleanup --dry-run`                     | Previews abandoned install stages and unused shared sources that cleanup can remove.          |
 | `wren cleanup`                               | Removes those abandoned stages and unused shared sources.                                     |
 | `wren upgrade-wren`                          | Installs the newest stable Wren executable and keeps the previous binary for rollback.        |
+
+## Diagnose an installation
+
+Run `wren doctor` for quick offline checks, or name one installed release:
+
+```sh
+wren doctor 3.47.9
+wren doctor 3.47.9 --full --json
+```
+
+A targeted diagnosis inspects that release and Wren setup. Project compatibility
+and the normally selected release remain visible as context. `--full` verifies
+local file integrity; `--verbose` adds detail. Doctor never downloads artifacts,
+launches Flutter or Dart, or repairs SDK files. Missing trusted evidence is
+reported as incomplete. Confirmed damage blocks affected releases until repair.
+
+`flutter upgrade` and `flutter channel` through Wren are unsupported. Their
+consequences for managed installations are unknown. To change SDK versions,
+use `wren install <version>` and select the installed release through Wren.
 
 ## What Wren changes on your system
 

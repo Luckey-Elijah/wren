@@ -2296,20 +2296,20 @@ printf '\376\000\n' >&2
         final installedFrameworkInfo = File(
           p.join(
             installed.path,
-            'bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework/Info.plist',
+            'bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework/Info.plist',
           ),
         );
         final sourceFrameworkInfo = File(
           p.join(
             source.path,
-            'bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework/Info.plist',
+            'bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework/Info.plist',
           ),
         );
         expect(
           Directory(
             p.join(
               installed.path,
-              'bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework',
+              'bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework',
             ),
           ).existsSync(),
           isTrue,
@@ -2322,7 +2322,7 @@ printf '\376\000\n' >&2
         );
         expect(
           Directory(
-            p.join(source.path, 'bin/cache/artifacts/engine/darwin-arm64'),
+            p.join(source.path, 'bin/cache/artifacts/engine/darwin-x64'),
           ).existsSync(),
           isTrue,
         );
@@ -2333,9 +2333,143 @@ printf '\376\000\n' >&2
       },
     );
 
-    for (final releaseVersion in ['3.7.0', _version]) {
+    test('targeted macOS doctor inspects only its target '
+        'and propagates source damage', () async {
+      final environment = InstallEnvironment(
+        dataDirectory: dataDirectory,
+        flutterRepository: Uri.file(repositoryWorktree.path),
+      );
+      const secondVersion = '3.47.9';
+      for (final version in [_version, secondVersion]) {
+        await _writeFixtureSdk(
+          repositoryWorktree,
+          version: version,
+          host: HostPlatform.macosArm64,
+        );
+        await _git(repositoryWorktree.path, ['add', '.']);
+        await _git(repositoryWorktree.path, [
+          'commit',
+          '-m',
+          'macOS target $version',
+        ]);
+        await _git(repositoryWorktree.path, ['tag', '-f', version]);
+        final revision = await _git(repositoryWorktree.path, [
+          'rev-parse',
+          'HEAD',
+        ]);
+        final errors = StringBuffer();
+        expect(
+          await runWren(
+            ['install', version],
+            catalogJson: _catalog(
+              revision,
+              releaseVersion: version,
+              host: HostPlatform.macosArm64,
+            ),
+            host: HostPlatform.macosArm64,
+            installEnvironment: environment,
+            stdoutSink: StringBuffer(),
+            stderrSink: errors,
+          ),
+          0,
+          reason: errors.toString(),
+        );
+      }
+      final target = Directory(
+        p.join(dataDirectory.path, 'releases/stable-$_version-darwin-arm64'),
+      );
+      final other = Directory(
+        p.join(
+          dataDirectory.path,
+          'releases/stable-$secondVersion-darwin-arm64',
+        ),
+      );
+      final source = Directory(
+        p.join(dataDirectory.path, 'sources/$_engineRevision-macos-arm64'),
+      );
+      final project = Directory(p.join(temp.path, 'project'))..createSync();
+      await File(p.join(project.path, 'pubspec.yaml')).writeAsString(
+        'environment:\n  flutter: ^$_version\n  sdk: ^$_dartVersion\n',
+      );
+      // A non-target checkout is deliberately damaged. Reading its payloads
+      // would change its readiness marker or contaminate the target report.
+      await File(p.join(other.path, 'bin/internal/engine.version'))
+          .writeAsString('non-target damage');
+      final otherBefore = await _snapshotTree(other);
+      var launches = 0;
+      Future<Map<String, Object?>> diagnose(
+        bool full,
+        int expectedStatus,
+      ) async {
+        final output = StringBuffer();
+        final errors = StringBuffer();
+        final status = await HttpOverrides.runZoned(
+          () => runWren(
+            ['doctor', _version, if (full) '--full', '--json'],
+            host: HostPlatform.macosArm64,
+            installEnvironment: environment,
+            projectDirectory: project,
+            stdoutSink: output,
+            stderrSink: errors,
+            sdkLauncher:
+                ({
+                  required release,
+                  required executable,
+                  required arguments,
+                }) async {
+                  launches++;
+                  return 99;
+                },
+          ),
+          createHttpClient: (_) =>
+              throw StateError('doctor attempted network access'),
+        );
+        expect(status, expectedStatus, reason: '$errors\n$output');
+        final report = jsonDecode(output.toString()) as Map<String, Object?>;
+        expect(report['releases'], [containsPair('version', _version)]);
+        expect(report['selection'], containsPair('release', secondVersion));
+        expect(report['selection'], containsPair('integrity', isNull));
+        expect(launches, 0);
+        return report;
+      }
+
+      await diagnose(false, 0);
+      await diagnose(true, 0);
+      expect(await _snapshotTree(other), otherBefore);
+      await File(p.join(source.path, 'bin/cache/dart-sdk/bin/dart'))
+          .writeAsString('damaged shared source');
+      final binsBefore = await _snapshotTree(
+        Directory(p.join(other.path, 'bin')),
+      );
+      final damaged = await diagnose(true, 4);
+      expect(
+        damaged['shared_source_affected_releases'],
+        contains('stable-$secondVersion-darwin-arm64'),
+      );
+      expect(
+        await _snapshotTree(Directory(p.join(other.path, 'bin'))),
+        binsBefore,
+      );
+      final otherRecord = jsonDecode(
+        await File(p.join(other.path, '.wren-release.json')).readAsString(),
+      ) as Map<String, Object?>;
+      expect(otherRecord['sourceNeedsRepair'], true);
+      final targetRecord = File(p.join(target.path, '.wren-release.json'));
+      await targetRecord.writeAsString('{broken');
+      final invalidRecord = await diagnose(true, 1);
+      expect(invalidRecord['releases'], [
+        containsPair('integrity', 'needs_repair'),
+      ]);
+    });
+
+    for (final (releaseVersion, targeted) in [
+      ('3.7.0', false),
+      (_version, false),
+      ('3.7.0', true),
+      (_version, true),
+    ]) {
       test(
-        'macOS $releaseVersion doctor JSON preserves diagnostic states',
+        'macOS $releaseVersion doctor JSON states, targeted=$targeted',
         () async {
           final legacy = releaseVersion == '3.7.0';
           final dartVersion = legacy ? '2.19.0' : _dartVersion;
@@ -2403,7 +2537,13 @@ environment:
             final output = StringBuffer();
             final errors = StringBuffer();
             final status = await runWren(
-              ['doctor', if (full) '--full', '--json', '--verbose'],
+              [
+                'doctor',
+                if (targeted) releaseVersion,
+                if (full) '--full',
+                '--json',
+                '--verbose',
+              ],
               host: HostPlatform.macosArm64,
               installEnvironment: environment,
               projectDirectory: project,
@@ -2416,6 +2556,12 @@ environment:
             final report =
                 jsonDecode(output.toString()) as Map<String, Object?>;
             expect(report['schema_version'], 1);
+            expect(
+              report['scope'],
+              targeted
+                  ? {'kind': 'release', 'requested_release': releaseVersion}
+                  : {'kind': 'all'},
+            );
             expect(report['depth'], full ? 'full' : 'quick');
             expect(report['exit_status'], expectedStatus);
             expect(
@@ -3949,13 +4095,10 @@ Future<void> _writeFixtureSdk(
   bool legacyIosArchiveLayout = false,
 }) async {
   final isLinux = host == HostPlatform.linuxX64;
-  final hostArtifactRoot = isLinux ? 'linux-x64' : 'darwin-arm64';
-  final hostProfileRoot = isLinux
-      ? 'linux-x64-profile'
-      : 'darwin-arm64-profile';
-  final hostReleaseRoot = isLinux
-      ? 'linux-x64-release'
-      : 'darwin-arm64-release';
+  final hostArtifactRoot = isLinux ? 'linux-x64' : 'darwin-x64';
+  final hostProfileRoot = isLinux ? 'linux-x64-profile' : 'darwin-x64-profile';
+  final hostReleaseRoot = isLinux ? 'linux-x64-release' : 'darwin-x64-release';
+  final snapshotName = isLinux ? 'gen_snapshot' : 'gen_snapshot_arm64';
   final hostStamp = isLinux ? 'linux-sdk.stamp' : 'macos-sdk.stamp';
   final omitMacRelease = omitMacReleaseArtifact ? 'true' : 'false';
   final legacyIos = legacyIosArchiveLayout ? 'true' : 'false';
@@ -4060,14 +4203,14 @@ if [ "\$1" = "precache" ]; then
       printf '$_engineRevision\\n' > bin/cache/flutter_runner_debug_symbols.stamp
     fi
     if [ "\$group" = "macos" ]; then
-      mkdir -p bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework
-      mkdir -p bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework
-      mkdir -p bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework
-      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-arm64/FlutterMacOS.xcframework/Info.plist
-      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-arm64-profile/FlutterMacOS.xcframework/Info.plist
-      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-arm64-release/FlutterMacOS.xcframework/Info.plist
-      touch bin/cache/artifacts/engine/darwin-arm64/gen_snapshot
-      chmod +x bin/cache/artifacts/engine/darwin-arm64/gen_snapshot
+      mkdir -p bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework
+      mkdir -p bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework
+      mkdir -p bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-x64/FlutterMacOS.xcframework/Info.plist
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-x64-profile/FlutterMacOS.xcframework/Info.plist
+      printf 'fixture framework\\n' > bin/cache/artifacts/engine/darwin-x64-release/FlutterMacOS.xcframework/Info.plist
+      touch bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64
+      chmod +x bin/cache/artifacts/engine/darwin-x64/gen_snapshot_arm64
     fi
     printf x >> "../../../\$group-fetch-count"
     exit 0
@@ -4120,7 +4263,16 @@ if [ "\$1" = "precache" ]; then
   printf 'main\\n' > bin/cache/engine.realm
   if [ '$isLinux' = 'true' ]; then touch $frameworkArtifact $profileArtifact; else printf 'fixture framework\\n' > $frameworkArtifact; printf 'fixture framework\\n' > $profileArtifact; fi
   if [ '$omitMacRelease' = 'false' ] || [ '$isLinux' = 'true' ]; then if [ '$isLinux' = 'true' ]; then touch $releaseArtifact; else printf 'fixture framework\\n' > $releaseArtifact; fi; fi
-  touch bin/cache/artifacts/engine/$hostArtifactRoot/gen_snapshot
+  if [ '$isLinux' = 'false' ]; then
+    framework=bin/cache/artifacts/engine/$hostProfileRoot/FlutterMacOS.xcframework/macos-arm64_x86_64/FlutterMacOS.framework
+    mkdir -p "\$framework/Versions/A"
+    printf 'native framework payload' > "\$framework/Versions/A/FlutterMacOS"
+    rm -rf "\$framework/Versions/Current"
+    rm -f "\$framework/FlutterMacOS"
+    ln -s A "\$framework/Versions/Current"
+    ln -s Versions/Current/FlutterMacOS "\$framework/FlutterMacOS"
+  fi
+  touch bin/cache/artifacts/engine/$hostArtifactRoot/$snapshotName
   if [ '$isLinux' = 'true' ]; then touch bin/cache/artifacts/engine/$hostArtifactRoot/flutter_tester; fi
   touch bin/cache/flutter_web_sdk/version.txt
   touch bin/cache/pkg/sky_engine/pubspec.yaml
@@ -4130,7 +4282,7 @@ if [ "\$1" = "precache" ]; then
 printf 'Dart SDK version: $runtimeDartVersion (stable) on "%s"\\n' "$dartHost" >&2
 DART
   chmod +x bin/cache/dart-sdk/bin/dart
-  chmod +x bin/cache/artifacts/engine/$hostArtifactRoot/gen_snapshot
+  chmod +x bin/cache/artifacts/engine/$hostArtifactRoot/$snapshotName
   if [ '$isLinux' = 'true' ]; then chmod +x bin/cache/artifacts/engine/$hostArtifactRoot/flutter_tester; fi
   exit 0
 fi

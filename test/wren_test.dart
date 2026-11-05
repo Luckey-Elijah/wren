@@ -2065,7 +2065,7 @@ exec '${child.path}' "\$@"
         expect(records.map((record) => record['runId']).toSet(), hasLength(1));
         expect(records.last['command'], 'list');
         expect(records.last['host'], 'Linux x86_64');
-        expect(records.last['wrenVersion'], '1.0.0');
+        expect(records.last['wrenVersion'], '0.0.1');
         expect(records.last['exitStatus'], 0);
         expect(records.last['startedAt'], isA<String>());
         expect(records.last['durationMicros'], greaterThanOrEqualTo(0));
