@@ -115,14 +115,20 @@ class DoctorFullIntegrityReport {
   new(
     List<DoctorReleaseIntegrity> releases, {
     List<DoctorIntegrityCheck> checks = const [],
+    List<String> sourceAffectedReleases = const [],
   }) : releases = List.unmodifiable(releases),
-       checks = List.unmodifiable(checks);
+       checks = List.unmodifiable(checks),
+       sourceAffectedReleases = List.unmodifiable(sourceAffectedReleases);
 
   /// Per-release results in deterministic order.
   final List<DoctorReleaseIntegrity> releases;
 
   /// Scan-wide checks, such as release registry enumeration.
   final List<DoctorIntegrityCheck> checks;
+
+  /// Registered identities blocked by confirmed shared-source damage.
+  /// Their SDK payloads need not have been inspected by this scan.
+  final List<String> sourceAffectedReleases;
 
   /// Whether any release check was incomplete.
   bool get isIncomplete =>

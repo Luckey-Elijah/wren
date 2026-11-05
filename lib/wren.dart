@@ -43,7 +43,7 @@ typedef WrenConfirmation = Future<bool?> Function(String message);
 const _minimumDartVersion = '2.19.0';
 const _wrenVersion = String.fromEnvironment(
   'WREN_VERSION',
-  defaultValue: '1.0.0',
+  defaultValue: '0.0.1',
 );
 const _linuxCatalog =
     'https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json';
@@ -1148,7 +1148,7 @@ class _DoctorCommand extends WrenCommand {
       ..addFlag(
         'full',
         negatable: false,
-        help: 'Validate local integrity for every installed release.',
+        help: 'Validate local integrity at the requested scope.',
       )
       ..addFlag(
         'json',
@@ -1178,10 +1178,24 @@ class _DoctorCommand extends WrenCommand {
     }
   }
 
+  @override
+  String get invocation => 'wren doctor [<release>] [arguments]';
+
   Future<int> _runDoctor(DoctorCancellation cancellation) async {
     cancellation.throwIfCancelled();
-    if (argResults!.rest.isNotEmpty) {
-      failUsage('doctor does not accept positional arguments.');
+    final arguments = argResults!.rest;
+    if (arguments.length > 1) failUsage('doctor accepts at most one release.');
+    final requestedRelease = arguments.firstOrNull;
+    if (requestedRelease != null) {
+      Version? parsed;
+      try {
+        parsed = Version.parse(requestedRelease);
+      } on FormatException {
+        // Report all invalid target forms as usage errors.
+      }
+      if (parsed == null || parsed.toString() != requestedRelease) {
+        failUsage('doctor requires an exact canonical Flutter version.');
+      }
     }
     final targetHost = context.host;
     if (targetHost == null) {
@@ -1195,12 +1209,44 @@ class _DoctorCommand extends WrenCommand {
     DoctorFullIntegrityReport? fullReport;
     late final List<InstalledRelease> installed;
     Object? releaseEnumerationError;
-    if (fullRequested) {
+    List<InstalledRelease>? registered;
+    if (requestedRelease != null) {
+      try {
+        registered =
+            context.installedReleasesOverride ??
+            await cancellation.race(
+              context.installer.listRegistered(
+                host: targetHost,
+                cancellation: cancellation,
+              ),
+            );
+      } on InstallCancelledException {
+        rethrow;
+      } on Object catch (error) {
+        registered = const [];
+        releaseEnumerationError = error;
+      }
+      if (releaseEnumerationError == null &&
+          !registered!.any(
+            (release) =>
+                release.version == requestedRelease &&
+                release.host == targetHost.catalogOs,
+          )) {
+        failUsage(
+          'Flutter $requestedRelease is not installed. '
+          'Run `wren list` or `wren install $requestedRelease`.',
+        );
+      }
+    }
+    if (fullRequested && releaseEnumerationError == null) {
       try {
         fullReport = await cancellation.race(
           context.traceOperation(
             'release.full_integrity',
             () => context.installer.inspectFullIntegrity(
+              target: requestedRelease == null
+                  ? null
+                  : (version: requestedRelease, host: targetHost),
               checkTimeout: context.fullDoctorCheckTimeout,
               cancellation: cancellation,
             ),
@@ -1233,15 +1279,27 @@ class _DoctorCommand extends WrenCommand {
             repairReason: release.repairReason,
           ),
       ];
-    } else {
+    } else if (releaseEnumerationError == null) {
       try {
         installed =
-            context.installedReleasesOverride ??
+            context.installedReleasesOverride
+                ?.where(
+                  (release) =>
+                      requestedRelease == null ||
+                      (release.version == requestedRelease &&
+                          release.host == targetHost.catalogOs),
+                )
+                .toList() ??
             await cancellation.race(
               context.traceOperation<List<InstalledRelease>>(
                 'release.list_installed',
-                () =>
-                    context.installer.listInstalled(cancellation: cancellation),
+                () => context.installer.listInstalled(
+                  target: requestedRelease == null
+                      ? null
+                      : (version: requestedRelease, host: targetHost),
+                  cancellation: cancellation,
+                  checkTimeout: const Duration(seconds: 1),
+                ),
               ),
             );
       } on InstallCancelledException {
@@ -1250,7 +1308,22 @@ class _DoctorCommand extends WrenCommand {
         installed = const [];
         releaseEnumerationError = error;
       }
+    } else {
+      installed = const [];
     }
+    final selectionReleases = registered == null
+        ? installed
+        : [
+            for (final release in registered)
+              installed
+                      .where(
+                        (checked) =>
+                            checked.version == release.version &&
+                            checked.host == release.host,
+                      )
+                      .firstOrNull ??
+                  release,
+          ];
     final setup = await cancellation.race(
       DoctorSetupInspector(
         dataDirectory: context.installEnvironment.dataDirectory,
@@ -1260,7 +1333,7 @@ class _DoctorCommand extends WrenCommand {
         processEnvironmentOverride: context.processEnvironmentOverride,
         globalFallbackOverride: context.globalFallbackOverride,
       ).inspect(
-        installedReleases: installed,
+        installedReleases: selectionReleases,
         releaseEnumerationError: releaseEnumerationError,
       ),
     );
@@ -1282,7 +1355,7 @@ class _DoctorCommand extends WrenCommand {
     final project = context._projectReleaseConstraints();
     final compatibleProjectRelease = project.selectRelease(
       targetHost,
-      installed,
+      selectionReleases,
     );
     final commandLineRelease = globalResults?.option('release')?.trim();
     final environmentRelease =
@@ -1437,7 +1510,7 @@ class _DoctorCommand extends WrenCommand {
       ];
       final selected = selectedRelease == null
           ? null
-          : installed
+          : selectionReleases
                 .where((release) => release.version == selectedRelease)
                 .firstOrNull;
       final selectionSourceCode = switch (selectionSource) {
@@ -1450,7 +1523,13 @@ class _DoctorCommand extends WrenCommand {
       final selectedIntegrity = selected == null
           ? null
           : fullIntegrityFor(selected)?.integrity;
-      final selectedIntegrityLabel = selected == null
+      final selectedIntegrityLabel =
+          selected == null ||
+              !installed.any(
+                (release) =>
+                    release.version == selected.version &&
+                    release.host == selected.host,
+              )
           ? null
           : selectedIntegrity == null
           ? selected.needsRepair
@@ -1469,6 +1548,9 @@ class _DoctorCommand extends WrenCommand {
           : compatibilityStatus(selected);
       final report = <String, Object?>{
         'schema_version': 1,
+        'scope': requestedRelease == null
+            ? {'kind': 'all'}
+            : {'kind': 'release', 'requested_release': requestedRelease},
         'depth': fullRequested ? 'full' : 'quick',
         'completion': completion,
         'exit_status': exitStatus,
@@ -1499,6 +1581,8 @@ class _DoctorCommand extends WrenCommand {
           'compatibility': selectedCompatibility,
         },
         'releases': releaseJson,
+        'shared_source_affected_releases':
+            fullReport?.sourceAffectedReleases ?? const <String>[],
         'scan_checks': [
           for (final check
               in fullReport?.checks ?? const <DoctorIntegrityCheck>[])
@@ -1513,9 +1597,12 @@ class _DoctorCommand extends WrenCommand {
     cancellation.throwIfCancelled();
 
     writeOut(
-      fullReport == null
-          ? 'Wren quick diagnosis (offline).'
-          : 'Wren full diagnosis (offline).',
+      requestedRelease == null
+          ? fullRequested
+                ? 'Wren full diagnosis (offline).'
+                : 'Wren quick diagnosis (offline).'
+          : 'Wren ${fullRequested ? 'full' : 'quick'} diagnosis '
+                'for Flutter $requestedRelease (offline).',
     );
     writeOut('Setup:');
     for (final check in setup.checks) {
@@ -1545,9 +1632,18 @@ class _DoctorCommand extends WrenCommand {
         }
       }
     }
+    if (fullReport != null && fullReport.sourceAffectedReleases.isNotEmpty) {
+      writeOut(
+        'Shared-source damage blocks these registered releases: '
+        '${fullReport.sourceAffectedReleases.join(', ')}. '
+        'This does not imply their SDK payloads were inspected.',
+      );
+    }
     if (installed.isEmpty) {
       writeOut(
-        fullReport?.isIncomplete ?? false
+        requestedRelease != null && releaseEnumerationError != null
+            ? 'The requested release could not be inspected.'
+            : (fullReport?.isIncomplete ?? false)
             ? 'No Flutter releases were confirmed by the incomplete full scan.'
             : 'No Flutter releases are installed.',
       );
@@ -1633,7 +1729,7 @@ class _DoctorCommand extends WrenCommand {
       'Effective selection: Flutter $selectedRelease '
       '(source: $selectionSource).',
     );
-    final selected = installed.where(
+    final selected = selectionReleases.where(
       (release) => release.version == selectedRelease,
     );
     if (selected.isEmpty) {
@@ -1643,7 +1739,12 @@ class _DoctorCommand extends WrenCommand {
       );
     } else {
       final release = selected.first;
-      if (release.needsRepair) {
+      if (requestedRelease != null && release.version != requestedRelease) {
+        writeOut(
+          'The effective selection is context only; '
+          'its integrity was not inspected.',
+        );
+      } else if (release.needsRepair) {
         writeOut(
           'Finding: the effective selection needs repair. Run '
           '`wren repair $selectedRelease`.',

@@ -16,9 +16,8 @@ command -v tar >/dev/null 2>&1 || fail 'tar is required.'
 os=$(uname -s)
 arch=$(uname -m)
 case "$os:$arch" in
-  Linux:x86_64|Linux:amd64) host=linux-x64 ;;
   Darwin:arm64|Darwin:aarch64) host=macos-arm64 ;;
-  *) fail "unsupported host $os/$arch; Wren supports Linux x86_64 and macOS arm64." ;;
+  *) fail "unsupported host $os/$arch; Wren 0.0.x downloads support Apple Silicon macOS only." ;;
 esac
 
 if command -v sha256sum >/dev/null 2>&1; then

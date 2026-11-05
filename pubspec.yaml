@@ -1,7 +1,7 @@
 name: wren
-description: A sample command-line application.
-version: 1.0.0
-# repository: https://github.com/my_org/my_repo
+description: A standalone Flutter and Dart version manager.
+version: 0.0.1
+repository: https://github.com/Luckey-Elijah/wren
 
 environment:
   sdk: ^3.13.4

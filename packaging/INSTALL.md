@@ -6,7 +6,7 @@ installing Flutter releases.
 
 ### One-line installer
 
-On Linux x86_64 or Apple Silicon macOS, install the highest stable Wren release
+On Apple Silicon macOS, install the newest published Wren release
 with:
 
 ```sh
@@ -28,24 +28,17 @@ new one passes its final checks.
 
 Choose the archive matching your host:
 
-- `wren-<version>-linux-x64.tar.gz` for Linux x86_64.
 - `wren-<version>-macos-arm64.tar.gz` for Apple Silicon macOS.
 
 Verify the archive against the matching `.sha256` file or the `SHA256SUMS`
-release manifest before extracting it. For example, on Linux:
-
-```sh
-sha256sum --check wren-<version>-linux-x64.tar.gz.sha256
-```
-
-On macOS:
+release manifest before extracting it. On macOS:
 
 ```sh
 shasum -a 256 --check wren-<version>-macos-arm64.tar.gz.sha256
 ```
 
 Extract the archive and copy `wren` to a directory on your `PATH` that you can
-write to, such as `~/.local/bin` on Linux or `~/bin` on macOS:
+write to, such as `~/.local/bin`:
 
 ```sh
 tar -xzf wren-<version>-<host>.tar.gz
@@ -65,5 +58,8 @@ open **System Settings > Privacy & Security**, scroll to **Security**, and
 choose **Open Anyway** for Wren. Confirm the prompt, then run Wren again. The
 approval is needed only once for that executable.
 
-Wren currently supports Linux x86_64 and macOS arm64 only. Windows, Linux arm64,
-and Intel macOS are not supported.
+Wren 0.0.x downloads support Apple Silicon macOS only. They are unsigned
+experimental development releases; every update may break compatibility.
+Linux qualification is tracked in [issue #11](https://github.com/Luckey-Elijah/wren/issues/11). Intel macOS and Windows are not
+supported. Use `wren upgrade-wren` to install a newer published 0.0.x release,
+or repeat the installer command. Read the release notes before updating.
